@@ -140,7 +140,7 @@ def _point_passed(
     avg_alicat: Optional[float],
     avg_transducer: Optional[float],
 ) -> tuple[bool, Optional[float], Optional[float], bool]:
-    """Return passed, alicat deviation, transducer deviation, mensor_used."""
+    """Return raw deviation fields; pass/fail is decided after correlation fit."""
     mensor_used = settings.require_mensor and target_psia <= settings.mensor_max_psia + 1e-6
     if mensor_used:
         if avg_mensor is None or avg_alicat is None:
@@ -149,8 +149,7 @@ def _point_passed(
         transducer_dev = None
         if avg_transducer is not None:
             transducer_dev = avg_mensor - avg_transducer
-        passed = abs(alicat_dev) <= settings.pressure_tolerance_psia
-        return passed, alicat_dev, transducer_dev, True
+        return False, alicat_dev, transducer_dev, True
     if avg_alicat is None:
         return False, None, None, False
     alicat_err = avg_alicat - target_psia

@@ -228,6 +228,14 @@ def is_port_installed(config: Dict[str, Any], port_id: str) -> bool:
     return bool(port_cfg.get('transducer_installed', True))
 
 
+def is_transducer_installed(config: Dict[str, Any], port_id: str) -> bool:
+    """True when a physical port transducer is installed and should be validated."""
+    port_cfg = config.get('hardware', {}).get('labjack', {}).get(port_id, {})
+    if not isinstance(port_cfg, dict):
+        return True
+    return bool(port_cfg.get('transducer_installed', True))
+
+
 def get_port_config(config: Dict[str, Any], port_id: str) -> Dict[str, Any]:
     """Get configuration for a specific port (port_a or port_b)."""
     labjack_config = config['hardware']['labjack'].get(port_id, {})

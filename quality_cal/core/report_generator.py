@@ -11,6 +11,7 @@ from PyQt6.QtCore import QMarginsF
 from PyQt6.QtGui import QPdfWriter
 from PyQt6.QtGui import QTextDocument
 
+from quality_cal.core.calibration_export import point_passes_raw
 from quality_cal.config import QualitySettings
 from quality_cal.session import CalibrationPointResult, PortCalibrationResult, QualityCalibrationSession
 
@@ -96,7 +97,7 @@ def default_csv_filename(session: QualityCalibrationSession, settings: QualitySe
     return f"{settings.report_filename_prefix}_Asset{asset}_{timestamp}.csv"
 
 
-def build_report_csv(session: QualityCalibrationSession, _settings: QualitySettings) -> str:
+def build_report_csv(session: QualityCalibrationSession, settings: QualitySettings) -> str:
     """Build CSV content with session metadata and calibration data for quality use."""
     out = io.StringIO()
     w = csv.writer(out)
@@ -118,15 +119,21 @@ def build_report_csv(session: QualityCalibrationSession, _settings: QualitySetti
     w.writerow([])
     w.writerow([
         "Port", "Point", "Target (psia)", "Mensor (psia)", "Alicat (psia)",
-        "Transducer (psia)", "Deviation (psia)", "Result",
+        "Transducer (psia)", "Raw Dev (psia)", "Corrected Dev (psia)",
+        "Raw Result", "Final Result",
     ])
     for port in (session.left_port, session.right_port):
         for point in port.points:
-            w.writerow(_point_row(port.port_label, point))
+            w.writerow(_point_row(port.port_label, point, settings))
     return out.getvalue()
 
 
-def _point_row(port_label: str, point: CalibrationPointResult) -> list:
+def _point_row(
+    port_label: str,
+    point: CalibrationPointResult,
+    settings: QualitySettings,
+) -> list:
+    raw_pass = point_passes_raw(point, pressure_tolerance_psia=settings.pressure_tolerance_psia)
     return [
         port_label,
         f"{point.point_index}/{point.point_total}",
@@ -135,6 +142,8 @@ def _point_row(port_label: str, point: CalibrationPointResult) -> list:
         _csv_fmt(point.alicat_psia),
         _csv_fmt(point.transducer_psia),
         _csv_fmt(point.deviation_psia),
+        _csv_fmt(point.corrected_deviation_psia),
+        "PASS" if raw_pass else "FAIL",
         "PASS" if point.passed else "FAIL",
     ]
 
@@ -160,8 +169,12 @@ def export_report_csv(
 def _build_port_section(port_result: PortCalibrationResult, settings: QualitySettings) -> str:
     rows: list[str] = []
     for point in port_result.points:
-        status = "PASS" if point.passed else "FAIL"
-        status_class = "pass" if point.passed else "fail"
+        raw_pass = point_passes_raw(
+            point,
+            pressure_tolerance_psia=settings.pressure_tolerance_psia,
+        )
+        final_status = 'PASS' if point.passed else 'FAIL'
+        raw_status = 'PASS' if raw_pass else 'FAIL'
         rows.append(
             f"""
             <tr>
@@ -171,21 +184,32 @@ def _build_port_section(port_result: PortCalibrationResult, settings: QualitySet
               <td>{_fmt(point.alicat_psia)}</td>
               <td>{_fmt(point.transducer_psia)}</td>
               <td>{_fmt(point.deviation_psia)}</td>
+              <td>{_fmt(point.corrected_deviation_psia)}</td>
+              <td class="{'pass' if raw_pass else 'fail'}">{raw_status}</td>
+              <td class="{'pass' if point.passed else 'fail'}">{final_status}</td>
               <td>{point.route}</td>
-              <td class="{status_class}">{status}</td>
             </tr>
             """
         )
 
     if not rows:
         rows.append(
-            '<tr><td colspan="8" class="note">No calibration points recorded.</td></tr>'
+            '<tr><td colspan="10" class="note">No calibration points recorded.</td></tr>'
+        )
+
+    fit_note = ''
+    if port_result.fit_summary is not None and port_result.fit_summary.applied_to_stinger_config:
+        fit_note = (
+            '<p class="note">Correlation models were fitted from the sweep and applied '
+            f'before final pass/fail (Alicat 0–{settings.alicat_fit_max_psia:.0f} PSIA; '
+            f'transducer 0–{settings.fit_max_psia:.0f} PSIA when installed).</p>'
         )
 
     return f"""
     <h2>{_escape(port_result.port_label)}</h2>
     <p><b>Result:</b> <span class="{'pass' if port_result.overall_passed else 'fail'}">{'PASS' if port_result.overall_passed else 'FAIL'}</span>
-    &nbsp;&nbsp; <b>Tolerance:</b> +/- {settings.pressure_tolerance_psia:.3f} psia</p>
+    &nbsp;&nbsp; <b>Tolerance (final):</b> +/- {settings.pressure_tolerance_psia:.4f} psia</p>
+    {fit_note}
     <table>
       <tr>
         <th>Point</th>
@@ -193,9 +217,11 @@ def _build_port_section(port_result: PortCalibrationResult, settings: QualitySet
         <th>Mensor</th>
         <th>Alicat</th>
         <th>Transducer</th>
-        <th>Deviation</th>
+        <th>Raw Dev</th>
+        <th>Corrected Dev</th>
+        <th>Raw</th>
+        <th>Final</th>
         <th>Route</th>
-        <th>Result</th>
       </tr>
       {''.join(rows)}
     </table>

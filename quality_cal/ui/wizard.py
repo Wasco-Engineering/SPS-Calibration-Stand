@@ -12,6 +12,7 @@ from quality_cal.ui.styles import APP_STYLESHEET
 
 from app.hardware.port import PortManager
 from quality_cal.config import QualitySettings
+from quality_cal.core.hardware_checks import evaluate_labjack_port_check
 from quality_cal.core.hardware_discovery import (
     discover_alicat_assignments,
     discover_labjack_target,
@@ -252,56 +253,25 @@ class QualityCalibrationWizard(QWizard):
                 )
                 continue
 
-            labjack_status = port.daq.get_status()
-            transducer_reading = port.daq.read_transducer()
-            driver_loaded = bool(labjack_status.get("driver_loaded", False))
-            simulated = bool(labjack_status.get("simulated", False))
-            if (
-                driver_loaded
-                and transducer_reading is None
-                and not bool(labjack_status.get("configured", False))
-            ):
-                port.daq.configure()
-                labjack_status = port.daq.get_status()
-                transducer_reading = port.daq.read_transducer()
-                driver_loaded = bool(labjack_status.get("driver_loaded", False))
-                simulated = bool(labjack_status.get("simulated", False))
-            labjack_ok = transducer_reading is not None and driver_loaded and not simulated
-            if not labjack_ok:
+            lj_status = port.daq.get_status()
+            probe_detail = (
+                f"Target={lj_status.get('device_type')}/"
+                f"{lj_status.get('connection_type')}/"
+                f"{lj_status.get('identifier')} | {self._labjack_probe_detail}"
+            )
+            labjack_result = evaluate_labjack_port_check(
+                port_id=port_id,
+                port=port,
+                config=self.config,
+                probe_detail=probe_detail,
+            )
+            if not labjack_result.ok:
                 overall_ok = False
-            if not driver_loaded:
-                labjack_detail = (
-                    f"{labjack_status.get('status', 'Unknown')} | "
-                    f"Target={labjack_status.get('device_type')}/{labjack_status.get('connection_type')}/"
-                    f"{labjack_status.get('identifier')} | "
-                    "LabJack driver missing: install the LabJack LJM driver to read the transducer "
-                    "and switch the solenoid."
-                )
-            elif simulated:
-                labjack_detail = (
-                    f"{labjack_status.get('status', 'Unknown')} | "
-                    f"Target={labjack_status.get('device_type')}/{labjack_status.get('connection_type')}/"
-                    f"{labjack_status.get('identifier')} | "
-                    "Simulated only: solenoid and transducer control are not live."
-                )
-            elif transducer_reading is None:
-                labjack_detail = (
-                    f"{labjack_status.get('status', 'Unknown')} | "
-                    f"Target={labjack_status.get('device_type')}/{labjack_status.get('connection_type')}/"
-                    f"{labjack_status.get('identifier')} | {self._labjack_probe_detail}"
-                )
-            else:
-                labjack_detail = (
-                    f"{labjack_status.get('status', 'Unknown')} | "
-                    f"Target={labjack_status.get('device_type')}/{labjack_status.get('connection_type')}/"
-                    f"{labjack_status.get('identifier')} | "
-                    f"Transducer={transducer_reading.pressure:.3f} psia"
-                )
             entries.append(
                 {
                     "name": f"{port_id} LabJack",
-                    "ok": labjack_ok,
-                    "detail": labjack_detail,
+                    "ok": labjack_result.ok,
+                    "detail": labjack_result.detail,
                 }
             )
 

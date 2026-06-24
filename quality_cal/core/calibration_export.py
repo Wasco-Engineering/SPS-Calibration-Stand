@@ -203,13 +203,8 @@ def point_passes_mensor_tolerance(
 
 # Mensor must track the setpoint; otherwise corrected residuals are meaningless.
 MENSOR_TARGET_AGREEMENT_PSI = 5.0
-# Above fit_max_psia we do not apply 0–30 psia error models (extrapolation is invalid).
 SEVERE_MENSOR_TARGET_PSI = 10.0
 SEVERE_SENSOR_GAP_PSI = 5.0
-# Above fit_max_psia: models are not used; allow slightly looser raw Mensor–Alicat check.
-DEFAULT_HIGH_PRESSURE_PASS_THRESHOLD_TORR = 3.0
-# In-band point check is slightly looser than fit p99 (which stays at pass_threshold_torr).
-POINT_PASS_SLACK_TORR = 0.5
 
 
 def is_severe_point_failure(
@@ -231,6 +226,24 @@ def is_severe_point_failure(
     return False
 
 
+def point_passes_raw(
+    point: CalibrationPointResult,
+    *,
+    pressure_tolerance_psia: float,
+) -> bool:
+    """Pre-correlation pass: raw Alicat vs Mensor (or vs target when Mensor unused)."""
+    if not point.mensor_used:
+        if point.alicat_psia is None:
+            return False
+        return abs(point.alicat_psia - point.target_psia) <= pressure_tolerance_psia
+    if point.mensor_psia is None or point.alicat_psia is None:
+        return False
+    raw_psi = point.deviation_psia
+    if raw_psi is None:
+        raw_psi = point.mensor_psia - point.alicat_psia
+    return abs(raw_psi) <= pressure_tolerance_psia
+
+
 def point_passes_after_correction(
     point: CalibrationPointResult,
     *,
@@ -238,14 +251,12 @@ def point_passes_after_correction(
     fit_max_psia: float,
     pressure_tolerance_psia: float = ONE_TORR_PSI,
     mensor_target_agreement_psi: float = MENSOR_TARGET_AGREEMENT_PSI,
-    high_pressure_pass_threshold_torr: float = DEFAULT_HIGH_PRESSURE_PASS_THRESHOLD_TORR,
+    high_pressure_pass_threshold_torr: float = 3.0,
 ) -> bool:
-    """Post-fit pass for quarterly calibration.
-
-  - 0–fit_max psia: corrected Alicat vs Mensor (or raw if correction is worse).
-  - Above fit_max: raw Alicat vs Mensor only (models are not extrapolated).
-    """
+    """Post-fit pass for quarterly calibration using corrected Alicat vs Mensor when available."""
     from app.services.pressure_calibration import psi_to_torr
+
+    _ = (pass_threshold_torr, fit_max_psia, mensor_target_agreement_psi, high_pressure_pass_threshold_torr)
 
     if is_severe_point_failure(point):
         return False
@@ -261,22 +272,16 @@ def point_passes_after_correction(
     raw_psi = point.deviation_psia
     if raw_psi is None:
         raw_psi = point.mensor_psia - point.alicat_psia
-    raw_torr = abs(psi_to_torr(raw_psi))
 
-    in_band_limit_torr = pass_threshold_torr + POINT_PASS_SLACK_TORR
-    if point.target_psia > fit_max_psia + 1e-6:
-        high_limit = max(
-            high_pressure_pass_threshold_torr,
-            pass_threshold_torr * 3.0,
+    if point.corrected_deviation_psia is not None:
+        corr_psi = point.corrected_deviation_psia
+        deviation_psi = (
+            corr_psi if abs(corr_psi) < abs(raw_psi) else raw_psi
         )
-        return raw_torr <= high_limit
+    else:
+        deviation_psi = raw_psi
 
-    corr_torr = (
-        abs(psi_to_torr(point.corrected_deviation_psia))
-        if point.corrected_deviation_psia is not None
-        else raw_torr
-    )
-    return min(corr_torr, raw_torr) <= in_band_limit_torr
+    return abs(psi_to_torr(deviation_psi)) <= abs(psi_to_torr(pressure_tolerance_psia))
 
 
 def port_calibration_passed(

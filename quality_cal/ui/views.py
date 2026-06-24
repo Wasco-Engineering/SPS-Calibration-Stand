@@ -271,7 +271,8 @@ class SetupPanel(QWidget):
             self.profile_detail_label.setText(
                 f'{n} pressure points (high → low), ~{est_min:.0f} min per port. '
                 f'Mensor reference to {settings.mensor_max_psia:.0f} PSIA; '
-                f'transducer fit band 0–{settings.fit_max_psia:.0f} PSIA.',
+                f'Alicat fit 0–{settings.alicat_fit_max_psia:.0f} PSIA; '
+                f'transducer fit 0–{settings.fit_max_psia:.0f} PSIA.',
             )
         except Exception as exc:
             self.profile_detail_label.setText(f'CAL 10 profile could not be loaded. ({exc})')
@@ -372,6 +373,7 @@ class RunPanel(QWidget):
         self._result_count = 0
         self._completed_points: list[CalibrationPointResult] = []
         self._fit_max_psia = 30.0
+        self._alicat_fit_max_psia = 115.0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -546,7 +548,8 @@ class RunPanel(QWidget):
         if stage.kind == 'calibration':
             self.mensor_note_label.setText(
                 f'Mensor reference active through {mensor_max_psia:.0f} PSIA. '
-                f'Port transducer correction fit uses 0–{self._fit_max_psia:.0f} PSIA.',
+                f'Port Alicat correction fit uses 0–{self._alicat_fit_max_psia:.0f} PSIA; '
+                f'transducer fit uses 0–{self._fit_max_psia:.0f} PSIA.',
             )
             self.mensor_note_label.show()
         else:
@@ -572,6 +575,9 @@ class RunPanel(QWidget):
 
     def set_fit_max_psia(self, fit_max_psia: float) -> None:
         self._fit_max_psia = fit_max_psia
+
+    def set_alicat_fit_max_psia(self, alicat_fit_max_psia: float) -> None:
+        self._alicat_fit_max_psia = alicat_fit_max_psia
 
     def reset(self) -> None:
         self._result_count = 0
@@ -685,6 +691,7 @@ class RunPanel(QWidget):
         rescored, transducer_model, alicat_model = apply_provisional_corrections(
             self._completed_points,
             fit_max_psia=self._fit_max_psia,
+            alicat_fit_max_psia=self._alicat_fit_max_psia,
         )
         self._completed_points = list(rescored)
         display = rescored[-1]
@@ -709,6 +716,7 @@ class RunPanel(QWidget):
         rescored, transducer_model, alicat_model = apply_provisional_corrections(
             self._completed_points,
             fit_max_psia=self._fit_max_psia,
+            alicat_fit_max_psia=self._alicat_fit_max_psia,
         )
         self._completed_points = list(rescored)
         display = rescored[row]

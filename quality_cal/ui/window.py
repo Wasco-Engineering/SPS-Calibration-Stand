@@ -26,19 +26,15 @@ from app.services import run_async
 from quality_cal.config import QualitySettings, parse_quality_settings
 from quality_cal.core.calibration_runner import CalibrationRunner
 from quality_cal.core.port_calibrator import (
-    apply_port_models_to_stinger_config,
-    build_port_config_snippet,
-    fit_port_from_sweep_csv,
-    fit_summary_from_result,
-    format_fit_dialog_text,
-    reload_port_calibration,
-    rescore_points_with_models,
+    FinalizeCalibrationResult,
+    finalize_port_calibration,
 )
 from quality_cal.core.hardware_discovery import (
     discover_alicat_assignments,
     discover_labjack_target,
     discover_mensor_port,
 )
+from quality_cal.core.hardware_checks import evaluate_labjack_port_check
 from quality_cal.core.leak_check_runner import LeakCheckRunner
 from quality_cal.core.mensor_reader import MensorReader
 from quality_cal.session import CalibrationPointResult, QualityCalibrationSession
@@ -283,6 +279,7 @@ class QualityCalibrationWindow(QMainWindow):
             panel = RunPanel(self)
             panel.configure(stage, mensor_max_psia=self.settings.mensor_max_psia)
             panel.set_fit_max_psia(self.settings.fit_max_psia)
+            panel.set_alicat_fit_max_psia(self.settings.alicat_fit_max_psia)
             panel.start_requested.connect(lambda stage_key=stage.key: self._start_stage_run(stage_key))
             panel.retest_requested.connect(
                 lambda point_index, stage_key=stage.key: self._start_retest(stage_key, point_index)
@@ -613,79 +610,44 @@ class QualityCalibrationWindow(QMainWindow):
         if port_id is not None:
             self.session.port_result(port_id).points = list(results)
         panel = self._run_panel_for(stage_key)
-        panel.show_calibration_result(list(results))
 
         csv_path = self._pending_sweep_csv.pop(stage_key, None)
-        if csv_path and port_id:
-
-            def _fit() -> object:
-                return fit_port_from_sweep_csv(Path(csv_path), port_id, self.settings)
-
-            def _on_fit_done(fit: object, error: Exception | None) -> None:
-                if error is not None:
-                    panel.set_fit_summary(f'Fit failed: {error}', applied=False)
-                    self._mark_stage_complete(stage_key)
-                    return
-                from quality_cal.core.port_calibrator import PortCalibrationFitResult
-
-                assert isinstance(fit, PortCalibrationFitResult)
-                if fit.error_message and fit.transducer is None and fit.alicat is None:
-                    panel.set_fit_summary(fit.error_message, applied=False)
-                    self._mark_stage_complete(stage_key)
-                    return
-
-                reply = QMessageBox.question(
-                    self,
-                    'Calibration fit results',
-                    format_fit_dialog_text(fit, self.settings),
-                    QMessageBox.StandardButton.Apply | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.Apply,
-                )
-                applied = reply == QMessageBox.StandardButton.Apply
-                if applied:
-                    try:
-                        apply_port_models_to_stinger_config(port_id, fit)
-                        snippet = build_port_config_snippet(port_id, fit)
-                        if self.port_manager is not None:
-                            port = self.port_manager.get_port(port_id)
-                            if port is not None:
-                                reload_port_calibration(port, snippet)
-                        rescored = rescore_points_with_models(
-                            results, fit, settings=self.settings
-                        )
-                        self.session.port_result(port_id).points = rescored
-                        panel.set_results_table(rescored)
-                        panel.show_calibration_result(rescored)
-                        summary = fit_summary_from_result(port_id, fit, applied=True)
-                        self.session.port_result(port_id).fit_summary = summary
-                        lines = [
-                            'Applied to stinger_config.yaml on this machine.',
-                        ]
-                        if fit.transducer is not None:
-                            lines.append(
-                                f'Transducer p99: {fit.transducer.p99_abs_torr:.3f} Torr',
-                            )
-                        if fit.alicat is not None:
-                            lines.append(f'Alicat p99: {fit.alicat.p99_abs_torr:.3f} Torr')
-                        panel.set_fit_summary('\n'.join(lines), applied=True)
-                    except Exception as exc:
-                        panel.set_fit_summary(f'Apply failed: {exc}', applied=False)
-                else:
-                    rescored = rescore_points_with_models(
-                        results, fit, settings=self.settings
-                    )
-                    self.session.port_result(port_id).points = rescored
-                    panel.set_results_table(rescored)
-                    panel.show_calibration_result(rescored)
-                    summary = fit_summary_from_result(port_id, fit, applied=False)
-                    self.session.port_result(port_id).fit_summary = summary
-                    panel.set_fit_summary('Fit complete. Models not applied (skipped by operator).', applied=False)
-                self._mark_stage_complete(stage_key)
-
-            run_async(_fit, _on_fit_done)
+        if not csv_path or port_id is None:
+            panel.show_calibration_result(list(results))
+            self._mark_stage_complete(stage_key)
             return
 
-        self._mark_stage_complete(stage_key)
+        panel.set_running(True)
+        panel.set_progress(95, 'Fitting correlation models and rescoring points...')
+
+        def _finalize() -> object:
+            port = self.port_manager.get_port(port_id) if self.port_manager else None
+            return finalize_port_calibration(
+                csv_path,
+                port_id,
+                list(results),
+                self.settings,
+                port=port,
+                apply_to_stinger=True,
+            )
+
+        def _on_finalize_done(bundle: object, error: Exception | None) -> None:
+            panel.set_running(False)
+            if error is not None:
+                panel.show_error(f'Post-calibration finalize failed: {error}')
+                panel.show_calibration_result(list(results))
+                self._mark_stage_complete(stage_key)
+                return
+
+            assert isinstance(bundle, FinalizeCalibrationResult)
+            self.session.port_result(port_id).points = bundle.points
+            self.session.port_result(port_id).fit_summary = bundle.fit_summary
+            panel.set_results_table(bundle.points)
+            panel.show_calibration_result(bundle.points)
+            panel.set_fit_summary(bundle.message, applied=bundle.fit_summary.applied_to_stinger_config)
+            self._mark_stage_complete(stage_key)
+
+        run_async(_finalize, _on_finalize_done)
 
     def _on_leak_finished(self, stage_key: str, result) -> None:
         stage = self._stage_by_key(stage_key)
@@ -823,41 +785,19 @@ class QualityCalibrationWindow(QMainWindow):
                 )
                 continue
 
-            labjack_status = port.daq.get_status()
-            transducer_reading = port.daq.read_transducer()
-            driver_loaded = bool(labjack_status.get('driver_loaded', False))
-            simulated = bool(labjack_status.get('simulated', False))
-            if driver_loaded and transducer_reading is None and not bool(labjack_status.get('configured', False)):
-                port.daq.configure()
-                labjack_status = port.daq.get_status()
-                transducer_reading = port.daq.read_transducer()
-                driver_loaded = bool(labjack_status.get('driver_loaded', False))
-                simulated = bool(labjack_status.get('simulated', False))
-            labjack_ok = transducer_reading is not None and driver_loaded and not simulated
-            overall_ok = overall_ok and labjack_ok
-            if not driver_loaded:
-                detail = (
-                    f"{labjack_status.get('status', 'Unknown')} | "
-                    'LabJack driver missing: install the LabJack LJM driver.'
-                )
-            elif simulated:
-                detail = (
-                    f"{labjack_status.get('status', 'Unknown')} | Simulated only: solenoid and transducer are not live."
-                )
-            elif transducer_reading is None:
-                detail = (
-                    f"{labjack_status.get('status', 'Unknown')} | {self._labjack_probe_detail}"
-                )
-            else:
-                detail = (
-                    f"{labjack_status.get('status', 'Unknown')} | Transducer={transducer_reading.pressure:.3f} psia"
-                )
+            labjack_result = evaluate_labjack_port_check(
+                port_id=port_id,
+                port=port,
+                config=self.config,
+                probe_detail=self._labjack_probe_detail,
+            )
+            overall_ok = overall_ok and labjack_result.ok
             entries.append(
                 HardwareStatusEntry(
                     name=f'{port_id}_labjack',
                     label=f'{label} LabJack',
-                    ok=labjack_ok,
-                    detail=detail,
+                    ok=labjack_result.ok,
+                    detail=labjack_result.detail,
                 )
             )
 

@@ -106,6 +106,10 @@ def feedback_pressure_psia(
     the transducer is expected to saturate and must not drive settle.
     """
     alicat = alicat_abs_psia(reading, barometric_psia)
+    if port is not None and not bool(
+        getattr(port, '_labjack_config', {}).get('transducer_installed', True)
+    ):
+        return alicat
     transducer = transducer_abs_psia(
         reading,
         barometric_psia,

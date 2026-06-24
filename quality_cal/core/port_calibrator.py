@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 
 import yaml
 
-from app.hardware.port import Port
+from app.core.config import is_transducer_installed, load_config
 from app.services.pressure_calibration import (
     REFERENCE_MENSOR,
     SENSOR_ALICAT,
@@ -225,14 +225,20 @@ def fit_port_from_sweep_csv(
     try:
         from app.services.pressure_calibration import filter_samples_pressure_band
 
-        samples = _load_samples([path], port_id)
-        samples = filter_samples_pressure_band(
-            samples,
+        all_samples = _load_samples([path], port_id)
+        transducer_samples = filter_samples_pressure_band(
+            all_samples,
             min_psi=0.0,
             max_psi=settings.fit_max_psia,
             reference=REFERENCE_MENSOR,
         )
-        if not any(s.mensor_abs_psia is not None for s in samples):
+        alicat_samples = filter_samples_pressure_band(
+            all_samples,
+            min_psi=0.0,
+            max_psi=settings.alicat_fit_max_psia,
+            reference=REFERENCE_MENSOR,
+        )
+        if not any(s.mensor_abs_psia is not None for s in all_samples):
             return PortCalibrationFitResult(
                 port_id=port_id,
                 sweep_csv_path=path,
@@ -242,17 +248,19 @@ def fit_port_from_sweep_csv(
             )
 
         min_samples = max(30, len(settings.pressure_points_psia) * 2)
-        transducer_fit = _fit_sensor_from_samples(
-            port_id=port_id,
-            sensor=SENSOR_TRANSDUCER,
-            samples=samples,
-            settings=settings,
-            min_samples=min_samples,
-        )
+        transducer_fit = None
+        if is_transducer_installed(load_config(), port_id):
+            transducer_fit = _fit_sensor_from_samples(
+                port_id=port_id,
+                sensor=SENSOR_TRANSDUCER,
+                samples=transducer_samples,
+                settings=settings,
+                min_samples=min_samples,
+            )
         alicat_fit = _fit_sensor_from_samples(
             port_id=port_id,
             sensor=SENSOR_ALICAT,
-            samples=samples,
+            samples=alicat_samples,
             settings=settings,
             min_samples=min_samples,
         )
@@ -353,6 +361,80 @@ def reload_port_calibration(port: Port, snippet: Dict[str, Any]) -> None:
         port.alicat._error_model = ali_cfg.get('alicat_error_model')
 
 
+@dataclass(slots=True)
+class FinalizeCalibrationResult:
+    """Raw sweep complete → fit models → rescore → optional apply."""
+
+    points: list[CalibrationPointResult]
+    fit: PortCalibrationFitResult
+    fit_summary: PortFitSummary
+    message: str
+
+
+def finalize_port_calibration(
+    sweep_csv_path: Path | str,
+    port_id: str,
+    raw_points: list[CalibrationPointResult],
+    settings: QualitySettings,
+    *,
+    port: Optional[Port] = None,
+    apply_to_stinger: bool = True,
+) -> FinalizeCalibrationResult:
+    """Fit correlation models from the sweep, rescore points, optionally apply to config."""
+    path = Path(sweep_csv_path)
+    fit = fit_port_from_sweep_csv(path, port_id, settings)
+    if fit.error_message and fit.transducer is None and fit.alicat is None:
+        return FinalizeCalibrationResult(
+            points=raw_points,
+            fit=fit,
+            fit_summary=fit_summary_from_result(port_id, fit, applied=False),
+            message=f'Fit failed: {fit.error_message}',
+        )
+
+    rescored = rescore_points_with_models(raw_points, fit, settings=settings)
+    applied = False
+    message_lines = [f'{settings.profile_label} — {port_id}']
+
+    if fit.transducer is not None:
+        message_lines.append(
+            f'Transducer fit p99: {fit.transducer.p99_abs_torr:.3f} Torr '
+            f'({"PASS" if fit.transducer.passed else "FAIL"})',
+        )
+    if fit.alicat is not None:
+        message_lines.append(
+            f'Alicat fit p99: {fit.alicat.p99_abs_torr:.3f} Torr '
+            f'({"PASS" if fit.alicat.passed else "FAIL"})',
+        )
+
+    if apply_to_stinger and (fit.transducer is not None or fit.alicat is not None):
+        snippet = build_port_config_snippet(port_id, fit, require_passed=True)
+        has_models = bool(
+            snippet.get('hardware', {}).get('labjack', {}).get(port_id)
+            or snippet.get('hardware', {}).get('alicat', {}).get(port_id)
+        )
+        if has_models:
+            apply_port_models_to_stinger_config(port_id, fit, require_passed=True)
+            if port is not None:
+                reload_port_calibration(port, snippet)
+            applied = True
+            message_lines.append('Applied passing error models to stinger_config.yaml.')
+        else:
+            message_lines.append('No passing models met apply criteria; config unchanged.')
+
+    passed = sum(1 for p in rescored if p.passed)
+    message_lines.append(
+        f'Final result after correlation: {passed}/{len(rescored)} points pass '
+        f'(tolerance +/- {settings.pressure_tolerance_psia:.4f} psia).',
+    )
+
+    return FinalizeCalibrationResult(
+        points=rescored,
+        fit=fit,
+        fit_summary=fit_summary_from_result(port_id, fit, applied=applied),
+        message='\n'.join(message_lines),
+    )
+
+
 def fit_summary_from_result(
     port_id: str,
     fit: PortCalibrationFitResult,
@@ -402,15 +484,9 @@ def rescore_points_with_models(
             or point.target_psia <= settings.fit_max_psia + 1e-6
         )
         if point.mensor_used and point.mensor_psia is not None:
-            if (
-                in_fit_band
-                and alicat_model is not None
-                and point.alicat_psia is not None
-            ):
+            if alicat_model is not None and point.alicat_psia is not None:
                 corrected_alicat = apply_error_model(point.alicat_psia, alicat_model)
                 corrected_alicat_dev = point.mensor_psia - corrected_alicat
-            elif not in_fit_band and point.alicat_psia is not None:
-                corrected_alicat_dev = point.mensor_psia - point.alicat_psia
             if (
                 in_fit_band
                 and transducer_model is not None

@@ -17,9 +17,7 @@ hardware:
       transducer_pressure_max: 30.0
       transducer_reference: absolute
       port_installed: true
-      transducer_installed: true
-      # Left DB9: switch sense on pin 3 only (bench verified 2026-06); pin 1 unwired.
-      # PTP decides whether pin 3 is NO or NC for the active part/sequence.
+      transducer_installed: false
       switch_sensed_db9_pins:
       - 3
       # Bench: DB9 pin 3 opens on SPS01496-02/600 vacuum trip (DIO high);
@@ -36,7 +34,7 @@ hardware:
         pressure_axis: measured
     port_b:
       port_installed: true
-      transducer_installed: true
+      transducer_installed: false
       transducer_ain: 0
       transducer_ain_neg: 1
       transducer_voltage_min: 0
@@ -44,8 +42,6 @@ hardware:
       transducer_pressure_min: 0.0
       transducer_pressure_max: 30.0
       transducer_reference: absolute
-      # Right DB9: switch sense on pin 3 only (bench verified 2026-06); pin 1 unwired.
-      # PTP decides whether pin 3 is NO or NC for the active part/sequence.
       switch_sensed_db9_pins:
       - 3
       # Bench: DB9 pin 3 opens on SPS01496-02/600 vacuum trip (DIO high);
@@ -68,7 +64,7 @@ hardware:
           intercept_error_psi: 0.03897909303252994
         pressure_axis: measured
   alicat:
-    baudrate: 115200
+    baudrate: 19200
     timeout_s: 0.2
     auto_tare_on_connect: true
     auto_tare_max_delta_psi: 0.5
@@ -85,10 +81,23 @@ hardware:
       com_port: COM3
       address: A
       alicat_error_model:
-        type: quadratic
-        a_error_per_psi2: -3.765397909814573e-05
-        b_error_per_psi: 0.001317930475644635
-        c_error_psi: -0.004725871265722729
+        type: piecewise_linear
+        segments:
+        - max_psi: 0.22
+          slope_error_per_psi: 0.13293103448275845
+          intercept_error_psi: -0.03822241379310341
+        - max_psi: 0.23199999999999998
+          slope_error_per_psi: 0.9451428571428572
+          intercept_error_psi: -0.21640285714285715
+        - max_psi: 2.14
+          slope_error_per_psi: 0.03851162790697659
+          intercept_error_psi: -0.04628325581395343
+        - max_psi: 74.97
+          slope_error_per_psi: 0.0005401403381669902
+          intercept_error_psi: -0.0037305610466794453
+        - max_psi: null
+          slope_error_per_psi: -0.0008095956845992132
+          intercept_error_psi: 0.08268458304497521
         pressure_axis: measured
     port_b:
       com_port: COM3
@@ -96,21 +105,21 @@ hardware:
       alicat_error_model:
         type: piecewise_linear
         segments:
-        - max_psi: 0.17
-          slope_error_per_psi: 0.0034000000000003064
-          intercept_error_psi: -0.010366000000000035
-        - max_psi: 0.3028
-          slope_error_per_psi: -0.24459608323133408
-          intercept_error_psi: 0.0315516523867809
-        - max_psi: 1.1176000000000001
-          slope_error_per_psi: 0.057896503739781
-          intercept_error_psi: -0.06108877543920689
-        - max_psi: 10.05
-          slope_error_per_psi: 0.0009417958335215115
-          intercept_error_psi: -0.00048387437994668525
+        - max_psi: 0.2864
+          slope_error_per_psi: 0.09446879643387816
+          intercept_error_psi: -0.039285141158989595
+        - max_psi: 2.05
+          slope_error_per_psi: 0.04138179391883471
+          intercept_error_psi: -0.057395027562295794
+        - max_psi: 3.05
+          slope_error_per_psi: -0.0007575757575755617
+          intercept_error_psi: -0.012516969696970304
+        - max_psi: 74.9104
+          slope_error_per_psi: 0.0006337989702052781
+          intercept_error_psi: -0.007776082355529877
         - max_psi: null
-          slope_error_per_psi: -0.0004963899924944369
-          intercept_error_psi: 0.010327565115638314
+          slope_error_per_psi: -0.0004304227457130831
+          intercept_error_psi: 0.06338015362996956
         pressure_axis: measured
   solenoid:
     vacuum_state: 1
@@ -119,7 +128,7 @@ hardware:
   measurement:
     preferred_source: auto
     fallback_on_unavailable: true
-    transducer_only_below_psi: 5.0
+    transducer_only_below_psi: 20.0
     alicat_only_above_psi: 5.0
     switch_pivot_min_psi: 5.0
     sensor_disagreement_fallback_enabled: true
@@ -158,7 +167,7 @@ database:
   database: WASCO_Calibration
   driver: ODBC Driver 18 for SQL Server
   username: MAXSQLAdmin
-  password: 'M@x@dm1n'
+  password: M@x@dm1n
   connection_timeout_sec: 5.0
 max_database:
   database: ExactMAXWasco
