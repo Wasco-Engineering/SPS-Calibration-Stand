@@ -627,7 +627,7 @@ def test_increasing_vacuum_no_open_uses_false_activation_state() -> None:
     assert executor._vacuum_switch_trips_on_no_open() is True
     assert executor._cycle_target_switch_state('activation') is False
     assert executor._cycle_target_switch_state('deactivation') is True
-    assert not executor._cycle_edge_switch_state_allowed('activation', True)
+    assert executor._cycle_edge_switch_state_allowed('activation', True)
     assert executor._cycle_edge_switch_state_allowed('activation', False)
 
 
@@ -716,6 +716,13 @@ def test_nc_derived_single_sense_without_explicit_config_uses_nc_runtime_fallbac
     assert executor._vacuum_switch_trips_on_no_open() is False
     assert executor._cycle_target_switch_state('activation') is True
     assert executor._cycle_target_switch_state('deactivation') is False
+    assert executor._cycle_edge_switch_state_allowed('activation', True)
+    assert executor._cycle_edge_switch_state_allowed('activation', False)
+    assert executor._cycle_edge_switch_state_allowed('deactivation', True)
+    assert executor._cycle_edge_switch_state_allowed('deactivation', False)
+    executor._cycle_observed_edge_states['activation'] = False
+    assert not executor._cycle_edge_switch_state_allowed('activation', True)
+    assert executor._cycle_edge_switch_state_allowed('activation', False)
 
 
 def test_sps01496_seq600_uses_nc_derived_runtime_vacuum_target_on_both_ports() -> None:
@@ -867,8 +874,8 @@ def test_vacuum_increasing_nc_derived_cycle_repositions_low_then_sweeps_high() -
     assert low_command < bounds[0]
     assert high_command > bounds[1]
     assert waits == [
-        ('activation', pytest.approx(low_command), -1),
-        ('deactivation', pytest.approx(high_command), 1),
+        ('deactivation', pytest.approx(low_command), -1),
+        ('activation', pytest.approx(high_command), 1),
     ]
 
 
@@ -1041,6 +1048,57 @@ def test_window_precision_emits_each_edge_as_it_is_found() -> None:
 
     assert outcome.result == SweepResult(activation_psi=10.8, deactivation_psi=10.0)
     assert emitted == [('deactivation', 10.0), ('activation', 10.8)]
+
+
+def test_nc_derived_upward_precision_pass_orders_edges_by_pressure() -> None:
+    setup = TestSetup(
+        part_id='SPS02262-02',
+        sequence_id='600',
+        units_code='21',
+        units_label='Torr',
+        activation_direction='Increasing',
+        activation_target=600.0,
+        pressure_reference='absolute',
+        terminals={},
+        bands={
+            'increasing': {'lower': 590.0, 'upper': 610.0},
+            'decreasing': {'lower': 450.0, 'upper': float('inf')},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    port = _FakePort([True])
+    port.daq = SimpleNamespace(switch_no_derived_from_nc=True)
+    emitted: list[tuple[str, float]] = []
+    executor = _TestExecutor(
+        port_id='port_a',
+        port=cast(Any, port),
+        test_setup=setup,
+        config={'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}}},
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.7,
+        on_edge_detected=lambda edge_type, pressure: emitted.append((edge_type, pressure)),
+    )
+    executor._wait_until_near_target = lambda **_kwargs: True  # type: ignore[method-assign]
+    edges = [
+        EdgeDetection(pressure_psi=10.72, activated=True),
+        EdgeDetection(pressure_psi=11.68, activated=False),
+    ]
+    executor._sweep_to_edge = lambda target, direction, **kwargs: (  # type: ignore[method-assign]
+        EdgeDetection(pressure_psi=10.72, activated=True)
+        if direction < 0
+        else EdgeDetection(pressure_psi=11.68, activated=False)
+    )
+    executor._collect_edges_during_sweep = lambda **_kwargs: edges  # type: ignore[method-assign]
+
+    outcome = executor._run_nc_derived_upward_precision_pass(
+        reset_target=8.4,
+        high_target=12.1,
+        rate_psi_per_sec=0.1,
+    )
+
+    assert outcome.result == SweepResult(activation_psi=11.68, deactivation_psi=10.72)
+    assert emitted == [('deactivation', 10.72), ('activation', 11.68)]
 
 
 def test_executor_precision_targets_use_close_limit_for_decreasing() -> None:
@@ -1463,7 +1521,7 @@ def test_decreasing_pressure_activation_prep_not_skipped_when_switch_wrong_state
     max_psi = convert_pressure(500.0, 'mmHg @ 0 C', 'PSI')
     nudge_target = max(-14.65, min_psi - 0.5)
     readings = [
-        (max_psi + 0.5, True),
+        (min_psi + 0.25, True),
         (nudge_target, True),
         (nudge_target, False),
     ]
@@ -1497,6 +1555,128 @@ def test_decreasing_pressure_activation_prep_not_skipped_when_switch_wrong_state
 
     assert port.set_pressure_calls
     assert port.set_pressure_calls[-1] == pytest.approx(14.7 + nudge_target)
+
+
+def test_decreasing_pressure_activation_prep_starts_from_high_side_even_if_switch_active() -> None:
+    port = _FakePort([True])
+    setup = TestSetup(
+        part_id='SPS02072-02',
+        sequence_id='300',
+        units_code='19',
+        units_label='mmHg @ 0 C',
+        activation_direction='Decreasing',
+        activation_target=400.0,
+        pressure_reference='gauge',
+        terminals={},
+        bands={
+            'increasing': {'lower': float('-inf'), 'upper': 500.0},
+            'decreasing': {'lower': 390.0, 'upper': 410.0},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    min_psi = convert_pressure(390.0, 'mmHg @ 0 C', 'PSI')
+    max_psi = convert_pressure(500.0, 'mmHg @ 0 C', 'PSI')
+    executor = _TestExecutor(
+        port_id='port_a',
+        port=cast(Any, port),
+        test_setup=setup,
+        config={'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}}},
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.7,
+    )
+    executor._read_pressure_and_switch_state = lambda: (max_psi + 0.5, True)  # type: ignore[method-assign]
+
+    executor._prepare_switch_for_cycle_edge(
+        sweep_mode='pressure',
+        min_psi=min_psi,
+        max_psi=max_psi,
+        direction=-1,
+        edge_type='activation',
+        overshoot=0.5,
+        hw_min_psi=-14.65,
+        hw_max_psi=15.35,
+    )
+
+    assert port.set_pressure_calls == []
+
+
+def test_decreasing_pressure_deactivation_prep_starts_from_low_side_even_if_switch_inactive() -> None:
+    port = _FakePort([True])
+    setup = TestSetup(
+        part_id='SPS02072-02',
+        sequence_id='300',
+        units_code='19',
+        units_label='mmHg @ 0 C',
+        activation_direction='Decreasing',
+        activation_target=400.0,
+        pressure_reference='gauge',
+        terminals={},
+        bands={
+            'increasing': {'lower': float('-inf'), 'upper': 500.0},
+            'decreasing': {'lower': 390.0, 'upper': 410.0},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    min_psi = convert_pressure(390.0, 'mmHg @ 0 C', 'PSI')
+    max_psi = convert_pressure(500.0, 'mmHg @ 0 C', 'PSI')
+    executor = _TestExecutor(
+        port_id='port_a',
+        port=cast(Any, port),
+        test_setup=setup,
+        config={'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}}},
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.7,
+    )
+    executor._read_pressure_and_switch_state = lambda: (min_psi - 0.25, False)  # type: ignore[method-assign]
+
+    executor._prepare_switch_for_cycle_edge(
+        sweep_mode='pressure',
+        min_psi=min_psi,
+        max_psi=max_psi,
+        direction=-1,
+        edge_type='deactivation',
+        overshoot=0.5,
+        hw_min_psi=-14.65,
+        hw_max_psi=15.35,
+    )
+
+    assert port.set_pressure_calls == []
+
+
+def test_decreasing_pressure_cycle_edges_use_observed_polarity_from_transition() -> None:
+    setup = TestSetup(
+        part_id='SPS02072-02',
+        sequence_id='300',
+        units_code='19',
+        units_label='mmHg @ 0 C',
+        activation_direction='Decreasing',
+        activation_target=400.0,
+        pressure_reference='gauge',
+        terminals={},
+        bands={
+            'increasing': {'lower': float('-inf'), 'upper': 500.0},
+            'decreasing': {'lower': 390.0, 'upper': 410.0},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    executor = _TestExecutor(
+        port_id='port_a',
+        port=cast(Any, _FakePort([True])),
+        test_setup=setup,
+        config={'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}}},
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.7,
+    )
+
+    assert executor._cycle_edge_already_present('activation', 10.17, True) is False
+    assert executor._cycle_edge_switch_state_allowed('activation', False) is True
+    executor._cycle_observed_edge_states['activation'] = False
+    assert executor._cycle_edge_switch_state_allowed('activation', True) is False
+    assert executor._cycle_edge_already_present('deactivation', 7.04, False) is False
+    assert executor._cycle_edge_switch_state_allowed('deactivation', True) is True
 
 
 def test_pressure_increasing_pre_approach_resets_below_deactivation_side() -> None:

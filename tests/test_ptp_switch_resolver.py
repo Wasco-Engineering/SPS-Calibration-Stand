@@ -193,3 +193,62 @@ def test_unobservable_ptp_terminals_fail_without_configured_pin_fallback() -> No
     assert result.no_dio is None
     assert result.nc_dio is None
     assert any('not observable' in error for error in result.errors)
+
+
+def test_com5_dual_throw_seq600_uses_drive_nc_read_common() -> None:
+    result = resolve_ptp_switch_config(
+        ptp_params={
+            'NormallyOpenTerminal': '6',
+            'NormallyClosedTerminal': '4',
+            'CommonTerminal': '5',
+        },
+        port_id='port_a',
+        port_config={'switch_sensed_db9_pins': [3]},
+    )
+
+    assert result.is_valid
+    assert result.no_dio == 4
+    assert result.nc_dio == 4
+    assert result.drive_dio == 3
+    assert result.drive_role == 'normally_closed'
+    assert result.derivation_mode == 'drive_nc_read_common'
+    assert result.derive_no_from_nc
+    assert any('COM=5 bench' in warning for warning in result.warnings)
+
+
+def test_com5_dual_throw_seq300_uses_drive_no_read_common() -> None:
+    result = resolve_ptp_switch_config(
+        ptp_params={
+            'NormallyOpenTerminal': '4',
+            'NormallyClosedTerminal': '6',
+            'CommonTerminal': '5',
+        },
+        port_id='port_b',
+        port_config={'switch_sensed_db9_pins': [3]},
+    )
+
+    assert result.is_valid
+    assert result.no_dio == 13
+    assert result.nc_dio == 13
+    assert result.drive_dio == 12
+    assert result.drive_role == 'normally_open'
+    assert result.derivation_mode == 'drive_no_read_common'
+    assert result.derive_nc_from_no
+
+
+def test_com5_single_nc_throw_maps_sensed_pin3_to_nc() -> None:
+    result = resolve_ptp_switch_config(
+        ptp_params={
+            'NormallyOpenTerminal': '0',
+            'NormallyClosedTerminal': '4',
+            'CommonTerminal': '5',
+        },
+        port_id='port_a',
+        port_config={'switch_sensed_db9_pins': [3]},
+    )
+
+    assert result.is_valid
+    assert result.normally_open_terminal is None
+    assert result.drive_dio == 3
+    assert result.derivation_mode == 'drive_nc_read_common'
+    assert result.derive_no_from_nc

@@ -182,11 +182,33 @@ def resolve_ptp_switch_config(
             derivation_mode = 'drive_nc_read_common'
             derive_no_from_nc = True
         else:
-            errors.append(
-                'PTP NO/NC terminals are not observable on this stand '
-                f'(COM={common_terminal}, NO={no_terminal}, NC={nc_terminal}, '
-                f'sensed={list(sensed_pins)})'
+            fallback = _resolve_com5_single_sense_fallback(
+                normalized_port,
+                common_terminal=common_terminal,
+                common_dio=common_dio,
+                no_terminal=no_terminal,
+                nc_terminal=nc_terminal,
+                sensed_pins=sensed_pins,
+                warnings=warnings,
             )
+            if fallback is not None:
+                (
+                    drive_terminal,
+                    drive_dio,
+                    drive_role,
+                    no_dio,
+                    nc_dio,
+                    observed,
+                    derivation_mode,
+                    derive_nc_from_no,
+                    derive_no_from_nc,
+                ) = fallback
+            else:
+                errors.append(
+                    'PTP NO/NC terminals are not observable on this stand '
+                    f'(COM={common_terminal}, NO={no_terminal}, NC={nc_terminal}, '
+                    f'sensed={list(sensed_pins)})'
+                )
 
     return PtpSwitchResolution(
         port_id=normalized_port,
@@ -212,6 +234,91 @@ def resolve_ptp_switch_config(
 def db9_pin_to_dio(port_id: str, pin: int) -> Optional[int]:
     """Public DB9 pin to DIO helper used by diagnostics."""
     return _db9_pin_to_dio(str(port_id).strip().lower(), pin)
+
+
+def _resolve_com5_single_sense_fallback(
+    port_id: str,
+    *,
+    common_terminal: Optional[int],
+    common_dio: Optional[int],
+    no_terminal: Optional[int],
+    nc_terminal: Optional[int],
+    sensed_pins: tuple[int, ...],
+    warnings: list[str],
+) -> Optional[
+    tuple[
+        Optional[int],
+        Optional[int],
+        str,
+        Optional[int],
+        Optional[int],
+        tuple[str, ...],
+        str,
+        bool,
+        bool,
+    ]
+]:
+    """Map COM=5 switches whose PTP throw pins land off the configured sensed pin.
+
+    PTP is correct (COM=5, NO/NC on 4/6). On this bench the red wire lands on
+    DB9 pin 3, but deep diagnostic (2026-06-25, SPS02262-02 seq 600) showed
+    switch transitions on PTP CommonTerminal pin 5 (DIO4), not pin 3 (DIO2).
+    Read common on pin 5 and drive the active throw pin directly.
+    """
+
+    if common_terminal != 5 or len(sensed_pins) != 1 or common_dio is None:
+        return None
+    if no_terminal is None and nc_terminal is None:
+        return None
+
+    read_dio = common_dio
+    no_ptp_dio = _db9_pin_to_dio(port_id, no_terminal)
+    nc_ptp_dio = _db9_pin_to_dio(port_id, nc_terminal)
+
+    observe_no = no_terminal is not None and nc_terminal is None
+    if no_terminal is not None and nc_terminal is not None:
+        active_throw = min(no_terminal, nc_terminal)
+        observe_no = active_throw == no_terminal
+
+    bench_note = (
+        f'COM=5 bench: read PTP CommonTerminal pin {common_terminal} (DIO{read_dio}), '
+        f'not configured sensed pin {sensed_pins[0]}'
+    )
+
+    if observe_no:
+        if no_ptp_dio is None:
+            return None
+        warnings.append(
+            f'{bench_note}; drive NormallyOpenTerminal {no_terminal}'
+        )
+        return (
+            no_terminal,
+            no_ptp_dio,
+            'normally_open',
+            read_dio,
+            read_dio,
+            ('common_as_normally_open',),
+            'drive_no_read_common',
+            True,
+            False,
+        )
+
+    if nc_ptp_dio is None:
+        return None
+    warnings.append(
+        f'{bench_note}; drive NormallyClosedTerminal {nc_terminal}'
+    )
+    return (
+        nc_terminal,
+        nc_ptp_dio,
+        'normally_closed',
+        read_dio,
+        read_dio,
+        ('common_as_normally_closed',),
+        'drive_nc_read_common',
+        False,
+        True,
+    )
 
 
 def _terminal_from_ptp(
