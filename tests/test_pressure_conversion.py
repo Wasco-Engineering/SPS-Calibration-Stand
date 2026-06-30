@@ -210,6 +210,39 @@ def test_torr_pressure_visualization_keeps_atmosphere_on_torr_scale() -> None:
     assert viz['max_psi'] < 1000.0
 
 
+def test_pressure_visualization_keeps_psig_atmosphere_on_gauge_scale() -> None:
+    setup = derive_test_setup(
+        '17123',
+        '399',
+        {
+            'ActivationTarget': '10.000000',
+            'IncreasingLowerLimit': '9.500000',
+            'IncreasingUpperLimit': '10.500000',
+            'DecreasingLowerLimit': '7.000000',
+            'DecreasingUpperLimit': '9.500000',
+            'ResetBandLowerLimit': '-Inf',
+            'ResetBandUpperLimit': 'Inf',
+            'TargetActivationDirection': 'Increasing',
+            'UnitsOfMeasure': '1',
+            'PressureReference': 'Gauge',
+            'CommonTerminal': '1',
+            'NormallyOpenTerminal': '2',
+            'NormallyClosedTerminal': '0',
+        },
+    )
+
+    viz = build_pressure_visualization(
+        setup,
+        {},
+        atmosphere_override=14.7,
+        display_units_override='PSIG',
+    )
+
+    assert viz['atmosphere_psi'] == pytest.approx(0.0, abs=1e-6)
+    assert viz['activation_band'] == pytest.approx((9.5, 10.5))
+    assert viz['deactivation_band'] == pytest.approx((7.0, 9.5))
+
+
 def test_barometric_plausibility_guard() -> None:
     assert is_plausible_barometric_psi(14.7)
     assert not is_plausible_barometric_psi(0.2635)

@@ -283,6 +283,32 @@ def test_ptp_common_sensed_drives_connected_throw(monkeypatch: Any) -> None:
     assert port.last_switch_resolution.drive_dio == 5
 
 
+def test_ptp_spst_fallback_reads_connected_throw(monkeypatch: Any) -> None:
+    port = _make_port(
+        monkeypatch,
+        labjack_overrides={
+            'switch_sensed_db9_pins': [3],
+        },
+    )
+    ok = port.configure_from_ptp(
+        {
+            'NormallyOpenTerminal': '2',
+            'NormallyClosedTerminal': '0',
+            'CommonTerminal': '1',
+            'PressureReference': 'Gauge',
+        }
+    )
+
+    assert ok
+    daq = port.daq
+    assert isinstance(daq, _FakeLabJackController)
+    assert daq.configure_di_calls[-1] == (1, 1, 0, 0)
+    assert daq.switch_nc_derived_from_no
+    assert not daq.switch_no_derived_from_nc
+    assert port.last_switch_resolution is not None
+    assert port.last_switch_resolution.derivation_mode == 'derive_nc_from_no'
+
+
 def test_ptp_invalid_terminal_fails_without_configured_pin_fallback(monkeypatch: Any) -> None:
     port = _make_port(
         monkeypatch,

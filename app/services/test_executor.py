@@ -235,6 +235,7 @@ class CyclePhaseRunner:
             return
 
         # ---- Phase 1: Ramp toward activation until activation edge detected ----
+        self._ctx._cycle_prep_confirmed = True
         self._ctx._prepare_switch_for_cycle_edge(
             sweep_mode=sweep_mode,
             min_psi=min_psi,
@@ -247,25 +248,29 @@ class CyclePhaseRunner:
         )
         self._ctx._emit_substate('cycling.wait_activation')
 
-        target_activation_abs = self._ctx._to_absolute(target_activation)
+        # If prep could not confirm switch position, use the full fallback target to
+        # guarantee the ramp crosses the entire band regardless of starting state.
+        act_target = full_activation if not self._ctx._cycle_prep_confirmed else target_activation
+        target_activation_abs = self._ctx._to_absolute(act_target)
         self._ctx._set_pressure_or_raise(target_activation_abs)
         self._ctx._port.alicat.cancel_hold()
 
         logger.info(
-            '%s: Cycle ramp toward activation (target=%.4f PSI)',
+            '%s: Cycle ramp toward activation (target=%.4f PSI%s)',
             self._ctx._port_id,
-            target_activation,
+            act_target,
+            ', full-range fallback: prep unconfirmed' if not self._ctx._cycle_prep_confirmed else '',
         )
 
         # Wait for activation edge - check if debounce system commits an activation
         activation_samples_before = len(self._ctx._cycle_activation_samples)
         activation_detected, activation_diagnostic = self._ctx._wait_for_cycle_edge(
-            target_psi=target_activation,
+            target_psi=act_target,
             direction=direction,
             edge_type='activation',
             samples_before=activation_samples_before,
             timeout_s=self._ctx._edge_timeout_s,
-            fallback_target_psi=activation_fallback,
+            fallback_target_psi=full_activation if act_target != full_activation else None,
         )
 
         if self._ctx._cancel_event.is_set():
@@ -298,6 +303,7 @@ class CyclePhaseRunner:
         )
 
         # ---- Phase 2: Immediately reverse direction and ramp toward deactivation until deactivation edge detected ----
+        self._ctx._cycle_prep_confirmed = True
         self._ctx._prepare_switch_for_cycle_edge(
             sweep_mode=sweep_mode,
             min_psi=min_psi,
@@ -312,7 +318,8 @@ class CyclePhaseRunner:
         deactivation_port_edges_before = len(get_history()) if callable(get_history) else None
         self._ctx._emit_substate('cycling.wait_deactivation')
 
-        target_deactivation_abs = self._ctx._to_absolute(target_deactivation)
+        deact_target = full_deactivation if not self._ctx._cycle_prep_confirmed else target_deactivation
+        target_deactivation_abs = self._ctx._to_absolute(deact_target)
         if not self._ctx._port.alicat.set_ramp_rate(self._ctx._fast_rate_psi):
             self._ctx._fail(
                 TestFailureCode.RAMP_RATE_FAILURE,
@@ -322,20 +329,21 @@ class CyclePhaseRunner:
         self._ctx._port.alicat.cancel_hold()
 
         logger.info(
-            '%s: Cycle fast ramp to deactivation target %.4f PSI, waiting for reset edge',
+            '%s: Cycle fast ramp to deactivation target %.4f PSI, waiting for reset edge%s',
             self._ctx._port_id,
-            target_deactivation,
+            deact_target,
+            ' (full-range fallback: prep unconfirmed)' if not self._ctx._cycle_prep_confirmed else '',
         )
 
         # Wait for deactivation edge - check if debounce system commits a deactivation
         deactivation_samples_before = len(self._ctx._cycle_deactivation_samples)
         deactivation_detected, deactivation_diagnostic = self._ctx._wait_for_cycle_edge(
-            target_psi=target_deactivation,
+            target_psi=deact_target,
             direction=deactivation_direction,
             edge_type='deactivation',
             samples_before=deactivation_samples_before,
             timeout_s=self._ctx._edge_timeout_s,
-            fallback_target_psi=deactivation_fallback,
+            fallback_target_psi=full_deactivation if deact_target != full_deactivation else None,
             port_edges_before=deactivation_port_edges_before,
         )
 
@@ -924,6 +932,7 @@ class TestExecutor:
         self._cycle_observed_edge_states: dict[str, bool] = {}
         self._cycle_debounce_state = SpdtDebounceState()
         self._cycle_waiting_edge: Optional[str] = None
+        self._cycle_prep_confirmed: bool = True
         self._run_atmosphere_psi: Optional[float] = None
         self._alicat_setpoint_ref: Optional[str] = None
         self._last_precision_missing_edge: Optional[str] = None
@@ -1627,6 +1636,63 @@ class TestExecutor:
             return pressure, None
         return pressure, self._effective_switch_state(reading.switch)
 
+    def _cycle_prep_geometry(
+        self,
+        *,
+        edge_type: str,
+        sweep_mode: str,
+        min_psi: float,
+        max_psi: float,
+        hw_min_psi: float,
+        hw_max_psi: float,
+        overshoot: float,
+    ) -> tuple[bool, float, float]:
+        """Return (prep_state, prep_target_psi, margin_psi) for a cycle-prep leg.
+
+        prep_state: the switch state the prep move is trying to achieve
+                    (= not cycle_target_switch_state, i.e. the reset/opposite side)
+        prep_target_psi: pressure to ramp to in order to reach prep_state
+        margin_psi: tolerance for "already at prep side" position check
+
+        Geometry rules (test-reference PSI):
+          pressure increasing (dir>0): activation=high(max), reset=low(min)
+          pressure decreasing (dir<0): activation=low(min),  reset=high(max)
+          vacuum (any direction for the generic path): same as above based on direction
+
+        For activation leg: prep_state=reset side; for deactivation leg: prep_state=activation side.
+        """
+        nudge_psi = max(overshoot, self._precision_prepass_nudge_psi)
+        margin_psi = max(0.15, self._precision_approach_tolerance_psi)
+        prep_state = not self._cycle_target_switch_state(edge_type)
+        direction = self._resolve_activation_sweep_direction()
+
+        if edge_type == 'activation':
+            # To be ready for the activation sweep, position at the reset side.
+            if direction < 0:
+                # Decreasing sweep: activation is low, reset is high.
+                prep_target = min(hw_max_psi, max_psi + nudge_psi)
+            else:
+                # Increasing sweep: activation is high, reset is low.
+                prep_target = max(hw_min_psi, min_psi - nudge_psi)
+        else:
+            # To be ready for the deactivation sweep, position at the activation side.
+            if direction < 0:
+                # Decreasing sweep: activation is low, reset is high.
+                prep_target = max(hw_min_psi, min_psi - nudge_psi)
+            else:
+                # Increasing sweep: activation is high, reset is low.
+                prep_target = min(hw_max_psi, max_psi + nudge_psi)
+
+        return prep_state, prep_target, margin_psi
+
+    def _seed_debounce_from_live_reading(self) -> None:
+        """Refresh debounce state from the latest port reading."""
+        reading = self._get_latest_reading(self._port_id)
+        if reading is not None and reading.switch is not None:
+            self._cycle_debounce_state = self._spdt_debounce_from_switch(reading.switch)
+        else:
+            self._cycle_debounce_state = SpdtDebounceState()
+
     def _prepare_switch_for_cycle_edge(
         self,
         *,
@@ -1639,72 +1705,39 @@ class TestExecutor:
         hw_min_psi: float,
         hw_max_psi: float,
     ) -> None:
-        """Move to the opposite side of the edge before a fast cycle ramp.
+        """Best-effort positioning before a fast cycle ramp.
 
-        If the switch is already in the target state for the upcoming leg (e.g. NO
-        already closed before the activation ramp), cycling would otherwise sit in
-        _wait_for_cycle_edge until the full timeout with no ACT/DEC estimates.
+        Moves pressure to the opposite side of the edge so the upcoming ramp
+        starts in the right place and detects a clean transition. This is a
+        SPEED OPTIMISATION ONLY — it must never abort the test.
+
+        If positioning cannot be confirmed (switch does not flip within the timeout,
+        or pressure can't be reached), the method logs a warning and sets
+        _cycle_prep_confirmed=False, then returns. The caller (run_single_cycle)
+        will use the full-range fallback target to guarantee the ramp still crosses
+        the band and the edge wait will declare NO_SWITCH_DETECTED only after a
+        genuine full traverse with no transition.
         """
         pressure, switch_state = self._read_pressure_and_switch_state()
         if switch_state is None:
             self._cycle_debounce_state = SpdtDebounceState()
+            self._cycle_prep_confirmed = True
             return
 
-        nudge_psi = max(overshoot, self._precision_prepass_nudge_psi)
-
-        if (
-            sweep_mode == 'pressure'
-            and self._resolve_activation_sweep_direction() < 0
-            and edge_type == 'activation'
-            and pressure is not None
-            and math.isfinite(pressure)
-            and pressure >= max_psi
-        ):
-            reading = self._get_latest_reading(self._port_id)
-            if reading is not None and reading.switch is not None:
-                self._cycle_debounce_state = self._spdt_debounce_from_switch(reading.switch)
-            else:
-                self._cycle_debounce_state = SpdtDebounceState()
-            logger.info(
-                '%s: Cycle prep skipped for decreasing-pressure activation leg; '
-                'pressure %.4f PSI is on high side before falling edge',
-                self._port_id,
-                pressure,
-            )
-            return
-
-        if (
-            sweep_mode == 'pressure'
-            and self._resolve_activation_sweep_direction() < 0
-            and edge_type == 'deactivation'
-            and pressure is not None
-            and math.isfinite(pressure)
-            and pressure <= min_psi
-        ):
-            reading = self._get_latest_reading(self._port_id)
-            if reading is not None and reading.switch is not None:
-                self._cycle_debounce_state = self._spdt_debounce_from_switch(reading.switch)
-            else:
-                self._cycle_debounce_state = SpdtDebounceState()
-            logger.info(
-                '%s: Cycle prep skipped for decreasing-pressure deactivation leg; '
-                'pressure %.4f PSI is on low side before rising edge',
-                self._port_id,
-                pressure,
-            )
-            return
-
+        # ----------------------------------------------------------------
+        # Preserved verbatim: decreasing-vacuum (trips_on_no_open) branches
+        # (bench-verified, fully tested)
+        # ----------------------------------------------------------------
         if (
             edge_type == 'activation'
             and self._resolve_sweep_mode() == 'vacuum'
             and self._resolve_activation_sweep_direction() < 0
             and self._vacuum_switch_trips_on_no_open()
         ):
+            nudge_psi = max(overshoot, self._precision_prepass_nudge_psi)
             nudge_target = min(hw_max_psi, max_psi + nudge_psi)
             prep_state = not self._cycle_target_switch_state(edge_type)
             target_state = self._cycle_target_switch_state(edge_type)
-            # Very low absolute windows can sit near the band after a prior pull;
-            # reset them above the band so the next vacuum leg sees a real edge.
             low_absolute_window = max_psi <= convert_pressure(50.0, 'Torr', 'PSI')
             already_on_activation_side = (
                 not low_absolute_window
@@ -1769,32 +1802,9 @@ class TestExecutor:
                     self._port_id,
                     f'{pressure:.4f} PSI' if pressure is not None else '--',
                 )
-            reading = self._get_latest_reading(self._port_id)
-            if reading is not None and reading.switch is not None:
-                self._cycle_debounce_state = self._spdt_debounce_from_switch(reading.switch)
-            else:
-                self._cycle_debounce_state = SpdtDebounceState()
+            self._seed_debounce_from_live_reading()
+            self._cycle_prep_confirmed = True
             return
-
-        if edge_type == 'activation' and pressure is not None and math.isfinite(pressure):
-            starts_before_edge = (
-                (direction > 0 and pressure <= min_psi)
-                or (direction < 0 and pressure >= max_psi)
-            )
-            prep_state = not self._cycle_target_switch_state(edge_type)
-            if starts_before_edge and switch_state == prep_state:
-                reading = self._get_latest_reading(self._port_id)
-                if reading is not None and reading.switch is not None:
-                    self._cycle_debounce_state = self._spdt_debounce_from_switch(reading.switch)
-                else:
-                    self._cycle_debounce_state = SpdtDebounceState()
-                logger.info(
-                    '%s: Cycle prep skipped for %s leg; pressure %.4f PSI is already before edge band',
-                    self._port_id,
-                    edge_type,
-                    pressure,
-                )
-                return
 
         if (
             edge_type == 'deactivation'
@@ -1802,39 +1812,56 @@ class TestExecutor:
             and self._resolve_activation_sweep_direction() < 0
             and self._vacuum_switch_trips_on_no_open()
         ):
-            reading = self._get_latest_reading(self._port_id)
-            if reading is not None and reading.switch is not None:
-                self._cycle_debounce_state = self._spdt_debounce_from_switch(reading.switch)
-            else:
-                self._cycle_debounce_state = SpdtDebounceState()
+            self._seed_debounce_from_live_reading()
             logger.info(
                 '%s: Cycle prep skipped for decreasing-vacuum deactivation leg; returning through reset edge',
                 self._port_id,
             )
+            self._cycle_prep_confirmed = True
             return
 
-        prep_state = not self._cycle_target_switch_state(edge_type)
-        if switch_state == prep_state:
-            reading = self._get_latest_reading(self._port_id)
-            if reading is not None and reading.switch is not None:
-                self._cycle_debounce_state = self._spdt_debounce_from_switch(reading.switch)
-            else:
-                self._cycle_debounce_state = SpdtDebounceState()
+        # ----------------------------------------------------------------
+        # Generic path: all other families (A, B, C)
+        # Use geometry helper to compute the correct prep side.
+        # ----------------------------------------------------------------
+        prep_state, prep_target, margin_psi = self._cycle_prep_geometry(
+            edge_type=edge_type,
+            sweep_mode=sweep_mode,
+            min_psi=min_psi,
+            max_psi=max_psi,
+            hw_min_psi=hw_min_psi,
+            hw_max_psi=hw_max_psi,
+            overshoot=overshoot,
+        )
+
+        # Skip prep if pressure is already at/past the band boundary on the prep
+        # side — the upcoming ramp will naturally cross the edge regardless of
+        # the current switch reading.  No margin here: mid-band should not skip,
+        # especially for narrow near-atmosphere bands.
+        already_on_prep_side = (
+            pressure is not None
+            and math.isfinite(pressure)
+            and (
+                (prep_target >= max_psi and pressure >= max_psi)
+                or (prep_target <= min_psi and pressure <= min_psi)
+            )
+        )
+        if switch_state == prep_state or already_on_prep_side:
+            self._seed_debounce_from_live_reading()
+            logger.info(
+                '%s: Cycle prep skipped for %s leg; switch=%s pressure=%s PSI already on prep side '
+                '(target %.4f PSI)',
+                self._port_id,
+                edge_type,
+                'activated' if switch_state else 'deactivated',
+                f'{pressure:.4f}' if pressure is not None else '--',
+                prep_target,
+            )
+            self._cycle_prep_confirmed = True
             return
 
-        if prep_state:
-            if direction > 0:
-                nudge_target = max(hw_min_psi, min_psi - nudge_psi)
-            else:
-                nudge_target = min(hw_max_psi, max_psi + nudge_psi)
-            substate = 'cycling.prep_activated'
-        else:
-            if direction > 0:
-                nudge_target = max(hw_min_psi, min_psi - nudge_psi)
-            else:
-                nudge_target = max(hw_min_psi, min_psi - nudge_psi)
-            substate = 'cycling.prep_deactivated'
-
+        # Need to move: ramp to prep_target and wait for switch to reach prep_state.
+        substate = 'cycling.prep_activated' if prep_state else 'cycling.prep_deactivated'
         logger.info(
             '%s: Switch %s at %.4f PSI before %s leg (need %s); nudging to %.4f PSI',
             self._port_id,
@@ -1842,7 +1869,7 @@ class TestExecutor:
             pressure if pressure is not None else float('nan'),
             edge_type,
             'activated' if prep_state else 'deactivated',
-            nudge_target,
+            prep_target,
         )
         self._emit_substate(substate)
 
@@ -1852,45 +1879,63 @@ class TestExecutor:
                 TestFailureCode.RAMP_RATE_FAILURE,
                 f'Failed to set ramp rate for cycle prep on {self._port_id}',
             )
-        self._set_pressure_or_raise(self._to_absolute(nudge_target))
+        self._set_pressure_or_raise(self._to_absolute(prep_target))
         self._port.alicat.cancel_hold()
 
         prep_timeout_s = min(5.0, self._edge_timeout_s)
         prep_start = time.perf_counter()
-        near_target_since: Optional[float] = None
+        near_target_since_: Optional[float] = None
         while time.perf_counter() - prep_start < prep_timeout_s:
             if self._cancel_event.is_set():
                 return
             pressure_now, state = self._read_pressure_and_switch_state()
             if state == prep_state:
-                reading = self._get_latest_reading(self._port_id)
-                if reading is not None and reading.switch is not None:
-                    self._cycle_debounce_state = self._spdt_debounce_from_switch(reading.switch)
-                else:
-                    self._cycle_debounce_state = SpdtDebounceState()
+                self._seed_debounce_from_live_reading()
                 logger.info(
                     '%s: Cycle prep complete — switch now %s',
                     self._port_id,
                     'activated' if state else 'deactivated',
                 )
+                self._cycle_prep_confirmed = True
                 return
-            if pressure_now is not None and abs(pressure_now - nudge_target) <= max(0.15, self._precision_approach_tolerance_psi):
-                now = time.perf_counter()
-                if near_target_since is None:
-                    near_target_since = now
-                elif now - near_target_since >= 1.0:
-                    break
-            else:
-                near_target_since = None
+            # Accept if pressure is at the band boundary on the prep side even if
+            # the switch hasn't flipped yet (hysteresis lag).
+            if pressure_now is not None and math.isfinite(pressure_now):
+                at_prep_side = (
+                    (prep_target >= max_psi and pressure_now >= max_psi - margin_psi)
+                    or (prep_target <= min_psi and pressure_now <= min_psi + margin_psi)
+                )
+                if at_prep_side:
+                    now = time.perf_counter()
+                    if near_target_since_ is None:
+                        near_target_since_ = now
+                    elif now - near_target_since_ >= 1.0:
+                        self._seed_debounce_from_live_reading()
+                        logger.info(
+                            '%s: Cycle prep accepted by pressure %.4f PSI at prep side '
+                            '(switch hysteresis lag; %s leg)',
+                            self._port_id,
+                            pressure_now,
+                            edge_type,
+                        )
+                        self._cycle_prep_confirmed = True
+                        return
+                else:
+                    near_target_since_ = None
             time.sleep(0.02)
 
-        self._fail(
-            TestFailureCode.NO_SWITCH_DETECTED,
-            (
-                f'Switch did not reach {"activated" if prep_state else "deactivated"} '
-                f'state at cycle prep target {nudge_target:.3f} PSI on {self._port_id}'
-            ),
+        # Prep timed out: best-effort only, do NOT abort. The full-range fallback
+        # in run_single_cycle guarantees the cycle still crosses the band.
+        self._seed_debounce_from_live_reading()
+        logger.warning(
+            '%s: Cycle prep could not confirm %s state before %s leg '
+            '(timed out at prep target %.4f PSI) — falling back to full-range traverse',
+            self._port_id,
+            'activated' if prep_state else 'deactivated',
+            edge_type,
+            prep_target,
         )
+        self._cycle_prep_confirmed = False
 
     # ------------------------------------------------------------------
     # Precision sweep

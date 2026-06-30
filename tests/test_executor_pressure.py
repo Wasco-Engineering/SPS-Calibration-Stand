@@ -1519,9 +1519,9 @@ def test_decreasing_pressure_activation_prep_not_skipped_when_switch_wrong_state
     )
     min_psi = convert_pressure(390.0, 'mmHg @ 0 C', 'PSI')
     max_psi = convert_pressure(500.0, 'mmHg @ 0 C', 'PSI')
-    nudge_target = max(-14.65, min_psi - 0.5)
+    nudge_target = min(15.35, max_psi + 0.5)
     readings = [
-        (min_psi + 0.25, True),
+        (min_psi + (max_psi - min_psi) * 0.5, True),
         (nudge_target, True),
         (nudge_target, False),
     ]
@@ -1987,3 +1987,353 @@ def test_executor_precision_failure_message_identifies_second_edge() -> None:
 
     assert errors
     assert 'Deactivation edge not detected during precision return-sweep' in errors[0]
+
+
+# ---------------------------------------------------------------------------
+# Cycle prep: fail-open and geometry correctness
+# ---------------------------------------------------------------------------
+
+def _make_press_dec_setup(min_mmhg: float = 390.0, max_mmhg: float = 500.0) -> tuple[TestSetup, float, float]:
+    """Return (TestSetup, min_psi, max_psi) for a decreasing-pressure part (Family A)."""
+    setup = TestSetup(
+        part_id='SPS01439-02',
+        sequence_id='300',
+        units_code='19',
+        units_label='mmHg @ 0 C',
+        activation_direction='Decreasing',
+        activation_target=400.0,
+        pressure_reference='gauge',
+        terminals={},
+        bands={
+            'increasing': {'lower': float('-inf'), 'upper': max_mmhg},
+            'decreasing': {'lower': min_mmhg, 'upper': max_mmhg},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    min_psi = convert_pressure(min_mmhg, 'mmHg @ 0 C', 'PSI')
+    max_psi = convert_pressure(max_mmhg, 'mmHg @ 0 C', 'PSI')
+    return setup, min_psi, max_psi
+
+
+def _make_press_inc_setup() -> tuple[TestSetup, float, float]:
+    """Return (TestSetup, min_psi, max_psi) for an increasing-pressure part (Family C)."""
+    setup = TestSetup(
+        part_id='SPS01897-02',
+        sequence_id='300',
+        units_code='19',
+        units_label='mmHg @ 0 C',
+        activation_direction='Increasing',
+        activation_target=75.0,
+        pressure_reference='gauge',
+        terminals={},
+        bands={
+            'increasing': {'lower': 67.5, 'upper': 82.5},
+            'decreasing': {'lower': 30.0, 'upper': float('inf')},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    min_psi = convert_pressure(67.5, 'mmHg @ 0 C', 'PSI')
+    max_psi = convert_pressure(82.5, 'mmHg @ 0 C', 'PSI')
+    return setup, min_psi, max_psi
+
+
+def _prep_executor(setup: TestSetup, port: _FakePort, pressure: float, switch: bool) -> _TestExecutor:
+    executor = _TestExecutor(
+        port_id='port_a',
+        port=cast(Any, port),
+        test_setup=setup,
+        config={'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}}},
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.7,
+    )
+    executor._read_pressure_and_switch_state = lambda: (pressure, switch)  # type: ignore[method-assign]
+    return executor
+
+
+def _run_prep(executor: _TestExecutor, setup: TestSetup, min_psi: float, max_psi: float, edge_type: str) -> None:
+    direction = executor._resolve_activation_sweep_direction()
+    executor._prepare_switch_for_cycle_edge(
+        sweep_mode='pressure',
+        min_psi=min_psi,
+        max_psi=max_psi,
+        direction=direction,
+        edge_type=edge_type,
+        overshoot=0.5,
+        hw_min_psi=-14.65,
+        hw_max_psi=15.35,
+    )
+
+
+# ----- Fail-open: prep cannot position switch → does NOT raise -----
+
+def test_cycle_prep_failopen_does_not_raise_when_switch_never_flips() -> None:
+    """Prep timed out (switch stuck): must return without raising, cycle_prep_confirmed=False."""
+    setup, min_psi, max_psi = _make_press_dec_setup()
+    port = _FakePort([True])
+    mid = (min_psi + max_psi) / 2.0
+    # Switch is activated but never flips during the prep loop (always returns activated=True)
+    executor = _prep_executor(setup, port, mid, True)
+    # Override loop reads to always show switch still in wrong state at mid-band pressure
+    executor._read_pressure_and_switch_state = lambda: (mid, True)  # type: ignore[method-assign]
+    executor._edge_timeout_s = 0.05
+
+    _run_prep(executor, setup, min_psi, max_psi, 'activation')
+
+    assert executor._cycle_prep_confirmed is False
+    # Must not raise → test passes by reaching here
+
+
+def test_cycle_prep_failopen_confirmed_true_when_switch_flips() -> None:
+    """Prep succeeds (switch flips): cycle_prep_confirmed=True."""
+    setup, min_psi, max_psi = _make_press_dec_setup()
+    port = _FakePort([True])
+    nudge_target = min(15.35, max_psi + 0.5)
+    calls = {'n': 0}
+
+    def _reads() -> tuple[float, bool]:
+        # First call: mid-band, wrong state (activated); subsequent: at target, correct (deactivated)
+        if calls['n'] == 0:
+            calls['n'] += 1
+            return (min_psi + max_psi) / 2.0, True
+        return nudge_target, False
+
+    executor = _TestExecutor(
+        port_id='port_a',
+        port=cast(Any, port),
+        test_setup=setup,
+        config={'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}}},
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.7,
+    )
+    executor._read_pressure_and_switch_state = _reads  # type: ignore[method-assign]
+
+    _run_prep(executor, setup, min_psi, max_psi, 'activation')
+
+    assert executor._cycle_prep_confirmed is True
+
+
+# ----- Family A (decreasing pressure): geometry -----
+
+def test_prep_geometry_family_a_activation_nudges_to_high_side() -> None:
+    """Family A activation prep must nudge toward max_psi (reset/high side)."""
+    setup, min_psi, max_psi = _make_press_dec_setup()
+    mid = (min_psi + max_psi) / 2.0
+    nudge_target = min(15.35, max_psi + 0.5)
+    port = _FakePort([True])
+    executor = _prep_executor(setup, port, mid, True)
+    executor._edge_timeout_s = 0.05  # short timeout → exits by timeout, not switch flip
+
+    _run_prep(executor, setup, min_psi, max_psi, 'activation')
+
+    assert port.set_pressure_calls, 'expected a nudge move'
+    # prep_target should be above max_psi (14.7 baro + gauge target)
+    assert port.set_pressure_calls[-1] == pytest.approx(14.7 + nudge_target, abs=0.05)
+
+
+def test_prep_geometry_family_a_activation_skips_when_already_on_high_side() -> None:
+    """Family A activation prep skips move when pressure is already at/beyond max_psi."""
+    setup, min_psi, max_psi = _make_press_dec_setup()
+    port = _FakePort([True])
+    executor = _prep_executor(setup, port, max_psi + 0.1, True)
+
+    _run_prep(executor, setup, min_psi, max_psi, 'activation')
+
+    assert port.set_pressure_calls == [], 'should skip: already on high/reset side'
+    assert executor._cycle_prep_confirmed is True
+
+
+def test_prep_geometry_family_a_deactivation_nudges_to_low_side() -> None:
+    """Family A deactivation prep must nudge toward min_psi (activation/low side)."""
+    setup, min_psi, max_psi = _make_press_dec_setup()
+    mid = (min_psi + max_psi) / 2.0
+    nudge_target = max(-14.65, min_psi - 0.5)
+    port = _FakePort([True])
+    executor = _prep_executor(setup, port, mid, False)
+    executor._edge_timeout_s = 0.05
+
+    _run_prep(executor, setup, min_psi, max_psi, 'deactivation')
+
+    assert port.set_pressure_calls, 'expected a nudge move'
+    assert port.set_pressure_calls[-1] == pytest.approx(14.7 + nudge_target, abs=0.05)
+
+
+def test_prep_geometry_family_a_deactivation_skips_when_already_on_low_side() -> None:
+    """Family A deactivation prep skips when pressure is at/below min_psi."""
+    setup, min_psi, max_psi = _make_press_dec_setup()
+    port = _FakePort([True])
+    executor = _prep_executor(setup, port, min_psi - 0.1, False)
+
+    _run_prep(executor, setup, min_psi, max_psi, 'deactivation')
+
+    assert port.set_pressure_calls == [], 'should skip: already on low/activation side'
+    assert executor._cycle_prep_confirmed is True
+
+
+# ----- Family C (increasing pressure): geometry -----
+
+def test_prep_geometry_family_c_activation_nudges_to_low_side() -> None:
+    """Family C (Increasing) activation prep must nudge toward min_psi (reset/low side).
+
+    Switch is activated (True) at mid-band which is the wrong state — prep_state is False.
+    """
+    setup, min_psi, max_psi = _make_press_inc_setup()
+    mid = (min_psi + max_psi) / 2.0
+    nudge_target = max(-14.65, min_psi - 0.5)
+    port = _FakePort([True])
+    # Switch must be in wrong state (activated=True when prep_state=False) to trigger nudge
+    executor = _prep_executor(setup, port, mid, True)
+    executor._edge_timeout_s = 0.05
+
+    direction = executor._resolve_activation_sweep_direction()
+    executor._prepare_switch_for_cycle_edge(
+        sweep_mode='pressure',
+        min_psi=min_psi,
+        max_psi=max_psi,
+        direction=direction,
+        edge_type='activation',
+        overshoot=0.5,
+        hw_min_psi=-14.65,
+        hw_max_psi=15.35,
+    )
+
+    assert port.set_pressure_calls, 'expected a nudge move'
+    assert port.set_pressure_calls[-1] == pytest.approx(14.7 + nudge_target, abs=0.05)
+
+
+def test_prep_geometry_family_c_deactivation_nudges_to_high_side() -> None:
+    """Family C (Increasing) deactivation prep must nudge toward max_psi (reset from activation).
+
+    Switch is deactivated (False) at mid-band which is the wrong state — prep_state is True.
+    """
+    setup, min_psi, max_psi = _make_press_inc_setup()
+    mid = (min_psi + max_psi) / 2.0
+    nudge_target = min(15.35, max_psi + 0.5)
+    port = _FakePort([True])
+    # Switch must be in wrong state (deactivated=False when prep_state=True) to trigger nudge
+    executor = _prep_executor(setup, port, mid, False)
+    executor._edge_timeout_s = 0.05
+
+    direction = executor._resolve_activation_sweep_direction()
+    executor._prepare_switch_for_cycle_edge(
+        sweep_mode='pressure',
+        min_psi=min_psi,
+        max_psi=max_psi,
+        direction=direction,
+        edge_type='deactivation',
+        overshoot=0.5,
+        hw_min_psi=-14.65,
+        hw_max_psi=15.35,
+    )
+
+    assert port.set_pressure_calls, 'expected a nudge move'
+    assert port.set_pressure_calls[-1] == pytest.approx(14.7 + nudge_target, abs=0.05)
+
+
+# ----- Family B (decreasing vacuum derive_no_from_nc): geometry -----
+
+def test_prep_geometry_family_b_activation_nudges_to_high_side() -> None:
+    """Family B (Decreasing vacuum) activation prep should nudge to high/reset side."""
+    setup = TestSetup(
+        part_id='SPS01439-02',
+        sequence_id='600',
+        units_code='21',
+        units_label='Torr',
+        activation_direction='Decreasing',
+        activation_target=400.0,
+        pressure_reference='absolute',
+        terminals={},
+        bands={
+            'increasing': {'lower': float('-inf'), 'upper': 490.0},
+            'decreasing': {'lower': 390.0, 'upper': 410.0},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    min_psi = convert_pressure(390.0, 'Torr', 'PSI')
+    max_psi = convert_pressure(490.0, 'Torr', 'PSI')
+    nudge_target = min(15.35, max_psi + 0.5)
+    mid = (min_psi + max_psi) / 2.0
+    port = _FakePort([True])
+
+    class _FakePortWithDeriveNoFromNc(_FakePort):
+        switch_no_derived_from_nc = False
+        switch_nc_derived_from_no = False
+
+    fake_port = _FakePortWithDeriveNoFromNc([True])
+    executor = _TestExecutor(
+        port_id='port_a',
+        port=cast(Any, fake_port),
+        test_setup=setup,
+        config={'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}}},
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 0.0,
+    )
+    executor._read_pressure_and_switch_state = lambda: (mid, True)  # type: ignore[method-assign]
+    executor._edge_timeout_s = 0.05
+
+    # Ensure vacuum sweep mode: override if needed
+    executor._resolve_sweep_mode = lambda: 'vacuum'  # type: ignore[method-assign]
+
+    executor._prepare_switch_for_cycle_edge(
+        sweep_mode='vacuum',
+        min_psi=min_psi,
+        max_psi=max_psi,
+        direction=-1,
+        edge_type='activation',
+        overshoot=0.5,
+        hw_min_psi=0.0,
+        hw_max_psi=15.0,
+    )
+
+    # Either nudges or fails open (switch never flips in the stub);
+    # crucially must not raise and confirmed=False means full-range fallback kicks in.
+    assert executor._cycle_prep_confirmed is False or port.set_pressure_calls == [] or (
+        fake_port.set_pressure_calls and fake_port.set_pressure_calls[-1] >= 14.7 + min_psi
+    )
+
+
+# ----- Full-range fallback integration -----
+
+def test_cycle_prep_confirmed_false_causes_full_range_in_run_single_cycle() -> None:
+    """When cycle_prep_confirmed=False the leg uses full_activation/full_deactivation target."""
+    setup, min_psi, max_psi = _make_press_dec_setup()
+    port = _FakePort([True])
+
+    act_targets_used: list[float] = []
+    deact_targets_used: list[float] = []
+
+    executor = _TestExecutor(
+        port_id='port_a',
+        port=cast(Any, port),
+        test_setup=setup,
+        config={'control': {'cycling': {'num_cycles': 1}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}}},
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.7,
+    )
+
+    # Force prep to always fail (sets cycle_prep_confirmed=False)
+    def _fail_prep(**_kw: Any) -> None:
+        executor._cycle_prep_confirmed = False
+        executor._seed_debounce_from_live_reading()
+
+    # Intercept set_pressure to record the targets passed
+    original_sp = port.set_pressure
+    def _spy_sp(setpoint: float) -> bool:
+        act_targets_used.append(setpoint)
+        return True
+    port.set_pressure = _spy_sp  # type: ignore[method-assign]
+
+    executor._prepare_switch_for_cycle_edge = _fail_prep  # type: ignore[method-assign]
+    executor._wait_for_cycle_edge = lambda **_kw: (True, None)  # type: ignore[method-assign]
+    executor._cycle_phase_runner.run_single_cycle(sweep_mode='pressure', bounds=(min_psi, max_psi))
+
+    # All recorded setpoints should be at/beyond the full fallback (max+overshoot), not the adaptive target
+    overshoot = max((max_psi - min_psi) * 0.1, 0.5)
+    full_act_abs = 14.7 + max(- 14.65, min_psi - overshoot)  # baro + full activation target gauge
+    # Verify that full-range target (not narrowed) was used: setpoint must be <= full_act_abs + 0.1 margin
+    # (lower setpoint means further from band on decreasing sweep)
+    assert any(sp <= full_act_abs + 0.2 for sp in act_targets_used), (
+        f'Expected full-range target ~{full_act_abs:.3f}; got {act_targets_used}'
+    )

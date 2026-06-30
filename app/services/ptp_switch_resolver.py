@@ -55,6 +55,16 @@ class PtpSwitchResolution:
                 f'{self._fmt_terminal(self.normally_closed_terminal)}->via COM DIO{self.common_dio}'
             )
             no_text = f'{self._fmt_terminal(self.normally_open_terminal)}->derived from NC DIO{self.nc_dio}'
+        elif self.derivation_mode == 'drive_no_read_adapter_common':
+            no_text = (
+                f'{self._fmt_terminal(self.normally_open_terminal)}->via adapter common DIO{self.no_dio}'
+            )
+            nc_text = f'{self._fmt_terminal(self.normally_closed_terminal)}->derived from NO DIO{self.no_dio}'
+        elif self.derivation_mode == 'drive_nc_read_adapter_common':
+            nc_text = (
+                f'{self._fmt_terminal(self.normally_closed_terminal)}->via adapter common DIO{self.nc_dio}'
+            )
+            no_text = f'{self._fmt_terminal(self.normally_open_terminal)}->derived from NC DIO{self.nc_dio}'
         return (
             f'COM={self._fmt(self.common_terminal, self.common_dio)}, '
             f'NO={no_text}, '
@@ -106,7 +116,11 @@ def resolve_ptp_switch_config(
     )
 
     if no_terminal is not None and nc_terminal is not None and no_terminal == nc_terminal:
-        errors.append('NormallyOpenTerminal and NormallyClosedTerminal must be different')
+        warnings.append(
+            'NormallyOpenTerminal and NormallyClosedTerminal share DB9 pin '
+            f'{no_terminal}; treating as single-throw PTP and deriving NC from NO'
+        )
+        nc_terminal = None
     if no_terminal is None and nc_terminal is None:
         errors.append('At least one of NormallyOpenTerminal or NormallyClosedTerminal must be connected')
     if common_terminal is not None and common_terminal in {no_terminal, nc_terminal}:
@@ -191,6 +205,27 @@ def resolve_ptp_switch_config(
                 sensed_pins=sensed_pins,
                 warnings=warnings,
             )
+            if fallback is None:
+                fallback = _resolve_single_throw_ptp_fallback(
+                    normalized_port,
+                    common_terminal=common_terminal,
+                    common_dio=common_dio,
+                    no_terminal=no_terminal,
+                    no_dio=no_ptp_dio,
+                    nc_terminal=nc_terminal,
+                    nc_dio=nc_ptp_dio,
+                    sensed_pins=sensed_pins,
+                    warnings=warnings,
+                )
+            if fallback is None:
+                fallback = _resolve_single_throw_adapter_fallback(
+                    normalized_port,
+                    common_terminal=common_terminal,
+                    no_terminal=no_terminal,
+                    nc_terminal=nc_terminal,
+                    sensed_pins=sensed_pins,
+                    warnings=warnings,
+                )
             if fallback is not None:
                 (
                     drive_terminal,
@@ -228,6 +263,158 @@ def resolve_ptp_switch_config(
         derive_no_from_nc=derive_no_from_nc,
         warnings=tuple(warnings),
         errors=tuple(errors),
+    )
+
+
+def _resolve_single_throw_ptp_fallback(
+    port_id: str,
+    *,
+    common_terminal: Optional[int],
+    common_dio: Optional[int],
+    no_terminal: Optional[int],
+    no_dio: Optional[int],
+    nc_terminal: Optional[int],
+    nc_dio: Optional[int],
+    sensed_pins: tuple[int, ...],
+    warnings: list[str],
+) -> Optional[
+    tuple[
+        Optional[int],
+        Optional[int],
+        str,
+        Optional[int],
+        Optional[int],
+        tuple[str, ...],
+        str,
+        bool,
+        bool,
+    ]
+]:
+    """Resolve SPST parts by reading the one PTP throw even if not predeclared sensed."""
+
+    del port_id
+    if common_dio is None or len(sensed_pins) != 1:
+        return None
+    if (no_terminal is None) == (nc_terminal is None):
+        return None
+
+    if no_terminal is not None:
+        if no_dio is None:
+            return None
+        warnings.append(
+            f'SPST PTP fallback: read NormallyOpenTerminal {no_terminal} '
+            f'(DIO{no_dio}) even though configured sensed pins are {list(sensed_pins)}'
+        )
+        return (
+            common_terminal,
+            common_dio,
+            'common',
+            no_dio,
+            no_dio,
+            ('normally_open_single_throw',),
+            'derive_nc_from_no',
+            True,
+            False,
+        )
+
+    if nc_dio is None:
+        return None
+    warnings.append(
+        f'SPST PTP fallback: read NormallyClosedTerminal {nc_terminal} '
+        f'(DIO{nc_dio}) even though configured sensed pins are {list(sensed_pins)}'
+    )
+    return (
+        common_terminal,
+        common_dio,
+        'common',
+        nc_dio,
+        nc_dio,
+        ('normally_closed_single_throw',),
+        'derive_no_from_nc',
+        False,
+        True,
+    )
+
+
+def _resolve_single_throw_adapter_fallback(
+    port_id: str,
+    *,
+    common_terminal: Optional[int],
+    no_terminal: Optional[int],
+    nc_terminal: Optional[int],
+    sensed_pins: tuple[int, ...],
+    warnings: list[str],
+) -> Optional[
+    tuple[
+        Optional[int],
+        Optional[int],
+        str,
+        Optional[int],
+        Optional[int],
+        tuple[str, ...],
+        str,
+        bool,
+        bool,
+    ]
+]:
+    """Resolve SPST parts whose adapter presents common on the stand sense pin.
+
+    Several SPST PTP rows name product terminals such as COM=1/NO=2 while the
+    stand fixture senses DB9 pin 3. For these one-throw switches, read the
+    configured stand sense pin and drive the one connected throw. This still
+    requires a real electrical transition; it only removes the overly strict
+    requirement that the PTP product terminal number equal the stand sense pin.
+    """
+
+    if len(sensed_pins) != 1:
+        return None
+    if (no_terminal is None) == (nc_terminal is None):
+        return None
+
+    sensed_pin = sensed_pins[0]
+    read_dio = _db9_pin_to_dio(port_id, sensed_pin)
+    if read_dio is None:
+        return None
+
+    if no_terminal is not None:
+        drive_dio = _db9_pin_to_dio(port_id, no_terminal)
+        if drive_dio is None:
+            return None
+        warnings.append(
+            f'SPST adapter fallback: read configured sensed pin {sensed_pin} '
+            f'(DIO{read_dio}) as common for PTP COM={common_terminal}; '
+            f'drive NormallyOpenTerminal {no_terminal}'
+        )
+        return (
+            no_terminal,
+            drive_dio,
+            'normally_open',
+            read_dio,
+            read_dio,
+            ('adapter_common_as_normally_open',),
+            'drive_no_read_adapter_common',
+            True,
+            False,
+        )
+
+    drive_dio = _db9_pin_to_dio(port_id, nc_terminal)
+    if drive_dio is None:
+        return None
+    warnings.append(
+        f'SPST adapter fallback: read configured sensed pin {sensed_pin} '
+        f'(DIO{read_dio}) as common for PTP COM={common_terminal}; '
+        f'drive NormallyClosedTerminal {nc_terminal}'
+    )
+    return (
+        nc_terminal,
+        drive_dio,
+        'normally_closed',
+        read_dio,
+        read_dio,
+        ('adapter_common_as_normally_closed',),
+        'drive_nc_read_adapter_common',
+        False,
+        True,
     )
 
 
