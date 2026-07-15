@@ -1,0 +1,194 @@
+app:
+  name: Stinger
+  version: 1.0.0
+hardware:
+  labjack:
+    device_type: T7
+    connection_type: USB
+    identifier: ANY
+    resolution_index: 9
+    pressure_filter_alpha: 0.0
+    port_a:
+      transducer_ain: 2
+      transducer_ain_neg: 3
+      transducer_voltage_min: 0
+      transducer_voltage_max: 10
+      transducer_pressure_min: 0.0
+      transducer_pressure_max: 30.0
+      transducer_reference: absolute
+      port_installed: true
+      transducer_installed: true
+      # Left DB9: switch sense on pin 3 only (bench verified 2026-06); pin 1 unwired.
+      # PTP decides whether pin 3 is NO or NC for the active part/sequence.
+      switch_sensed_db9_pins:
+      - 3
+      # Bench: DB9 pin 3 opens on SPS01496-02/600 vacuum trip (DIO high);
+      # with NO derived from NC, that is switch_activated=True.
+      vacuum_switch_trips_on_no_open: false
+      switch_com_state: 0
+      switch_active_low: true
+      solenoid_dio: 19
+      transducer_error_model:
+        type: quadratic
+        a_error_per_psi2: -3.340003659130994e-05
+        b_error_per_psi: 0.0009666199601217584
+        c_error_psi: 0.01297524287297084
+        pressure_axis: measured
+    port_b:
+      port_installed: true
+      transducer_installed: true
+      transducer_ain: 0
+      transducer_ain_neg: 1
+      transducer_voltage_min: 0
+      transducer_voltage_max: 10
+      transducer_pressure_min: 0.0
+      transducer_pressure_max: 30.0
+      transducer_reference: absolute
+      # Right DB9: switch sense on pin 3 only (bench verified 2026-06); pin 1 unwired.
+      # PTP decides whether pin 3 is NO or NC for the active part/sequence.
+      switch_sensed_db9_pins:
+      - 3
+      # Bench: DB9 pin 3 opens on SPS01496-02/600 vacuum trip (DIO high);
+      # with NO derived from NC, that is switch_activated=True.
+      vacuum_switch_trips_on_no_open: false
+      switch_com_state: 0
+      switch_active_low: true
+      solenoid_dio: 18
+      transducer_error_model:
+        type: piecewise_linear
+        segments:
+        - max_psi: 0.39864000000000005
+          slope_error_per_psi: -0.1666265049216791
+          intercept_error_psi: 0.0531809196531422
+        - max_psi: 1.17522
+          slope_error_per_psi: 0.05255109654414992
+          intercept_error_psi: -0.022565370537363266
+        - max_psi: null
+          slope_error_per_psi: -0.0007380406130588863
+          intercept_error_psi: 0.03897909303252994
+        pressure_axis: measured
+  alicat:
+    baudrate: 115200
+    timeout_s: 0.2
+    auto_tare_on_connect: true
+    auto_tare_max_delta_psi: 0.5
+    auto_tare_delay_s: 0.5
+    pressure_units_stat: 2
+    pressure_units_group: 0
+    pressure_units_value: 10
+    pressure_units_override: 0
+    pressure_index: 0
+    gauge_index: 1
+    barometric_index: 2
+    setpoint_index: 3
+    port_a:
+      com_port: COM3
+      address: A
+      alicat_error_model:
+        type: quadratic
+        a_error_per_psi2: -3.765397909814573e-05
+        b_error_per_psi: 0.001317930475644635
+        c_error_psi: -0.004725871265722729
+        pressure_axis: measured
+    port_b:
+      com_port: COM3
+      address: B
+      alicat_error_model:
+        type: piecewise_linear
+        segments:
+        - max_psi: 0.17
+          slope_error_per_psi: 0.0034000000000003064
+          intercept_error_psi: -0.010366000000000035
+        - max_psi: 0.3028
+          slope_error_per_psi: -0.24459608323133408
+          intercept_error_psi: 0.0315516523867809
+        - max_psi: 1.1176000000000001
+          slope_error_per_psi: 0.057896503739781
+          intercept_error_psi: -0.06108877543920689
+        - max_psi: 10.05
+          slope_error_per_psi: 0.0009417958335215115
+          intercept_error_psi: -0.00048387437994668525
+        - max_psi: null
+          slope_error_per_psi: -0.0004963899924944369
+          intercept_error_psi: 0.010327565115638314
+        pressure_axis: measured
+  solenoid:
+    vacuum_state: 1
+    atmosphere_state: 0
+    safe_vacuum_switch_threshold_psi: 2.0
+  measurement:
+    preferred_source: auto
+    fallback_on_unavailable: true
+    transducer_only_below_psi: 5.0
+    alicat_only_above_psi: 5.0
+    switch_pivot_min_psi: 5.0
+    sensor_disagreement_fallback_enabled: true
+    sensor_disagreement_max_psi: 0.1
+control:
+  ramps:
+    fast_cycle_rate_psi_per_sec: 5.0
+    pre_approach_rate_multiplier: 1.0
+    precision_sweep_rate_torr_per_sec: 5.0
+    low_pressure_precision_threshold_psi: 1.0
+    low_pressure_precision_sweep_rate_torr_per_sec: 1.0
+  cycling:
+    num_cycles: 3
+  edge_detection:
+    overshoot_beyond_limit_percent: 10.0
+    timeout_sec: 60.0
+    precision_close_limit_offset_torr: 20.0
+    precision_post_target_grace_sec: 0.35
+    precision_return_overshoot_torr: 30.0
+  debounce:
+    stable_sample_count: 3
+    min_edge_interval_ms: 50
+timing:
+  ui_refresh_interval_ms: 16
+  hardware_poll_interval_ms: 7
+  alicat_poll_divisor: 4
+  alicat_poll_divisor_normal: 14
+  alicat_poll_divisor_precision: 2
+  labjack_poll_divisor_sibling: 14
+  hardware_poll_interval_ms_precision: 7
+  button_lockout_ms: 300
+  graceful_stop_timeout_sec: 5.0
+database:
+  type: mssql
+  server: PASCAL
+  database: WASCO_Calibration
+  driver: ODBC Driver 18 for SQL Server
+  username: MAXSQLAdmin
+  password: 'M@x@dm1n'
+  connection_timeout_sec: 5.0
+max_database:
+  database: ExactMAXWasco
+ui:
+  theme: dark
+  min_touch_target_px: 44
+  admin_pin: '2245'
+  debug_noise:
+    window_samples: 60
+    min_samples: 12
+    trend_alpha: 0.2
+    transition_sigma_factor: 8.0
+    max_holdoff_ms: 350
+  pressure_display:
+    decimal_places: 2
+  pressure_bar:
+    show_atmosphere_reference: true
+    show_acceptance_bands: true
+    show_measured_points: true
+test_parameters:
+  equipment_id: STINGER_01
+  default_temperature_c: 25.0
+  max_attempts: 3
+custom_work_orders:
+  stinger228:
+    part_id: SPS00000
+    sequence_id: '300'
+    order_qty: 1
+logging:
+  level: INFO
+  log_dir: logs
+  max_bytes: 10485760
+  backup_count: 5

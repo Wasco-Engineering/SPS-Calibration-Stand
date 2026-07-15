@@ -293,6 +293,9 @@ def select_ui_pressure_abs_psi(
     switch pivot, Alicat above range). The large UI number should track the
   transducer so ramps do not look like they instantly match the Alicat setpoint.
     """
+    if settings.preferred_source != MEASUREMENT_SOURCE_AUTO:
+        return select_main_pressure_abs_psi(reading, settings, barometric_psi)
+
     transducer_psi = _transducer_pressure_abs_psi(reading, barometric_psi)
     if transducer_psi is not None:
         return transducer_psi, MEASUREMENT_SOURCE_TRANSDUCER

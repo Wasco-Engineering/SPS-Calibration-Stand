@@ -18,6 +18,8 @@ hardware:
       transducer_reference: absolute
       port_installed: true
       transducer_installed: false
+      # Left DB9: switch sense on pin 3 only (bench verified 2026-06); pin 1 unwired.
+      # PTP decides whether pin 3 is NO or NC for the active part/sequence.
       switch_sensed_db9_pins:
       - 3
       # Bench: DB9 pin 3 opens on SPS01496-02/600 vacuum trip (DIO high);
@@ -126,7 +128,7 @@ hardware:
     atmosphere_state: 0
     safe_vacuum_switch_threshold_psi: 2.0
   measurement:
-    preferred_source: auto
+    preferred_source: alicat
     fallback_on_unavailable: true
     transducer_only_below_psi: 20.0
     alicat_only_above_psi: 5.0
@@ -152,13 +154,13 @@ control:
     stable_sample_count: 3
     min_edge_interval_ms: 50
 timing:
-  ui_refresh_interval_ms: 16
-  hardware_poll_interval_ms: 7
+  ui_refresh_interval_ms: 33
+  hardware_poll_interval_ms: 20
   alicat_poll_divisor: 4
-  alicat_poll_divisor_normal: 14
-  alicat_poll_divisor_precision: 2
-  labjack_poll_divisor_sibling: 14
-  hardware_poll_interval_ms_precision: 7
+  alicat_poll_divisor_normal: 10
+  alicat_poll_divisor_precision: 5
+  labjack_poll_divisor_sibling: 10
+  hardware_poll_interval_ms_precision: 20
   button_lockout_ms: 300
   graceful_stop_timeout_sec: 5.0
 database:
@@ -188,7 +190,7 @@ ui:
     show_acceptance_bands: true
     show_measured_points: true
 test_parameters:
-  equipment_id: STINGER_01
+  equipment_id: STINGER_04
   default_temperature_c: 25.0
   max_attempts: 3
 custom_work_orders:

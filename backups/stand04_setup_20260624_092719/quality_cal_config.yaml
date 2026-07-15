@@ -1,0 +1,156 @@
+app:
+  name: "Quality Calibration"
+  version: "0.1.0"
+
+hardware:
+  labjack:
+    device_type: "T7"
+    connection_type: "USB"
+    identifier: "ANY"
+    resolution_index: 9
+    # EMA on transducer for stable UI/settle; sweep CSV still logs raw via pressure_raw.
+    pressure_filter_alpha: 0.35
+    # Druck UNIK 5000 PMP50D6-* sensors are amplified 0-10 V, 4-wire units.
+    # Current hardware under test is 30 PSIA absolute.
+    # Match stinger_config: port_a=left, port_b=right (physical, May 2026 swap).
+    port_a:
+      port_installed: true
+      transducer_installed: true
+      transducer_ain: 2
+      transducer_ain_neg: 3
+      transducer_voltage_min: 0
+      transducer_voltage_max: 10
+      transducer_pressure_min: 0.0
+      transducer_pressure_max: 30
+      transducer_reference: "absolute"
+      switch_no_dio: 2
+      switch_nc_dio: 0
+      switch_com_dio: 3
+      switch_com_state: 0
+      switch_active_low: true
+      solenoid_dio: 19
+    port_b:
+      port_installed: true
+      transducer_installed: true
+      transducer_ain: 0
+      transducer_ain_neg: 1
+      transducer_voltage_min: 0
+      transducer_voltage_max: 10
+      transducer_pressure_min: 0.0
+      transducer_pressure_max: 30
+      transducer_reference: "absolute"
+      switch_no_dio: 11
+      switch_nc_dio: 9
+      switch_com_dio: 12
+      switch_com_state: 0
+      switch_active_low: true
+      solenoid_dio: 18
+  alicat:
+    baudrate: 115200
+    timeout_s: 0.05
+    auto_tare_on_connect: true
+    auto_tare_max_delta_psi: 0.5
+    auto_tare_delay_s: 0.5
+    pressure_units_stat: 2
+    pressure_units_group: 0
+    pressure_units_value: 10
+    pressure_units_override: 0
+    pressure_index: 0
+    gauge_index: 1
+    barometric_index: 2
+    setpoint_index: 3
+    port_a:
+      com_port: "COM3"
+      address: "A"
+    port_b:
+      com_port: "COM3"
+      address: "B"
+  solenoid:
+    vacuum_state: 1
+    atmosphere_state: 0
+    safe_vacuum_switch_threshold_psi: 2.0
+  mensor:
+    port: "COM4"   # auto-discovered May 2026; was COM10 in template
+    baudrate: 57600
+    timeout_s: 1.0
+
+quality:
+  default_profile_id: "cal10_wcs02075"
+  capture_raw_during_sweep: true
+  # Mensor reference (165 PSIA sensor); port LabJack transducers remain 0–30 PSIA for fit band.
+  mensor_max_psia: 165.0
+  fit_max_psia: 30.0
+  calibration_profiles:
+    cal10_wcs02075:
+      label: "CAL 10 WCS02075 (Rev 000)"
+      work_instruction: "I:\\Level 4 Work Instructions\\CAL 10 WCS02075 Calibration Rev 000.pdf"
+      require_mensor: true
+      mensor_max_psia: 165.0
+      fit_max_psia: 30.0
+      pass_threshold_torr: 1.0
+      capture_raw_during_sweep: true
+      preserve_point_order: true
+      pressure_points_psia:
+        - 115
+        - 100
+        - 90
+        - 75
+        - 50
+        - 40
+        - 30
+        - 25
+        - 20
+        - 15
+        - 10
+        - 5
+        - 3
+        - 2
+        - 1
+        - 0.5
+        - 0.2
+        - 0.05
+  hardware_check_poll_interval_ms: 2000
+  hardware_discovery:
+    enable_serial_auto_discovery: true
+    preferred_serial_ports:
+      - "COM4"
+      - "COM3"
+  pressure_schedule:
+    start_psia: 0.0
+    dense_up_to_psia: 20.0
+    dense_step_psia: 1.0
+    medium_up_to_psia: 30.0
+    medium_step_psia: 2.0
+    max_psia: 30.0
+    high_step_psia: 5.0
+  pressure_tolerance_psia: 0.0193
+  settle_tolerance_psia: 0.08
+  settle_hold_s: 2.0
+  settle_timeout_s: 90.0
+  static_hold_s: 5.0
+  settle_hold_at_or_below_5_psia_s: 2.0
+  settle_hold_above_5_psia_s: 1.5
+  settle_hold_above_30_psia_s: 1.5
+  static_hold_at_or_below_5_psia_s: 5.0
+  static_hold_above_5_psia_s: 3.0
+  static_hold_above_30_psia_s: 3.0
+  static_discard_s: 1.0
+  sample_hz: 4.0
+  leak_check:
+    target_psia: 100.0
+    duration_s: 90.0
+    sample_hz: 4.0
+    max_rate_psi_per_min: 0.2
+    ramp_rate_psi_per_s: 8.0
+  report:
+    output_dir: "I:\\Level 5 Documentation\\Records\\Calibration Certificates"
+    template_path: "deploy/templates/qf87/QF87_Stinger_TestStand.docx"
+    desktop_output_dir: "%USERPROFILE%/Desktop/Stinger/CalibrationReports"
+    also_write_records_path: true
+    filename_prefix: "QualityCalibration"
+
+logging:
+  level: INFO
+  log_dir: "logs"
+  max_bytes: 10485760
+  backup_count: 5

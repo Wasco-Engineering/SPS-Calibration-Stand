@@ -57,3 +57,31 @@ computers:
       measurement:
         preferred_source: alicat
     notes: Transducers capped until installed; run deploy_init_stand.ps1 -StandId STINGER_02 on that PC.
+
+  - hostname: ID-MAN-CR3-01
+    stand_id: STINGER_04
+    equipment_id: STINGER_04
+    role: spa_stand
+    local_config_dir: 'C:\Stinger'
+    stinger_config: 'C:\Stinger\stinger_config.yaml'
+    quality_cal_config: 'C:\Stinger\quality_cal_config.yaml'
+    logs_dir: 'C:\Stinger\logs'
+    repo_path: 'C:\Stinger'
+    desktop_deploy_dir: 'C:\Stinger'
+    env:
+      STINGER_STAND_ID: STINGER_04
+      STINGER_CONFIG_DIR: 'C:\Stinger'
+    hardware:
+      labjack: { device: T7, connection: USB, identifier: ANY }
+      alicat: { com_port: COM3, baudrate: 115200, port_a_address: A, port_b_address: B }
+      mensor: { com_port: COM4, baudrate: 57600, status: not_detected_2026_06_24 }
+      transducers:
+        port_a: { installed: false, ain: [2, 3], range_psia: 30 }
+        port_b: { installed: false, ain: [0, 1], range_psia: 30 }
+      solenoids: { port_a_dio: 19, port_b_dio: 18 }
+      measurement:
+        preferred_source: alicat
+    notes: >
+      Configured as STINGER_04 on 2026-06-24. Alicat controllers verified;
+      transducers are not installed. Only COM3 was detected, so Mensor on
+      configured COM4 was not available during setup.

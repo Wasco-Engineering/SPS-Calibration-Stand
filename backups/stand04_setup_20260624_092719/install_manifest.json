@@ -1,0 +1,11 @@
+﻿{
+    "build_timestamp_utc":  "2026-06-23T20:08:42.8451494Z",
+    "hostname":  "CA-MAN-SPS-02",
+    "stand_id":  "STINGER_01",
+    "install_root":  "C:\\Stinger",
+    "config_dir":  "C:\\Stinger",
+    "artifacts":  [
+                      "SPS Calibration Stand.exe",
+                      "QualityCal.exe"
+                  ]
+}

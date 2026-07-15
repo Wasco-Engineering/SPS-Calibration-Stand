@@ -1208,7 +1208,12 @@ class TestExecutor:
         for edge in get_history()[port_edges_before:]:
             if not self._cycle_edge_switch_state_allowed(edge_type, bool(edge.activated)):
                 continue
-            pressure_test = self._absolute_to_test_reference(edge.pressure)
+            pressure_test: Optional[float] = None
+            reading = self._get_latest_reading(self._port_id)
+            if reading is not None:
+                pressure_test = self._reading_pressure_test_psi(reading)
+            if pressure_test is None or not math.isfinite(pressure_test):
+                pressure_test = self._absolute_to_test_reference(edge.pressure)
             if not math.isfinite(pressure_test):
                 continue
             if not self._cycle_edge_pressure_allowed(edge_type, pressure_test):
@@ -1767,7 +1772,7 @@ class TestExecutor:
             if direction > 0:
                 nudge_target = max(hw_min_psi, min_psi - nudge_psi)
             else:
-                nudge_target = max(hw_min_psi, min_psi - nudge_psi)
+                nudge_target = min(hw_max_psi, max_psi + nudge_psi)
             substate = 'cycling.prep_deactivated'
 
         logger.info(
@@ -2577,6 +2582,13 @@ class TestExecutor:
 
     def _cycle_target_switch_state(self, edge_type: str) -> bool:
         """``switch_activated`` value that means this cycle edge (vacuum bench may invert)."""
+        if (
+            self._resolve_sweep_mode() == 'pressure'
+            and self._resolve_activation_sweep_direction() < 0
+        ):
+            daq = getattr(self._port, 'daq', None)
+            if daq is not None and bool(getattr(daq, 'switch_nc_derived_from_no', False)):
+                return edge_type != 'activation'
         if edge_type == 'activation':
             if self._resolve_sweep_mode() == 'vacuum' and self._vacuum_switch_trips_on_no_open():
                 return False

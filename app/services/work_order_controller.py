@@ -120,6 +120,8 @@ class WorkOrderController(QObject):
         self._debug_alicat_mode = self._runtime_state.debug_alicat_mode
         self._debug_solenoid_last_route = self._runtime_state.debug_solenoid_last_route
         self._hw_serial_busy_ports: set[str] = set()
+        self._last_worker_alicat_refresh_s: Dict[str, float] = {}
+        self._worker_alicat_refresh_interval_s = 0.10
         solenoid_cfg = self._config.get("hardware", {}).get("solenoid", {})
         self._auto_vacuum_threshold_psi = float(
             solenoid_cfg.get("safe_vacuum_switch_threshold_psi", 2.0)
@@ -1053,6 +1055,7 @@ class WorkOrderController(QObject):
             port = self._port_manager.get_port(port_id)
             if port is not None:
                 try:
+                    self._refresh_alicat_for_worker_if_due(port_id, port)
                     return port.read_precision_fast()
                 except Exception as exc:
                     logger.warning(
@@ -1062,6 +1065,26 @@ class WorkOrderController(QObject):
                     )
         with self._latest_readings_lock:
             return self._latest_readings.get(port_id)
+
+    def _refresh_alicat_for_worker_if_due(self, port_id: str, port: Any) -> None:
+        """Refresh cached Alicat pressure from the worker when tests use Alicat as source."""
+        measurement_cfg = self._config.get('hardware', {}).get('measurement', {})
+        preferred_source = (
+            str(measurement_cfg.get('preferred_source', 'auto')).strip().lower()
+            if isinstance(measurement_cfg, dict)
+            else 'auto'
+        )
+        port_cfg = self._config.get('hardware', {}).get('labjack', {}).get(port_id, {})
+        transducer_installed = bool(port_cfg.get('transducer_installed', True))
+        if preferred_source != 'alicat' and transducer_installed:
+            return
+
+        now = time.perf_counter()
+        last = self._last_worker_alicat_refresh_s.get(port_id, 0.0)
+        if now - last < self._worker_alicat_refresh_interval_s:
+            return
+        self._last_worker_alicat_refresh_s[port_id] = now
+        port.refresh_alicat()
 
     def _start_find_setpoint(self, port_id: str, payload: Dict[str, Any]) -> None:
         with self._debug_sweep_lock:

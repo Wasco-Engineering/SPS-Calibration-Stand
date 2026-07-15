@@ -89,6 +89,41 @@ STINGER_CONFIG_DIR=%LOCALAPPDATA%\Stinger\STINGER_02
 
 ---
 
+### ID-MAN-CR3-01 - Stand 4 (SPA stand)
+
+| Field | Value |
+|-------|--------|
+| **Hostname** | `ID-MAN-CR3-01` |
+| **Stand ID** | `STINGER_04` |
+| **Equipment ID** | `STINGER_04` |
+| **Role** | SPA stand |
+| **Local config dir** | `C:\Stinger` |
+| **Stinger config** | `C:\Stinger\stinger_config.yaml` |
+| **Quality Cal config** | `C:\Stinger\quality_cal_config.yaml` |
+| **Logs** | `C:\Stinger\logs` |
+| **Repo dev copy** | `C:\Stinger` |
+| **Z: release bin** | `Z:\Engineering\Program Builds\Python Builds\Stinger\bin\` |
+
+**Hardware (verified 2026-06-24):**
+
+| Item | Setting |
+|------|---------|
+| LabJack T7 | USB `ANY`; transducers not installed |
+| Alicat | `COM3` @ 115200 - Port A = address **A**, Port B = address **B** |
+| Mensor | Configured `COM4` @ 57600, but only `COM3` was detected during setup |
+| Transducers | **Not installed** — Port A AIN2/3, Port B AIN0/1 reserved for future 0-30 PSIA abs sensors |
+| Solenoids | Port A **DIO19**, Port B **DIO18** |
+| Measurement | `alicat` |
+
+**Env (User set; Machine env requires elevated PowerShell):**
+
+```powershell
+STINGER_STAND_ID=STINGER_04
+STINGER_CONFIG_DIR=C:\Stinger
+```
+
+---
+
 ## EXE artifacts (shared build output)
 
 Built from `C:\Stinger` via `.\scripts\deploy_build_and_install.ps1`:
