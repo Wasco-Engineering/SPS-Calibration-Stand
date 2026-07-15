@@ -292,7 +292,6 @@ class AlicatController:
     def _maybe_auto_tare(self) -> None:
         if not self._auto_tare_on_connect:
             return
-        self.exhaust()
         if self._auto_tare_delay_s > 0:
             time.sleep(self._auto_tare_delay_s)
         status = self.read_status()
@@ -301,16 +300,18 @@ class AlicatController:
             return
         delta = abs(status.pressure - status.barometric_pressure)
         if delta > self._auto_tare_max_delta:
-            logger.warning(
-                "Alicat %s: Auto-tare skipped (pressure %.2f, baro %.2f, delta %.2f)",
+            logger.info(
+                "Alicat %s: Auto-tare skipped (not at atmosphere: P=%.2f, baro=%.2f, delta=%.2f)",
                 self.address,
                 status.pressure,
                 status.barometric_pressure,
                 delta,
             )
             return
+        # Do not call exhaust() here. On Stinger stands EXH vents through the
+        # atmosphere solenoid route and pulls open DUT lines toward vacuum.
         if self.tare():
-            logger.info("Alicat %s: Auto-tare complete", self.address)
+            logger.info("Alicat %s: Auto-tare complete (at atmosphere)", self.address)
         else:
             logger.warning("Alicat %s: Auto-tare failed", self.address)
 

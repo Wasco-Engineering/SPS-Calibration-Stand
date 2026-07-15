@@ -25,7 +25,7 @@ from app.database.operations import (
 )
 from app.database.session import close_database, get_engine, initialize_database
 from app.services import run_async
-from app.core.config import save_config
+from app.core.config import is_transducer_installed, save_config
 from app.services.ptp_service import (
     load_ptp_from_db,
     load_ptp_from_dump,
@@ -515,6 +515,7 @@ class WorkOrderController(QObject):
     def _request_precision_slot(self, port_id: str) -> bool:
         """Try to acquire precision-sweep exclusivity for a port."""
         if self._precision_owner_port == port_id:
+            self._signal_precision_grant(port_id)
             return True
         if (
             self._precision_owner_port is None
@@ -620,6 +621,13 @@ class WorkOrderController(QObject):
         """True when Alicat serial is owned by a worker — keep GUI polls LabJack-only."""
         if self._hw_serial_busy_ports:
             return True
+        for port_id, executor in self._test_executors.items():
+            if not executor.is_running:
+                continue
+            # Without a transducer the Alicat is the only live pressure source;
+            # skipping it freezes the operator graph and readout during cycling.
+            if not is_transducer_installed(self._config, port_id):
+                return False
         return any(
             executor.is_running
             for executor in self._test_executors.values()
@@ -1056,10 +1064,16 @@ class WorkOrderController(QObject):
             if port is not None:
                 try:
                     self._refresh_alicat_for_worker_if_due(port_id, port)
-                    return port.read_precision_fast()
+                    if is_transducer_installed(self._config, port_id):
+                        reading = port.read_precision_fast()
+                    else:
+                        reading = port.read_fast()
+                    with self._latest_readings_lock:
+                        self._latest_readings[port_id] = reading
+                    return reading
                 except Exception as exc:
                     logger.warning(
-                        '%s: Live precision read failed, using cached poll: %s',
+                        '%s: Live test read failed, using cached poll: %s',
                         port_id,
                         exc,
                     )
@@ -2139,6 +2153,10 @@ class WorkOrderController(QObject):
             wait_for_precision_slot=_wait_for_precision_slot,
         )
         self._test_executors[port_id] = executor
+        # Fast Alicat polling for the whole run (cycling + precision). Precision-slot
+        # ownership is granted separately at cycles_complete; do not pre-set
+        # _precision_owner_port here or the grant event never fires.
+        self._port_manager.set_alicat_poll_profile(port_id)
         executor.start()
 
     # ------------------------------------------------------------------
@@ -2426,6 +2444,7 @@ class WorkOrderController(QObject):
         logger.info('%s: Test cancelled', port_id)
         self._remove_precision_waiter(port_id)
         self._release_precision_slot(port_id, reason='executor-cancelled')
+        self._port_manager.set_alicat_poll_profile(None)
 
     def _slot_substate(self, port_id: str, substate: str) -> None:
         if self._ui_bridge:

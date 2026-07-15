@@ -270,33 +270,14 @@ def ensure_port_at_atmosphere(
     timeout_s: float = 120.0,
     cancel_event: Optional[threading.Event] = None,
 ) -> bool:
-    """Vent and wait until Alicat (and untrusted pegged transducer) show near-atmosphere."""
-    if cancel_event is None:
-        cancel_event = threading.Event()
-
-    port.vent_to_atmosphere()
-    port.alicat.cancel_hold()
-    port.alicat.set_pressure(VACUUM_PRIME_SETPOINT_PSIA)
-    start = time.perf_counter()
-    while time.perf_counter() - start <= timeout_s:
-        if cancel_event.is_set():
-            return False
-        reading = port.read_all()
-        baro = infer_barometric_psia(reading)
-        alicat = alicat_abs_psia(reading, baro)
-        if alicat is not None and alicat <= (baro + 2.5):
-            logger.info(
-                "%s: Atmosphere confirmed (Alicat %.2f psia) after vent",
-                port.port_id.value,
-                alicat,
-            )
-            return True
-        time.sleep(0.5)
-    logger.warning(
-        "%s: Timed out waiting for atmosphere after vent (Alicat still high)",
-        port.port_id.value,
-    )
-    return False
+    """Vent and wait until the Alicat shows near-atmosphere pressure."""
+    if cancel_event is not None and cancel_event.is_set():
+        return False
+    try:
+        return port.vent_to_atmosphere(bleed_installed_dut=True, timeout_s=timeout_s)
+    except Exception as exc:
+        logger.warning('Failed to vent %s to atmosphere: %s', port.port_id.value, exc)
+        return False
 
 
 def prime_vacuum_route(

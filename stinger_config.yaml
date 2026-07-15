@@ -3,6 +3,8 @@ app:
   version: 1.0.0
 hardware:
   labjack:
+    # Idaho bench: open fittings sit near ~13.5 PSIA, not 14.7 sea level.
+    local_barometric_psi: 13.48
     device_type: T7
     connection_type: USB
     identifier: ANY
@@ -20,6 +22,7 @@ hardware:
       transducer_installed: false
       # Left DB9: switch sense on pin 3 only (bench verified 2026-06); pin 1 unwired.
       # PTP decides whether pin 3 is NO or NC for the active part/sequence.
+      open_fitting: true
       switch_sensed_db9_pins:
       - 3
       # Bench: DB9 pin 3 opens on SPS01496-02/600 vacuum trip (DIO high);
@@ -37,6 +40,7 @@ hardware:
     port_b:
       port_installed: true
       transducer_installed: false
+      open_fitting: true
       transducer_ain: 0
       transducer_ain_neg: 1
       transducer_voltage_min: 0
@@ -157,10 +161,10 @@ timing:
   ui_refresh_interval_ms: 33
   hardware_poll_interval_ms: 20
   alicat_poll_divisor: 4
-  alicat_poll_divisor_normal: 10
-  alicat_poll_divisor_precision: 5
-  labjack_poll_divisor_sibling: 10
-  hardware_poll_interval_ms_precision: 20
+  alicat_poll_divisor_normal: 4
+  alicat_poll_divisor_precision: 2
+  labjack_poll_divisor_sibling: 4
+  hardware_poll_interval_ms_precision: 7
   button_lockout_ms: 300
   graceful_stop_timeout_sec: 5.0
 database:
@@ -190,7 +194,7 @@ ui:
     show_acceptance_bands: true
     show_measured_points: true
 test_parameters:
-  equipment_id: STINGER_04
+  equipment_id: STINGER_03
   default_temperature_c: 25.0
   max_attempts: 3
 custom_work_orders:

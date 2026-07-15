@@ -1387,6 +1387,55 @@ def test_vacuum_increasing_pre_approach_starts_on_low_reset_side() -> None:
     assert wait_timeouts[0] < executor._edge_timeout_s
 
 
+def test_vacuum_decreasing_pre_approach_skips_vent_and_atmosphere_staging() -> None:
+    setup = TestSetup(
+        part_id='UC8A',
+        sequence_id='399',
+        units_code='21',
+        units_label='Torr',
+        activation_direction='Decreasing',
+        activation_target=75.0,
+        pressure_reference='absolute',
+        terminals={},
+        bands={
+            'increasing': {'lower': 143.0, 'upper': 145.0},
+            'decreasing': {'lower': 73.0, 'upper': 76.0},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    port = _FakePort([True])
+    executor = _TestExecutor(
+        port_id='port_a',
+        port=cast(Any, port),
+        test_setup=setup,
+        config={
+            'control': {
+                'cycling': {},
+                'ramps': {'fast_cycle_rate_psi_per_sec': 5.0},
+                'edge_detection': {'overshoot_beyond_limit_percent': 10.0},
+                'debounce': {},
+            },
+        },
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 13.43,
+    )
+    staged: list[bool] = []
+    executor._stage_atmosphere_setpoint_before_route = lambda: staged.append(True)  # type: ignore[method-assign]
+    executor._set_pressure_or_raise = lambda _pressure: None  # type: ignore[method-assign]
+    executor._wait_until_near_target = lambda **_kwargs: True  # type: ignore[method-assign]
+
+    bounds = (
+        convert_pressure(73.0, 'Torr', 'PSI'),
+        convert_pressure(145.0, 'Torr', 'PSI'),
+    )
+    executor._cycle_phase_runner.run_pre_approach('vacuum', bounds)
+
+    assert port.vent_calls == 0
+    assert staged == []
+    assert port.solenoid_calls == [True]
+
+
 def test_pressure_decreasing_pre_approach_resets_above_deactivation_side() -> None:
     setup = TestSetup(
         part_id='SPS02072-02',

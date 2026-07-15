@@ -169,9 +169,9 @@ def test_resolve_cycle_ramp_targets_vacuum_returns_to_reset_edge() -> None:
 
 
 def test_resolve_cycle_ramp_targets_low_absolute_vacuum_goes_deep() -> None:
-    """Low absolute Torr switches need full-cycle fallback well below the band."""
+    """Low absolute Torr switches stop just below the activation band."""
     low_psi = convert_pressure(75.0, 'Torr', 'PSI')
-    high_psi = convert_pressure(95.0, 'Torr', 'PSI')
+    high_psi = convert_pressure(145.0, 'Torr', 'PSI')
 
     act, deact = resolve_cycle_ramp_targets(
         sweep_mode='vacuum',
@@ -185,7 +185,7 @@ def test_resolve_cycle_ramp_targets_low_absolute_vacuum_goes_deep() -> None:
         pressure_reference='absolute',
     )
 
-    assert convert_pressure(act, 'PSI', 'Torr') < 30.0
+    assert act == pytest.approx(max(0.5, low_psi - 0.5), rel=0.05)
     assert deact == pytest.approx(high_psi + 0.5, rel=1e-6)
 
 

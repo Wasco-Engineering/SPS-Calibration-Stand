@@ -135,9 +135,14 @@ def resolve_cycle_ramp_targets(
     if activation_direction < 0:
         if sweep_mode == 'vacuum':
             if use_abs_limits:
-                # Traverse well below the activation band (e.g. 7.8 PSIA), not to the trip point.
-                past_band = max(overshoot, (baro - min_psi) + overshoot)
-                target_activation = max(0.5, min_psi - past_band)
+                if max_psi < baro - 5.0:
+                    # Entire band is far below atmosphere (e.g. 73–145 Torr absolute).
+                    # Stop just below the activation band so the switch trips during ramp.
+                    target_activation = max(hw_min_psi, min_psi - overshoot)
+                else:
+                    # Near-atmosphere absolute band (e.g. 7.8–11 PSIA): traverse well below.
+                    past_band = max(overshoot, (baro - min_psi) + overshoot)
+                    target_activation = max(0.5, min_psi - past_band)
                 target_deactivation = max_psi + overshoot
             elif ref == 'gauge':
                 target_activation = min_psi - max(overshoot, max_psi - min_psi + overshoot)
