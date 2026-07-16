@@ -4,6 +4,7 @@ Stinger - Scorpion Calibration Stand
 Entry point for the application.
 """
 
+import argparse
 import logging
 import os
 import subprocess
@@ -147,6 +148,14 @@ def _close_previous_instances(project_root: Path) -> list[int]:
 
 def main():
     """Main entry point."""
+    parser = argparse.ArgumentParser(description='Stinger - Scorpion Calibration Stand')
+    parser.add_argument(
+        '--skip-login',
+        action='store_true',
+        help='Skip operator login and enter built-in test mode (dev/UI preview only)',
+    )
+    args = parser.parse_args()
+
     # Load configuration
     try:
         config = load_config()
@@ -197,13 +206,15 @@ def main():
         ui_bridge = UIBridge(config)
         
         # Create and show main window
-        window = MainWindow(config, ui_bridge=ui_bridge)
+        window = MainWindow(config, ui_bridge=ui_bridge, skip_login=args.skip_login)
         window.showMaximized()
 
         # Create work order controller (starts GUI-thread hardware polling timer)
         work_order_controller = WorkOrderController(ui_bridge, config)
         window.attach_work_order_controller(work_order_controller)
         app.aboutToQuit.connect(work_order_controller.cleanup)
+        if args.skip_login:
+            window.enter_dev_session()
     except Exception as e:
         logger.exception('Startup failed before event loop: %s', e)
         print(f'ERROR starting app: {e}')

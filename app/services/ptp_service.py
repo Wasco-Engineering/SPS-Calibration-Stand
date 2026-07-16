@@ -17,6 +17,25 @@ logger = logging.getLogger(__name__)
 
 PTP_DUMP_DIR = Path(__file__).resolve().parents[2] / "docs" / "reference" / "ptp_dumps"
 
+# Optional Postgres PTP repository built once from config (wasco_instruments).
+_ptp_repository: Any = None
+_ptp_repository_config_id: Optional[int] = None
+
+
+def configure_ptp_repository(repository: Any) -> None:
+    """Install a shared PtpRepository used by load_ptp_from_db when present."""
+    global _ptp_repository, _ptp_repository_config_id
+    _ptp_repository = repository
+    _ptp_repository_config_id = id(repository) if repository is not None else None
+    if repository is None:
+        logger.info("PTP repository disabled — using SQL Server ProductTestParameters")
+    else:
+        logger.info("PTP repository configured (Postgres mirror via wasco-instruments)")
+
+
+def get_ptp_repository() -> Any:
+    return _ptp_repository
+
 UNITS_MAP = {
     "1": "PSI",
     "12": "mTorr",
@@ -82,7 +101,36 @@ class TestSetup:
 
 
 def load_ptp_from_db(part_id: str, sequence_id: str) -> Dict[str, str]:
-    """Load raw PTP parameters from the database."""
+    """Load raw PTP parameters from Postgres (preferred) or SQL Server fallback."""
+    repo = _ptp_repository
+    if repo is not None:
+        try:
+            ptp_data = repo.get_ptp(part_id, sequence=sequence_id)
+            seq = ptp_data.primary_sequence
+            if seq is not None and seq.parameters:
+                params = {str(k): str(v) for k, v in dict(seq.parameters).items()}
+                logger.info(
+                    "Loaded %d PTP params from Postgres (%s) for %s/%s",
+                    len(params),
+                    getattr(ptp_data, "source", "unknown"),
+                    part_id,
+                    sequence_id,
+                )
+                return params
+            logger.warning(
+                "Postgres PTP returned no sequence for %s/%s (source=%s)",
+                part_id,
+                sequence_id,
+                getattr(ptp_data, "source", None),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Postgres PTP lookup failed for %s/%s (%s); falling back to SQL Server",
+                part_id,
+                sequence_id,
+                exc,
+            )
+
     return load_test_parameters(part_id, sequence_id)
 
 

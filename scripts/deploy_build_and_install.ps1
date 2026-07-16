@@ -3,7 +3,7 @@ param(
     [string]$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).ProviderPath,
     [switch]$InstallPyInstaller,
     [switch]$SkipTests,
-    [string]$StandId = 'STINGER_01',
+    [string]$StandId = 'CA-SPS-01',
     [string]$InstallRoot = 'C:\Stinger',
     [string]$TargetUser = 'CalibrationUser',
     [switch]$SetMachineEnv,

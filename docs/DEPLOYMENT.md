@@ -47,7 +47,7 @@ Set machine environment (all users, including CalibrationUser):
 
 ```powershell
 STINGER_CONFIG_DIR=C:\Stinger
-STINGER_STAND_ID=STINGER_01      # equipment / stand label
+STINGER_STAND_ID=CA-SPS-01      # equipment / stand label
 ```
 
 Legacy layout (still supported if YAML exists there):
@@ -62,7 +62,7 @@ Legacy layout (still supported if YAML exists there):
 
 | Variable | Purpose |
 |----------|---------|
-| `STINGER_STAND_ID` | Subfolder name under `STINGER_HOME` (e.g. `STINGER_01`) |
+| `STINGER_STAND_ID` | Subfolder name under `STINGER_HOME` (e.g. `CA-SPS-01`) |
 | `STINGER_HOME` | Override local root (default `%LOCALAPPDATA%\Stinger`) |
 | `STINGER_CONFIG_DIR` | Full path to folder containing **both** YAML configs |
 | `STINGER_CONFIG` | Full path to `stinger_config.yaml` only |
@@ -86,20 +86,20 @@ From repo root (`C:\Stinger` on the build machine):
 cd C:\Stinger
 # If scripts are blocked by execution policy, use the .bat wrapper or Bypass (one session):
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\scripts\deploy_install_to_c_stinger.ps1 -Build -InstallPyInstaller -StandId STINGER_01 -SetMachineEnv -DesktopShortcuts
+.\scripts\deploy_install_to_c_stinger.ps1 -Build -InstallPyInstaller -StandId CA-SPS-01 -SetMachineEnv -DesktopShortcuts
 ```
 
 Or from **elevated** Command Prompt (no execution-policy change):
 
 ```cmd
 cd /d C:\Stinger
-scripts\deploy_install_to_c_stinger.bat STINGER_01
+scripts\deploy_install_to_c_stinger.bat CA-SPS-01
 ```
 
 Or build + install in one step:
 
 ```powershell
-.\scripts\deploy_build_and_install.ps1 -StandId STINGER_01 -SetMachineEnv -InstallPyInstaller
+.\scripts\deploy_build_and_install.ps1 -StandId CA-SPS-01 -SetMachineEnv -InstallPyInstaller
 ```
 
 Edit per-PC settings (COM ports, DB, Mensor) in:

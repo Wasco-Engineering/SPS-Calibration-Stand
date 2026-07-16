@@ -1,5 +1,5 @@
 # Set per-user environment variables for a Stinger stand.
-# Usage: .\scripts\deploy_set_stand_env.ps1 -StandId STINGER_01 [-ConfigDir C:\Stinger]
+# Usage: .\scripts\deploy_set_stand_env.ps1 -StandId CA-SPS-01 [-ConfigDir C:\Stinger]
 param(
     [Parameter(Mandatory = $true)]
     [string] $StandId,

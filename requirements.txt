@@ -11,6 +11,11 @@ pyserial>=3.5
 # Database
 SQLAlchemy>=2.0.0
 pyodbc>=5.0.0
+psycopg2-binary>=2.9.0
+#
+# Shared packages (editable local installs from sibling clones):
+#   python -m pip install -e "../wasco-instruments[nexus,postgres,db]"
+#   python -m pip install -e ../wasco-ui
 
 # Configuration
 PyYAML>=6.0

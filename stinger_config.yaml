@@ -177,6 +177,37 @@ database:
   connection_timeout_sec: 5.0
 max_database:
   database: ExactMAXWasco
+# Nexus badge login + work-order resolve. stand_key is resolved from
+# test_parameters.equipment_id via nexus.stand_keys when stand_key is null.
+nexus:
+  enabled: true
+  base_url: https://id-production.wasconexus.com/
+  stand_key: null
+  timeout_sec: 10
+  verify_tls: true
+  cache_path: data/nexus-badge-cache.sqlite3
+  stand_keys:
+    CA-SPS-01: wsk_a12NoQgKjVsu4TRX59P91_5kJv6wPwcXf7DY4sNMyY8
+    CA-SPS-02: wsk_zwOGJ4jsyprRc3DSX4DLYZ8rbKwJO4cWwkuhb0uUMT4
+    ID-SPS-01: wsk_hGsNOhl4UCkf1TfHP26E7R_6M6qVbhZcdyXNjYoOi6I
+    ID-SPS-02: wsk_uHjPgBNlaPCbggAs6moST5jr8HQQKAkkMb_iZercP58
+# On-site Postgres PTP mirror (authoritative parameter values).
+ptp_database:
+  enabled: true
+  timeout_sec: 3
+  retry_primary_sec: 120
+  primary:
+    host: 192.168.1.159
+    port: 5432
+    database: wasco_calibration
+    username: postgres
+    password: 'W@sc0@dm1n'
+  secondary:
+    host: null
+    port: 5432
+    database: wasco_calibration
+    username: postgres
+    password: null
 ui:
   theme: dark
   min_touch_target_px: 44
@@ -194,7 +225,7 @@ ui:
     show_acceptance_bands: true
     show_measured_points: true
 test_parameters:
-  equipment_id: STINGER_03
+  equipment_id: ID-SPS-01
   default_temperature_c: 25.0
   max_attempts: 3
 custom_work_orders:

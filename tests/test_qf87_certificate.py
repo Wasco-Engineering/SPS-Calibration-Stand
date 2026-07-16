@@ -78,10 +78,10 @@ def test_build_certificate_context_includes_technician(tmp_path: Path) -> None:
             sample_count=4,
         ),
     ]
-    ctx = build_certificate_context(session, _settings(tmp_path), equipment_id='STINGER_01')
+    ctx = build_certificate_context(session, _settings(tmp_path), equipment_id='CA-SPS-01')
     assert ctx['TECHNICIAN_ID'] == 'NB'
     assert ctx['OVERALL_RESULT'] == 'PASS'
-    assert 'STINGER_01' in ctx['EQUIPMENT_ID']
+    assert 'CA-SPS-01' in ctx['EQUIPMENT_ID']
 
 
 def test_fill_qf87_docx_replaces_placeholders(tmp_path: Path) -> None:

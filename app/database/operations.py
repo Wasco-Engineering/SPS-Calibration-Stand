@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional, Set
 
 import sqlalchemy
-from sqlalchemy import create_engine, func, text
+from sqlalchemy import case, create_engine, func, text
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -41,6 +41,15 @@ ORDER_CAL_MASTER_LIMITS: Dict[str, int] = {
     'modified_by': 20,
     'activation_target': 50,
 }
+
+# Stinger stores the current result for each serial, not an attempt history.
+# Keep the legacy argument on save_test_result for caller compatibility, but
+# normalize every write to this single detail row.
+CURRENT_RESULT_ACTIVATION_ID = 1
+
+
+class DetailWriteConflict(RuntimeError):
+    """A result key already belongs to another calibration stand."""
 
 
 SHOP_ORDER_LOOKUP_SQL = text(
@@ -724,7 +733,7 @@ def _ensure_work_order_master_in_session(
     shop_order_clean = _clean_string(shop_order)
     part_id_clean = _clean_string(part_id)
     operator_clean = _clean_string(operator_id) or 'Sys'
-    equipment_clean = _clean_string(equipment_id) or 'STINGER_01'
+    equipment_clean = _clean_string(equipment_id) or 'CA-SPS-01'
     created_by = equipment_clean[:20] or 'STINGER'
     modified_by = equipment_clean[:20] or 'STINGER'
     sequence_write = _resolve_sequence_id_for_write(session, part_id_clean, sequence_id)
@@ -983,6 +992,15 @@ def _save_detail_payload_to_session(session, detail: Dict[str, Any]) -> str:
     ).one_or_none()
 
     if existing:
+        existing_equipment = _clean_string(existing.EquipmentID)
+        incoming_equipment = _clean_string(detail['EquipmentID'])
+        if existing_equipment and incoming_equipment and existing_equipment != incoming_equipment:
+            raise DetailWriteConflict(
+                'OrderCalibrationDetail key already belongs to '
+                f'{existing_equipment!r}; refusing overwrite by {incoming_equipment!r} '
+                f'for {detail["ShopOrder"]}/{detail["SequenceID"]}/'
+                f'{detail["PartID"]}/SN{detail["SerialNumber"]}/Act{detail["ActivationID"]}'
+            )
         existing.IncreasingActivation = detail['IncreasingActivation']
         existing.DecreasingDeactivation = detail['DecreasingDeactivation']
         existing.TemperatureC = detail['TemperatureC']
@@ -1056,13 +1074,22 @@ def save_test_result(
         units_of_measure: Units string for display.
         operator_id: Operator who performed the test.
         equipment_id: Equipment identifier.
-        activation_id: Attempt identifier (usually 1).
+        activation_id: Legacy attempt identifier accepted for compatibility;
+            every write is normalized to ActivationID 1.
         
     Returns:
         True if save successful.
     """
     action = 'Saved'
     try:
+        requested_activation_id = activation_id
+        activation_id = CURRENT_RESULT_ACTIVATION_ID
+        if requested_activation_id != CURRENT_RESULT_ACTIVATION_ID:
+            logger.info(
+                'Normalizing legacy activation_id=%s to current-result row ActivationID=%s',
+                requested_activation_id,
+                CURRENT_RESULT_ACTIVATION_ID,
+            )
         shop_order_clean = _clean_string(shop_order)
         part_id_clean = _clean_string(part_id)
         operator_id_clean = _clean_string(operator_id)
@@ -1307,12 +1334,20 @@ def get_work_order_progress(shop_order: str, part_id: str, sequence_id: str) -> 
             shop_order_clean = shop_order.strip()
             part_id_clean = part_id.strip()
             
-            # Use window function to get the latest ActivationID per serial number
-            # This is much more efficient than fetching all rows and grouping in Python
-            # Subquery: get max ActivationID for each SerialNumber
+            # Prefer the single current-result row (ActivationID 1).  Fall back
+            # to the highest legacy activation for old data until it is migrated.
+            current_row_exists = func.max(
+                case(
+                    (OrderCalibrationDetail.ActivationID == CURRENT_RESULT_ACTIVATION_ID, 1),
+                    else_=0,
+                )
+            )
             latest_per_serial = session.query(
                 OrderCalibrationDetail.SerialNumber,
-                func.max(OrderCalibrationDetail.ActivationID).label('max_activation_id')
+                case(
+                    (current_row_exists == 1, CURRENT_RESULT_ACTIVATION_ID),
+                    else_=func.max(OrderCalibrationDetail.ActivationID),
+                ).label('selected_activation_id')
             ).filter(
                 OrderCalibrationDetail.ShopOrder == shop_order_clean,
                 OrderCalibrationDetail.PartID == part_id_clean,
@@ -1321,13 +1356,13 @@ def get_work_order_progress(shop_order: str, part_id: str, sequence_id: str) -> 
                 OrderCalibrationDetail.SerialNumber
             ).subquery()
             
-            # Join to get the InSpec status for the latest attempt of each serial
+            # Join to get the status for the current row, or legacy fallback.
             latest_results = session.query(
                 OrderCalibrationDetail.InSpec
             ).join(
                 latest_per_serial,
                 (OrderCalibrationDetail.SerialNumber == latest_per_serial.c.SerialNumber) &
-                (OrderCalibrationDetail.ActivationID == latest_per_serial.c.max_activation_id)
+                (OrderCalibrationDetail.ActivationID == latest_per_serial.c.selected_activation_id)
             ).filter(
                 OrderCalibrationDetail.ShopOrder == shop_order_clean,
                 OrderCalibrationDetail.PartID == part_id_clean,
