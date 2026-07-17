@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
@@ -20,7 +22,9 @@ from PyQt6.QtWidgets import (
     QWizardPage,
 )
 
+from app.services import run_async
 from quality_cal.core.calibration_runner import CalibrationRunner
+from quality_cal.core.port_calibrator import FinalizeCalibrationResult, finalize_port_calibration
 from quality_cal.ui.styles import COLORS, STYLES, TYPOGRAPHY
 
 
@@ -37,6 +41,8 @@ class CalibrationRunPage(QWizardPage):
         self._points_completed = 0
         self._retest_thread: QThread | None = None
         self._retest_runner: CalibrationRunner | None = None
+        self._sweep_csv_path: str | None = None
+        self._finalize_pending = False
 
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(20, 12, 20, 20)
@@ -159,7 +165,7 @@ class CalibrationRunPage(QWizardPage):
             self._start_run()
 
     def isComplete(self) -> bool:
-        return self._completed
+        return self._completed and not self._finalize_pending
 
     def cleanupPage(self) -> None:
         if self._runner is not None:
@@ -198,6 +204,8 @@ class CalibrationRunPage(QWizardPage):
 
         self._completed = False
         self._running = True
+        self._finalize_pending = False
+        self._sweep_csv_path = None
         self._points_completed = 0
         self.result_banner.setVisible(False)
         self.progress_bar.setValue(0)
@@ -221,6 +229,7 @@ class CalibrationRunPage(QWizardPage):
         self._runner.progressChanged.connect(self._on_progress)
         self._runner.liveReadingsUpdated.connect(self._on_live_readings)
         self._runner.pointMeasured.connect(self._on_point_measured)
+        self._runner.sweepCsvReady.connect(self._on_sweep_csv_ready)
         self._runner.finished.connect(self._on_finished)
         self._runner.failed.connect(self._on_failed)
         self._runner.cancelled.connect(self._on_cancelled)
@@ -303,16 +312,70 @@ class CalibrationRunPage(QWizardPage):
             f"Points completed: {result.point_index}/{result.point_total}"
         )
 
+    def _on_sweep_csv_ready(self, path: str) -> None:
+        self._sweep_csv_path = path
+
     def _on_finished(self, results) -> None:
         wizard = self.wizard()
         if wizard is not None:
             wizard.session.port_result(self.port_id).points = list(results)
         self._running = False
-        self._completed = True
         self.start_button.setEnabled(True)
         self.retest_button.setEnabled(True)
         self.retest_spin.setEnabled(True)
         self.live_readout_label.setText("Calibration complete.")
+
+        csv_path = self._sweep_csv_path
+        if csv_path and wizard is not None:
+            self._finalize_pending = True
+            self.status_label.setText("Fitting correlation models and rescoring points...")
+            self.progress_bar.setValue(95)
+
+            def _finalize() -> object:
+                port = wizard.port_manager.get_port(self.port_id) if wizard.port_manager else None
+                return finalize_port_calibration(
+                    Path(csv_path),
+                    self.port_id,
+                    list(results),
+                    wizard.settings,
+                    port=port,
+                    apply_to_stinger=True,
+                )
+
+            def _on_finalize_done(bundle: object, error: Exception | None) -> None:
+                self._finalize_pending = False
+                if error is not None:
+                    self.summary_label.setText(f"Finalize failed: {error}")
+                    self._show_final_banner(results)
+                    self._completed = True
+                    self.completeChanged.emit()
+                    return
+                assert isinstance(bundle, FinalizeCalibrationResult)
+                wizard.session.port_result(self.port_id).points = bundle.points
+                wizard.session.port_result(self.port_id).fit_summary = bundle.fit_summary
+                self._refresh_results_table(bundle.points)
+                self._show_final_banner(bundle.points)
+                self.summary_label.setText(bundle.message)
+                self._completed = True
+                self.completeChanged.emit()
+
+            run_async(_finalize, _on_finalize_done)
+            return
+
+        self._show_final_banner(results)
+        self.summary_label.setText(
+            f"Calibration complete. Points recorded: {len(results)}. "
+            f"Overall: {'PASS' if all(r.passed for r in results) else 'FAIL'}."
+        )
+        self._completed = True
+        self.completeChanged.emit()
+
+    def _refresh_results_table(self, results) -> None:
+        self.results_table.setRowCount(0)
+        for result in results:
+            self._on_point_measured(result)
+
+    def _show_final_banner(self, results) -> None:
         passed = all(r.passed for r in results) if results else False
         self.result_banner.setVisible(True)
         self.result_banner_label.setText("PASS" if passed else "FAIL")
@@ -334,11 +397,6 @@ class CalibrationRunPage(QWizardPage):
             self.result_banner_label.setStyleSheet(
                 f"color: {COLORS['danger']}; font-weight: bold; {TYPOGRAPHY['headline']}"
             )
-        self.summary_label.setText(
-            f"Calibration complete. Points recorded: {len(results)}. "
-            f"Overall: {'PASS' if passed else 'FAIL'}."
-        )
-        self.completeChanged.emit()
 
     def _on_failed(self, message: str) -> None:
         self._running = False

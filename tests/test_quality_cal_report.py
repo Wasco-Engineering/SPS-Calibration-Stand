@@ -30,6 +30,7 @@ def _settings() -> QualitySettings:
         sample_hz=4.0,
         mensor_max_psia=30.0,
         fit_max_psia=20.0,
+        alicat_fit_max_psia=20.0,
         require_mensor=True,
         prompt_disconnect_mensor_above_psi=None,
         capture_raw_during_sweep=True,

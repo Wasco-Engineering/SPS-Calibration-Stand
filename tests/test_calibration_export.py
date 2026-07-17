@@ -101,6 +101,7 @@ def test_point_passes_mensor_tolerance() -> None:
 
 
 def test_point_passes_after_correction_uses_corrected_residual(tmp_path: Path) -> None:
+    tol = 0.0193
     raw_fail = _point(15.0, 15.0, 15.05, 15.0)
     assert not raw_fail.passed
     raw_fail.corrected_deviation_psia = 0.0
@@ -108,15 +109,17 @@ def test_point_passes_after_correction_uses_corrected_residual(tmp_path: Path) -
         raw_fail,
         pass_threshold_torr=1.0,
         fit_max_psia=30.0,
+        pressure_tolerance_psia=tol,
     )
 
     borderline = _point(50.0, 50.0, 50.02, 30.0)
     borderline.deviation_psia = -0.02
     borderline.corrected_deviation_psia = -0.02265
-    assert point_passes_after_correction(
+    assert not point_passes_after_correction(
         borderline,
         pass_threshold_torr=1.0,
         fit_max_psia=30.0,
+        pressure_tolerance_psia=tol,
     )
 
     high_ok = _point(115.0, 115.0, 115.01, 30.0)
@@ -126,6 +129,17 @@ def test_point_passes_after_correction_uses_corrected_residual(tmp_path: Path) -
         high_ok,
         pass_threshold_torr=1.0,
         fit_max_psia=30.0,
+        pressure_tolerance_psia=tol,
+    )
+
+    over_corrected = _point(115.0, 115.0208, 115.0050, 30.0)
+    over_corrected.deviation_psia = 0.0158
+    over_corrected.corrected_deviation_psia = 0.0415
+    assert point_passes_after_correction(
+        over_corrected,
+        pass_threshold_torr=1.0,
+        fit_max_psia=115.0,
+        pressure_tolerance_psia=tol,
     )
 
     bad_mensor = _point(115.0, 13.5, 115.0, 30.0)
@@ -135,6 +149,7 @@ def test_point_passes_after_correction_uses_corrected_residual(tmp_path: Path) -
         bad_mensor,
         pass_threshold_torr=1.0,
         fit_max_psia=30.0,
+        pressure_tolerance_psia=tol,
     )
 
 
@@ -158,6 +173,7 @@ def test_rescore_updates_pass_flags(tmp_path: Path) -> None:
         sample_hz=4.0,
         mensor_max_psia=165.0,
         fit_max_psia=30.0,
+        alicat_fit_max_psia=115.0,
         require_mensor=True,
         prompt_disconnect_mensor_above_psi=None,
         capture_raw_during_sweep=True,

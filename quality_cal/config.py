@@ -67,6 +67,7 @@ class QualitySettings:
     sample_hz: float
     mensor_max_psia: float
     fit_max_psia: float
+    alicat_fit_max_psia: float
     require_mensor: bool
     prompt_disconnect_mensor_above_psi: Optional[float]
     capture_raw_during_sweep: bool
@@ -282,6 +283,12 @@ def parse_quality_settings(
         ),
     )
     fit_max = _coerce_float(profile_cfg.get('fit_max_psia', quality_cfg.get('fit_max_psia', 20.0)))
+    pressure_points = build_pressure_points_for_profile(str(selected_profile), quality_cfg)
+    alicat_fit_raw = profile_cfg.get('alicat_fit_max_psia', quality_cfg.get('alicat_fit_max_psia'))
+    if alicat_fit_raw is None:
+        alicat_fit_max = max(pressure_points) if pressure_points else fit_max
+    else:
+        alicat_fit_max = _coerce_float(alicat_fit_raw)
     prompt_disconnect = profile_cfg.get('prompt_disconnect_mensor_above_psi')
     if prompt_disconnect is not None and prompt_disconnect != '':
         prompt_disconnect_psi: Optional[float] = _coerce_float(prompt_disconnect)
@@ -291,7 +298,7 @@ def parse_quality_settings(
     return QualitySettings(
         profile_id=str(selected_profile),
         profile_label=str(profile_cfg.get('label', selected_profile)),
-        pressure_points_psia=build_pressure_points_for_profile(str(selected_profile), quality_cfg),
+        pressure_points_psia=pressure_points,
         pressure_tolerance_psia=_coerce_float(quality_cfg.get("pressure_tolerance_psia", 0.0193)),
         settle_tolerance_psia=_coerce_float(quality_cfg.get("settle_tolerance_psia", 0.05)),
         settle_hold_s=_coerce_float(quality_cfg.get("settle_hold_s", 5.0)),
@@ -325,6 +332,7 @@ def parse_quality_settings(
         sample_hz=_coerce_float(quality_cfg.get("sample_hz", 4.0)),
         mensor_max_psia=mensor_max,
         fit_max_psia=fit_max,
+        alicat_fit_max_psia=alicat_fit_max,
         require_mensor=bool(profile_cfg.get('require_mensor', True)),
         prompt_disconnect_mensor_above_psi=prompt_disconnect_psi,
         capture_raw_during_sweep=bool(

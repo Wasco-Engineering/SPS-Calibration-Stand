@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.hardware.alicat import AlicatController
+from app.hardware.alicat import AlicatController, AlicatReading
 from app.hardware.port import Port, PortId
 
 
@@ -64,6 +64,61 @@ def test_alicat_torr_units_ignore_stale_psi_command_preference() -> None:
     assert sent[0] == f'S {expected_setpoint:.2f}'
     assert sent[1] == f'SR {expected_rate:.4f} 4'
     assert not controller._prefer_psi_commands
+
+
+def test_auto_tare_on_connect_does_not_exhaust_at_atmosphere() -> None:
+    controller = AlicatController({
+        'address': 'A',
+        'auto_tare_on_connect': True,
+        'auto_tare_max_delta_psi': 0.5,
+        'auto_tare_delay_s': 0,
+    })
+    controller._is_connected = True
+    sent: list[str] = []
+    tared = {'value': False}
+
+    def fake_send(command: str) -> str:
+        sent.append(command)
+        return 'A'
+
+    controller._send_command = fake_send  # type: ignore[method-assign]
+    controller.read_status = lambda: AlicatReading(  # type: ignore[method-assign]
+        pressure=14.68,
+        setpoint=14.7,
+        barometric_pressure=14.7,
+        timestamp=1.0,
+    )
+
+    def fake_tare() -> bool:
+        tared['value'] = True
+        return True
+
+    controller.tare = fake_tare  # type: ignore[method-assign]
+    controller._maybe_auto_tare()
+    assert 'E' not in sent
+    assert tared['value'] is True
+
+
+def test_auto_tare_on_connect_skips_when_not_at_atmosphere() -> None:
+    controller = AlicatController({
+        'address': 'A',
+        'auto_tare_on_connect': True,
+        'auto_tare_max_delta_psi': 0.5,
+        'auto_tare_delay_s': 0,
+    })
+    controller._is_connected = True
+    sent: list[str] = []
+
+    controller._send_command = lambda command: sent.append(command) or 'A'  # type: ignore[method-assign]
+    controller.read_status = lambda: AlicatReading(  # type: ignore[method-assign]
+        pressure=0.5,
+        setpoint=0.5,
+        barometric_pressure=14.7,
+        timestamp=1.0,
+    )
+    controller.tare = lambda: False  # type: ignore[method-assign]
+    controller._maybe_auto_tare()
+    assert sent == []
 
 
 def test_port_configures_switch_pins_from_ptp() -> None:

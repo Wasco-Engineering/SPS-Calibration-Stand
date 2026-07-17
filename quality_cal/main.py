@@ -36,8 +36,11 @@ def main() -> int:
 
     try:
         window = QualityCalibrationWindow(config=config, settings=settings)
+        app.aboutToQuit.connect(window.cleanup_hardware)
         window.showMaximized()
-        return app.exec()
+        exit_code = app.exec()
+        window.cleanup_hardware()
+        return exit_code
     except Exception as exc:
         logger.exception("Fatal startup error")
         QMessageBox.critical(None, "Startup Error", str(exc))

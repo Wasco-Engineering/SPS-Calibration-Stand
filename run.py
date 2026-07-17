@@ -203,6 +203,7 @@ def main():
         # Create work order controller (starts GUI-thread hardware polling timer)
         work_order_controller = WorkOrderController(ui_bridge, config)
         window.attach_work_order_controller(work_order_controller)
+        app.aboutToQuit.connect(work_order_controller.cleanup)
     except Exception as e:
         logger.exception('Startup failed before event loop: %s', e)
         print(f'ERROR starting app: {e}')

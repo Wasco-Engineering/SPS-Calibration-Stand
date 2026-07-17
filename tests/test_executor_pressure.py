@@ -1357,6 +1357,44 @@ def test_precision_arming_uses_reset_target_when_already_activated_decreasing() 
     assert port.solenoid_calls == [True]
 
 
+def test_pressure_decreasing_activation_prep_resets_above_band() -> None:
+    port = _FakePort([True])
+    executor = _build_executor(port)
+    executor._resolve_sweep_mode = lambda: 'pressure'  # type: ignore[method-assign]
+    executor._resolve_activation_sweep_direction = lambda: -1  # type: ignore[method-assign]
+    states = iter([(9.9, True), (9.98, False)])
+    executor._read_pressure_and_switch_state = lambda: next(states, (9.98, False))  # type: ignore[method-assign]
+    executor._get_latest_reading = lambda _pid: None  # type: ignore[method-assign]
+
+    commanded: list[float] = []
+    executor._set_pressure_or_raise = lambda pressure: commanded.append(pressure)  # type: ignore[method-assign]
+
+    executor._prepare_switch_for_cycle_edge(
+        sweep_mode='pressure',
+        min_psi=7.64,
+        max_psi=9.48,
+        direction=-1,
+        edge_type='activation',
+        overshoot=0.5,
+        hw_min_psi=0.0,
+        hw_max_psi=30.0,
+    )
+
+    assert commanded == [pytest.approx(9.98)]
+    assert port.solenoid_calls == [True]
+
+
+def test_pressure_decreasing_derive_nc_from_no_inverts_cycle_targets() -> None:
+    port = _FakePort([True])
+    port.daq = SimpleNamespace(switch_nc_derived_from_no=True)
+    executor = _build_executor(port)
+    executor._resolve_sweep_mode = lambda: 'pressure'  # type: ignore[method-assign]
+    executor._resolve_activation_sweep_direction = lambda: -1  # type: ignore[method-assign]
+
+    assert executor._cycle_target_switch_state('activation') is False
+    assert executor._cycle_target_switch_state('deactivation') is True
+
+
 def test_vacuum_increasing_pre_approach_starts_on_low_reset_side() -> None:
     setup = TestSetup(
         part_id='SPS02305-02',
@@ -1405,6 +1443,55 @@ def test_vacuum_increasing_pre_approach_starts_on_low_reset_side() -> None:
     assert commanded[0] == pytest.approx(14.7, rel=1e-6)
     assert commanded[1] == pytest.approx(waits[0], rel=1e-6)
     assert wait_timeouts[0] < executor._edge_timeout_s
+
+
+def test_vacuum_decreasing_pre_approach_skips_vent_and_atmosphere_staging() -> None:
+    setup = TestSetup(
+        part_id='UC8A',
+        sequence_id='399',
+        units_code='21',
+        units_label='Torr',
+        activation_direction='Decreasing',
+        activation_target=75.0,
+        pressure_reference='absolute',
+        terminals={},
+        bands={
+            'increasing': {'lower': 143.0, 'upper': 145.0},
+            'decreasing': {'lower': 73.0, 'upper': 76.0},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    port = _FakePort([True])
+    executor = _TestExecutor(
+        port_id='port_a',
+        port=cast(Any, port),
+        test_setup=setup,
+        config={
+            'control': {
+                'cycling': {},
+                'ramps': {'fast_cycle_rate_psi_per_sec': 5.0},
+                'edge_detection': {'overshoot_beyond_limit_percent': 10.0},
+                'debounce': {},
+            },
+        },
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 13.43,
+    )
+    staged: list[bool] = []
+    executor._stage_atmosphere_setpoint_before_route = lambda: staged.append(True)  # type: ignore[method-assign]
+    executor._set_pressure_or_raise = lambda _pressure: None  # type: ignore[method-assign]
+    executor._wait_until_near_target = lambda **_kwargs: True  # type: ignore[method-assign]
+
+    bounds = (
+        convert_pressure(73.0, 'Torr', 'PSI'),
+        convert_pressure(145.0, 'Torr', 'PSI'),
+    )
+    executor._cycle_phase_runner.run_pre_approach('vacuum', bounds)
+
+    assert port.vent_calls == 0
+    assert staged == []
+    assert port.solenoid_calls == [True]
 
 
 def test_pressure_decreasing_pre_approach_resets_above_deactivation_side() -> None:

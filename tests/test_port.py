@@ -69,7 +69,7 @@ class _FakeLabJackController:
     def reset_filter(self) -> None:
         self.reset_filter_calls += 1
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, preserve_solenoid_state: bool = False) -> None:
         return None
 
     def get_status(self) -> dict[str, Any]:
@@ -87,7 +87,11 @@ class _FakeAlicatController:
             barometric_pressure=14.7,
         )
         self.hold_calls = 0
+        self.hold_closed: bool | None = None
+        self.exhaust_calls = 0
+        self.cancel_hold_calls = 0
         self.disconnect_calls = 0
+        self.set_pressure_calls: list[float] = []
 
     def connect(self) -> bool:
         self.connected = True
@@ -96,17 +100,24 @@ class _FakeAlicatController:
     def read_status(self) -> AlicatReading:
         return self.next_reading
 
-    def set_pressure(self, _setpoint: float) -> bool:
+    def set_pressure(self, setpoint: float) -> bool:
+        self.set_pressure_calls.append(float(setpoint))
         return True
 
     def set_ramp_rate(self, _rate: float) -> bool:
         return True
 
-    def exhaust(self) -> bool:
+    def cancel_hold(self) -> bool:
+        self.cancel_hold_calls += 1
         return True
 
-    def hold_valve(self) -> bool:
+    def exhaust(self) -> bool:
+        self.exhaust_calls += 1
+        return True
+
+    def hold_valve(self, closed: bool = False) -> bool:
         self.hold_calls += 1
+        self.hold_closed = closed
         return True
 
     def disconnect(self) -> None:
@@ -427,17 +438,21 @@ class _FakeManagedPort:
         self.read_precision_fast_calls = 0
         self.read_all_calls = 0
         self.disconnect_calls = 0
+        self.vent_calls = 0
 
     def connect(self) -> bool:
         self.connect_calls += 1
         return self.connect_result
 
+    def refresh_alicat(self) -> None:
+        self.refresh_calls += 1
+
+    def is_at_atmospheric_idle(self) -> bool:
+        return False
+
     def read_all(self) -> PortReading:
         self.read_all_calls += 1
         return PortReading(timestamp=float(self.read_all_calls))
-
-    def refresh_alicat(self) -> None:
-        self.refresh_calls += 1
 
     def read_fast(self) -> PortReading:
         self.read_fast_calls += 1
@@ -446,6 +461,10 @@ class _FakeManagedPort:
     def read_precision_fast(self) -> PortReading:
         self.read_precision_fast_calls += 1
         return PortReading(timestamp=float(self.read_precision_fast_calls))
+
+    def vent_to_atmosphere(self, **_kwargs: Any) -> bool:
+        self.vent_calls += 1
+        return True
 
     def disconnect(self, **_kwargs: Any) -> None:
         self.disconnect_calls += 1
@@ -480,6 +499,9 @@ def test_port_manager_initializes_connects_and_reads(monkeypatch: Any) -> None:
     assert set(manager.ports.keys()) == {PortId.PORT_A, PortId.PORT_B}
 
     assert manager.connect_all()
+    for port in manager.ports.values():
+        assert isinstance(port, _FakeManagedPort)
+        assert port.vent_calls == 1
     readings = manager.read_all_ports()
     assert set(readings.keys()) == {PortId.PORT_A, PortId.PORT_B}
     assert manager.get_port('port_a') is not None
@@ -592,3 +614,194 @@ def test_port_manager_disconnect_all_clears_ports(monkeypatch: Any) -> None:
     for port in ports:
         assert isinstance(port, _FakeManagedPort)
         assert port.disconnect_calls == 1
+
+
+def test_vent_to_atmosphere_locks_atmosphere_hold_without_exhaust(monkeypatch: Any) -> None:
+    port = _make_port(monkeypatch)
+    alicat = port.alicat
+    assert isinstance(alicat, _FakeAlicatController)
+    alicat.next_reading = AlicatReading(
+        pressure=14.68,
+        setpoint=0.5,
+        timestamp=1.0,
+        gauge_pressure=-0.02,
+        barometric_pressure=14.7,
+        raw_response='A +014.68 +000.50 EXH',
+    )
+    assert port.vent_to_atmosphere() is True
+    assert alicat.exhaust_calls == 0
+    assert alicat.hold_calls == 1
+    assert alicat.hold_closed is True
+    daq = port.daq
+    assert isinstance(daq, _FakeLabJackController)
+    assert daq.solenoid_calls[-1] is False
+
+
+def test_vent_to_atmosphere_skips_when_already_at_atmospheric_idle(monkeypatch: Any) -> None:
+    port = _make_port(monkeypatch)
+    alicat = port.alicat
+    assert isinstance(alicat, _FakeAlicatController)
+    alicat.next_reading = AlicatReading(
+        pressure=14.68,
+        setpoint=14.7,
+        timestamp=1.0,
+        gauge_pressure=-0.02,
+        barometric_pressure=14.7,
+        raw_response='A +014.68 +014.70 HLD',
+    )
+    daq = port.daq
+    assert isinstance(daq, _FakeLabJackController)
+    assert port.is_at_atmospheric_idle() is True
+    assert port.vent_to_atmosphere() is True
+    assert alicat.hold_calls == 0
+    assert alicat.cancel_hold_calls == 0
+    assert daq.solenoid_calls == []
+
+
+def test_vent_to_atmosphere_skips_idaho_open_fitting_hold(monkeypatch: Any) -> None:
+    """Open fittings at altitude: P~13.5 HLD should not trigger bleed to 14.7."""
+    port = _make_port(monkeypatch)
+    alicat = port.alicat
+    assert isinstance(alicat, _FakeAlicatController)
+    alicat.next_reading = AlicatReading(
+        pressure=13.476,
+        setpoint=14.7,
+        timestamp=1.0,
+        gauge_pressure=-1.22,
+        raw_response='A +013.48 +014.70 HLD',
+    )
+    daq = port.daq
+    assert isinstance(daq, _FakeLabJackController)
+    assert port.is_at_atmospheric_idle() is True
+    assert port.vent_to_atmosphere() is True
+    assert alicat.hold_calls == 0
+    assert alicat.cancel_hold_calls == 0
+    assert daq.solenoid_calls == []
+
+
+def test_is_at_atmospheric_idle_rejects_vacuum_hold(monkeypatch: Any) -> None:
+    """A vacuum-held line must not be treated as atmospheric idle."""
+    port = _make_port(monkeypatch)
+    alicat = port.alicat
+    assert isinstance(alicat, _FakeAlicatController)
+    alicat.next_reading = AlicatReading(
+        pressure=1.48,
+        setpoint=0.93,
+        timestamp=1.0,
+        raw_response='A +001.48 +000.93 HLD',
+    )
+    assert port.is_at_atmospheric_idle(14.7) is False
+
+
+def test_disconnect_restores_atmosphere_hold(monkeypatch: Any) -> None:
+    port = _make_port(monkeypatch)
+    alicat = port.alicat
+    assert isinstance(alicat, _FakeAlicatController)
+    alicat.next_reading = AlicatReading(
+        pressure=14.68,
+        setpoint=0.5,
+        timestamp=1.0,
+        gauge_pressure=-0.02,
+        barometric_pressure=14.7,
+        raw_response='A +014.68 +000.50 EXH',
+    )
+    port.disconnect(restore_safe_state=True)
+    alicat = port.alicat
+    assert isinstance(alicat, _FakeAlicatController)
+    assert alicat.exhaust_calls == 0
+    assert alicat.hold_calls >= 1
+    assert alicat.hold_closed is True
+    assert alicat.disconnect_calls == 1
+
+
+def test_port_manager_disconnect_all_vents_before_shared_disconnect(monkeypatch: Any) -> None:
+    monkeypatch.setattr(port_module, 'Port', _FakeManagedPort)
+    manager = PortManager(_manager_config())
+    manager.initialize_ports()
+    manager.connect_all(safe_idle_on_connect=False)
+    ports = list(manager.ports.values())
+    manager.disconnect_all()
+    assert manager.ports == {}
+    for port in ports:
+        assert isinstance(port, _FakeManagedPort)
+        assert port.vent_calls == 1
+        assert port.disconnect_calls == 1
+
+
+def test_vent_to_atmosphere_open_fitting_bleeds_without_exhaust(monkeypatch: Any) -> None:
+    """Open fittings must pressurize up on the atmosphere route; EXH pulls vacuum."""
+    port = _make_port(
+        monkeypatch,
+        labjack_overrides={
+            'open_fitting': True,
+            'transducer_installed': False,
+            'local_barometric_psi': 13.48,
+        },
+    )
+    alicat = port.alicat
+    assert isinstance(alicat, _FakeAlicatController)
+    low = AlicatReading(
+        pressure=0.20,
+        setpoint=0.5,
+        timestamp=1.0,
+        raw_response='A +000.20 +000.50 HLD',
+    )
+    high = AlicatReading(
+        pressure=13.50,
+        setpoint=13.48,
+        timestamp=3.0,
+        raw_response='A +013.50 +013.48 HLD',
+    )
+    readings = [low] * 8 + [high]
+    state = {'index': 0}
+
+    def _next_reading() -> AlicatReading:
+        reading = readings[min(state['index'], len(readings) - 1)]
+        state['index'] += 1
+        return reading
+
+    alicat.read_status = _next_reading  # type: ignore[method-assign]
+    port.read_all = lambda: PortReading(alicat=_next_reading(), timestamp=1.0)  # type: ignore[method-assign]
+
+    assert port.vent_to_atmosphere(bleed_installed_dut=True, timeout_s=5.0) is True
+    assert alicat.exhaust_calls == 0
+    assert alicat.set_pressure_calls
+    assert abs(alicat.set_pressure_calls[-1] - 13.48) < 0.05
+
+
+def test_vent_to_atmosphere_bleeds_low_pressure_before_exhaust(monkeypatch: Any) -> None:
+    port = _make_port(monkeypatch)
+    alicat = port.alicat
+    assert isinstance(alicat, _FakeAlicatController)
+    low = AlicatReading(
+        pressure=0.05,
+        setpoint=0.5,
+        timestamp=1.0,
+        barometric_pressure=14.7,
+        raw_response='A +000.05 +000.50 EXH',
+    )
+    high = AlicatReading(
+        pressure=14.6,
+        setpoint=14.7,
+        timestamp=3.0,
+        barometric_pressure=14.7,
+        raw_response='A +014.60 +014.70',
+    )
+    readings = [low] * 12 + [high]
+    state = {'index': 0}
+
+    def _next_reading() -> AlicatReading:
+        reading = readings[min(state['index'], len(readings) - 1)]
+        state['index'] += 1
+        return reading
+
+    alicat.read_status = _next_reading  # type: ignore[method-assign]
+    port.read_all = lambda: PortReading(alicat=_next_reading(), timestamp=1.0)  # type: ignore[method-assign]
+
+    assert port.vent_to_atmosphere(bleed_installed_dut=True, timeout_s=5.0) is True
+    daq = port.daq
+    assert isinstance(daq, _FakeLabJackController)
+    assert daq.solenoid_calls
+    assert daq.solenoid_calls[-1] is False
+    assert alicat.exhaust_calls == 0
+    assert alicat.hold_calls >= 1

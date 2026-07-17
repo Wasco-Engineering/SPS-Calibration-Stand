@@ -15,7 +15,7 @@ hardware:
     # Match stinger_config: port_a=left, port_b=right (physical, May 2026 swap).
     port_a:
       port_installed: true
-      transducer_installed: false
+      transducer_installed: true
       transducer_ain: 2
       transducer_ain_neg: 3
       transducer_voltage_min: 0
@@ -31,7 +31,7 @@ hardware:
       solenoid_dio: 19
     port_b:
       port_installed: true
-      transducer_installed: false
+      transducer_installed: true
       transducer_ain: 0
       transducer_ain_neg: 1
       transducer_voltage_min: 0
@@ -46,7 +46,7 @@ hardware:
       switch_active_low: true
       solenoid_dio: 18
   alicat:
-    baudrate: 19200
+    baudrate: 115200
     timeout_s: 0.05
     auto_tare_on_connect: true
     auto_tare_max_delta_psi: 0.5
@@ -77,10 +77,9 @@ hardware:
 quality:
   default_profile_id: "cal10_wcs02075"
   capture_raw_during_sweep: true
-  # Mensor reference (165 PSIA sensor); transducer fits 0–30 PSIA; Alicat fits full CAL10 range.
+  # Mensor reference (165 PSIA sensor); port LabJack transducers remain 0–30 PSIA for fit band.
   mensor_max_psia: 165.0
   fit_max_psia: 30.0
-  alicat_fit_max_psia: 115.0
   calibration_profiles:
     cal10_wcs02075:
       label: "CAL 10 WCS02075 (Rev 000)"
@@ -88,7 +87,6 @@ quality:
       require_mensor: true
       mensor_max_psia: 165.0
       fit_max_psia: 30.0
-      alicat_fit_max_psia: 115.0
       pass_threshold_torr: 1.0
       capture_raw_during_sweep: true
       preserve_point_order: true

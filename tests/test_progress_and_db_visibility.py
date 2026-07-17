@@ -460,6 +460,44 @@ def test_ensure_work_order_master_uses_composite_key_without_rewriting_other_par
         assert rows['SPS-17123'].LastSequenceCalibrated == '300'
 
 
+def test_save_test_result_accepts_null_measurements(monkeypatch) -> None:
+    engine = create_engine('sqlite:///:memory:')
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+
+    @contextmanager
+    def _session_scope():
+        session = Session()
+        try:
+            yield session
+            session.commit()
+        finally:
+            session.close()
+
+    monkeypatch.setattr(operations, 'session_scope', _session_scope)
+
+    result = operations.save_test_result(
+        shop_order='WO-1',
+        part_id='PART-1',
+        sequence_id='1',
+        serial_number=1,
+        increasing_activation=None,
+        decreasing_deactivation=None,
+        in_spec=False,
+        temperature_c=25.0,
+        units_of_measure='PSI',
+        operator_id='OP-1',
+        equipment_id='STINGER_01',
+    )
+
+    assert result is True
+    with Session() as session:
+        saved = session.query(OrderCalibrationDetail).one()
+        assert saved.IncreasingActivation is None
+        assert saved.DecreasingDeactivation is None
+        assert saved.InSpec is False
+
+
 def test_save_test_result_rejects_overlength_fixed_width_fields(caplog) -> None:
     result = operations.save_test_result(
         shop_order='SHOPORDER123',

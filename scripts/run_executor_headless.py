@@ -97,7 +97,7 @@ def run_headless_executor(
         logger.info('EVENT %s %s', name, payload)
 
     def get_latest(_pid: str) -> Optional[PortReading]:
-        return port.read_precision_fast()
+        return port.read_fast()
 
     last_baro: dict[str, Optional[float]] = {'value': None}
 

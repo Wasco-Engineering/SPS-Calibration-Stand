@@ -25,13 +25,9 @@ from quality_cal.core.hardware_helpers import ensure_port_at_atmosphere, safe_sh
 from quality_cal.core.hardware_session import connect_hardware_session
 from quality_cal.core.port_calibrator import (
     PortCalibrationFitResult,
-    apply_port_models_to_stinger_config,
-    build_port_config_snippet,
+    finalize_port_calibration,
     fit_port_from_sweep_csv,
-    fit_summary_from_result,
     format_fit_dialog_text,
-    reload_port_calibration,
-    rescore_points_with_models,
 )
 from quality_cal.core.qf87_certificate import (
     export_certificate_bundle,
@@ -98,7 +94,11 @@ def run_headless_sweep(
 
 
 def _log_fit_summary(fit: PortCalibrationFitResult, settings: QualitySettings) -> None:
-    logger.info('--- Correction factor fit (0–%.0f psia vs Mensor) ---', settings.fit_max_psia)
+    logger.info(
+        '--- Correction factor fit (Alicat 0–%.0f, transducer 0–%.0f psia vs Mensor) ---',
+        settings.alicat_fit_max_psia,
+        settings.fit_max_psia,
+    )
     for line in format_fit_dialog_text(fit, settings).splitlines():
         if line.strip():
             logger.info('%s', line)
@@ -324,24 +324,18 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         apply_models = not args.no_apply_models
-        fit_summary = fit_summary_from_result(args.port, fit, applied=False)
-        if apply_models and fit.transducer is None and fit.alicat is None:
-            logger.warning('No models fitted; skipping apply to stinger_config.yaml')
-            apply_models = False
-
-        if apply_models:
-            snippet = build_port_config_snippet(args.port, fit, require_passed=True)
-            if not snippet.get('hardware', {}).get('labjack', {}).get(args.port) and not (
-                snippet.get('hardware', {}).get('alicat', {}).get(args.port)
-            ):
-                logger.warning('No passing models to apply')
-            else:
-                apply_port_models_to_stinger_config(args.port, fit)
-                reload_port_calibration(port, snippet)
-                fit_summary = fit_summary_from_result(args.port, fit, applied=True)
-                logger.info('Applied passing error models to stinger_config.yaml for %s', args.port)
-
-        results = rescore_points_with_models(results, fit, settings=settings)
+        finalized = finalize_port_calibration(
+            sweep_path,
+            args.port,
+            results,
+            settings,
+            port=port,
+            apply_to_stinger=apply_models,
+        )
+        results = finalized.points
+        fit_summary = finalized.fit_summary
+        fit = finalized.fit
+        logger.info(finalized.message)
         _log_rescore_validation(results, settings)
 
         from quality_cal.core.calibration_export import port_calibration_passed

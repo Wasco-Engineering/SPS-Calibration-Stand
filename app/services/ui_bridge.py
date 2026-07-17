@@ -7,6 +7,7 @@ from UI implementation details.
 
 import logging
 import threading
+import time
 from typing import Any, Dict, Optional, Set
 
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -147,6 +148,11 @@ class UIBridge(QObject):
                 "barometric_psi": 14.7,
             },
         }
+        self._last_debug_chart_emit_s: Dict[str, float] = {
+            "port_a": 0.0,
+            "port_b": 0.0,
+        }
+        self._debug_chart_interval_s = 0.10
         
         logger.info("UIBridge initialized")
 
@@ -258,20 +264,24 @@ class UIBridge(QObject):
             "barometric_psi": baro_value,
         }
 
-        display_transducer = self._to_display_pressure(
-            transducer_abs_psi,
-            self._pressure_unit,
-            baro_value,
-        )
-        display_setpoint = self._to_display_pressure(setpoint_abs_psi, self._pressure_unit, baro_value)
-        display_alicat = self._to_display_pressure(alicat_abs_psi, self._pressure_unit, baro_value)
-        self.debug_chart_updated.emit(
-            port_id,
-            reading.timestamp,
-            display_transducer,
-            display_setpoint,
-            display_alicat,
-        )
+        now_s = time.monotonic()
+        last_emit_s = self._last_debug_chart_emit_s.get(port_id, 0.0)
+        if now_s - last_emit_s >= self._debug_chart_interval_s:
+            self._last_debug_chart_emit_s[port_id] = now_s
+            display_transducer = self._to_display_pressure(
+                transducer_abs_psi,
+                self._pressure_unit,
+                baro_value,
+            )
+            display_setpoint = self._to_display_pressure(setpoint_abs_psi, self._pressure_unit, baro_value)
+            display_alicat = self._to_display_pressure(alicat_abs_psi, self._pressure_unit, baro_value)
+            self.debug_chart_updated.emit(
+                port_id,
+                reading.timestamp,
+                display_transducer,
+                display_setpoint,
+                display_alicat,
+            )
         
         if reading.switch:
             self.switch_state_updated.emit(

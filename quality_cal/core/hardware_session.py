@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from app.hardware.port import Port, PortManager
+from quality_cal.core.hardware_checks import evaluate_labjack_port_check
 from quality_cal.core.hardware_discovery import (
     discover_alicat_assignments,
     discover_labjack_target,
@@ -120,38 +121,15 @@ def connect_hardware_session(config: dict[str, Any]) -> HardwareSession:
             )
             continue
 
-        labjack_status = port.daq.get_status()
-        transducer_reading = port.daq.read_transducer()
-        driver_loaded = bool(labjack_status.get('driver_loaded', False))
-        simulated = bool(labjack_status.get('simulated', False))
-        if driver_loaded and transducer_reading is None and not bool(
-            labjack_status.get('configured', False)
-        ):
-            port.daq.configure()
-            labjack_status = port.daq.get_status()
-            transducer_reading = port.daq.read_transducer()
-            driver_loaded = bool(labjack_status.get('driver_loaded', False))
-            simulated = bool(labjack_status.get('simulated', False))
-
-        labjack_ok = transducer_reading is not None and driver_loaded and not simulated
-        if not driver_loaded:
-            lj_detail = (
-                f"{labjack_status.get('status', 'Unknown')} | "
-                'LabJack driver missing: install the LabJack LJM driver.'
-            )
-        elif simulated:
-            lj_detail = (
-                f"{labjack_status.get('status', 'Unknown')} | "
-                'Simulated only — allow_simulated_hardware is not valid for production cal.'
-            )
-        elif transducer_reading is None:
-            lj_detail = f"{labjack_status.get('status', 'Unknown')} | {discovery_note}"
-        else:
-            lj_detail = (
-                f"{labjack_status.get('status', 'Unknown')} | "
-                f'Transducer={transducer_reading.pressure:.3f} psia'
-            )
-        checks.append(HardwareCheck(f'{port_id}_labjack', labjack_ok, lj_detail))
+        labjack_result = evaluate_labjack_port_check(
+            port_id=port_id,
+            port=port,
+            config=config,
+            probe_detail=discovery_note,
+        )
+        checks.append(
+            HardwareCheck(f'{port_id}_labjack', labjack_result.ok, labjack_result.detail),
+        )
 
         alicat_status = port.alicat.get_status()
         alicat_reading = port.alicat.read_status()

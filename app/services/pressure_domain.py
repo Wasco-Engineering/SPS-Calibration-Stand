@@ -29,6 +29,9 @@ def _alicat_status_indicates_vented(reading: AlicatReading) -> bool:
     raw = (reading.raw_response or '').upper()
     if 'EXH' in raw or 'ATM' in raw:
         return True
+    if 'HLD' in raw and reading.pressure is not None:
+        if is_plausible_barometric_psi(float(reading.pressure)):
+            return True
     if reading.setpoint is not None and abs(float(reading.setpoint)) <= 0.25:
         return 'HLD' in raw
     return False

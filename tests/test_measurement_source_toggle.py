@@ -367,6 +367,17 @@ def test_ui_pressure_prefers_transducer_over_auto_alicat() -> None:
     assert main_psi != pytest.approx(12.0)
 
 
+def test_ui_pressure_honors_explicit_alicat_source() -> None:
+    reading = build_port_reading(transducer_pressure=0.2, alicat_pressure=13.5)
+    ui_psi, ui_src = select_ui_pressure_abs_psi(
+        reading=reading,
+        settings=_auto_settings(preferred_source='alicat'),
+        barometric_psi=13.5,
+    )
+    assert ui_psi == pytest.approx(13.5)
+    assert ui_src == MEASUREMENT_SOURCE_ALICAT
+
+
 def test_executor_control_pressure_prefers_transducer() -> None:
     executor = _build_executor('auto')
     reading = build_port_reading(transducer_pressure=10.0, alicat_pressure=26.0)
