@@ -19,6 +19,7 @@ from .measurement_source import (
     _transducer_pressure_abs_psi,
 )
 from .pressure_domain import (
+    configured_barometric_psi,
     infer_barometric_pressure,
     infer_setpoint_abs_psi,
     is_gauge_unit_label,
@@ -116,7 +117,8 @@ class UIBridge(QObject):
         """
         super().__init__()
         self.config = config
-        
+        site_baro = configured_barometric_psi(config)
+
         # State tracking
         self._current_work_order: Optional[Dict] = None
         self._port_serials: Dict[str, int] = {}
@@ -124,13 +126,14 @@ class UIBridge(QObject):
         self._serial_lock = threading.Lock()
         self._pressure_unit = "PSIA"
         self._display_reference: Optional[str] = None
+        self._site_barometric_psi = site_baro
         self._last_pressure_abs_psi: Dict[str, float] = {
             "port_a": 0.0,
             "port_b": 0.0,
         }
         self._last_barometric_psi: Dict[str, float] = {
-            "port_a": 14.7,
-            "port_b": 14.7,
+            "port_a": site_baro,
+            "port_b": site_baro,
         }
         self._last_debug_readings: Dict[str, Dict[str, Optional[float]]] = {
             "port_a": {
@@ -138,14 +141,14 @@ class UIBridge(QObject):
                 "pressure_abs_psi": None,
                 "setpoint_abs_psi": None,
                 "alicat_abs_psi": None,
-                "barometric_psi": 14.7,
+                "barometric_psi": site_baro,
             },
             "port_b": {
                 "timestamp": None,
                 "pressure_abs_psi": None,
                 "setpoint_abs_psi": None,
                 "alicat_abs_psi": None,
-                "barometric_psi": 14.7,
+                "barometric_psi": site_baro,
             },
         }
         self._last_debug_chart_emit_s: Dict[str, float] = {
@@ -217,7 +220,9 @@ class UIBridge(QObject):
         """Update pressure display for a port."""
         baro_value = resolve_barometric_psi(
             reading,
+            fallback=self._site_barometric_psi,
             last_value=self._last_barometric_psi.get(port_id),
+            anchor_baro_psi=self._site_barometric_psi,
         )
         self._last_barometric_psi[port_id] = baro_value
 

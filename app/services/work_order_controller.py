@@ -52,6 +52,8 @@ from app.services.ui_bridge import UIBridge
 from app.hardware.port import Port, PortManager, PortId, PortReading
 from app.services.measurement_source import get_measurement_settings, select_main_pressure_abs_psi
 from app.services.pressure_domain import (
+    DEFAULT_BAROMETRIC_PSI,
+    configured_barometric_psi,
     infer_barometric_pressure,
     resolve_barometric_psi,
     is_gauge_unit_label,
@@ -111,7 +113,10 @@ class WorkOrderController(QObject):
         
         self._latest_readings: Dict[str, PortReading] = {}
         self._latest_readings_lock = threading.Lock()
-        self._runtime_state = PortRuntimeState.with_defaults()
+        self._site_barometric_psi = configured_barometric_psi(config)
+        self._runtime_state = PortRuntimeState.with_defaults(
+            barometric_psi=self._site_barometric_psi,
+        )
         self._last_barometric_psi = self._runtime_state.last_barometric_psi
         self._barometric_warning_issued = self._runtime_state.barometric_warning_issued
         self._debug_sweep_lock = threading.Lock()
@@ -488,21 +493,25 @@ class WorkOrderController(QObject):
         )
 
     def _initialize_hardware(self) -> None:
-        """Initialize hardware ports and start polling."""
+        """Initialize hardware ports and start polling.
+
+        Start polling before safe-idle vents so the UI is not stuck on
+        "Hardware Connecting..." while Alicats recover from vacuum/overpressure.
+        """
         init_start = time.perf_counter()
         ports_start = time.perf_counter()
         if not self._port_manager.initialize_ports():
             logger.error("Failed to initialize hardware ports")
             return
         logger.info('Hardware init: port objects initialized in %.3fs', time.perf_counter() - ports_start)
-        
+
         connect_start = time.perf_counter()
-        if not self._port_manager.connect_all():
+        if not self._port_manager.connect_all(safe_idle_on_connect=False):
             logger.warning("Some hardware connections failed, continuing anyway")
         logger.info('Hardware init: connect_all completed in %.3fs', time.perf_counter() - connect_start)
         self._sig_hw_status_refresh.emit()
-        
-        # Start polling loop
+
+        # Enable live polls before blocking safe-idle vents.
         poll_start = time.perf_counter()
         self._port_manager.start_polling()
         self._port_manager.set_alicat_poll_profile(None)
@@ -510,6 +519,13 @@ class WorkOrderController(QObject):
             'Hardware polling started in %.3fs (total hardware init %.3fs)',
             time.perf_counter() - poll_start,
             time.perf_counter() - init_start,
+        )
+
+        idle_start = time.perf_counter()
+        self._port_manager.safe_idle_connected_ports()
+        logger.info(
+            'Hardware init: safe idle completed in %.3fs',
+            time.perf_counter() - idle_start,
         )
 
     def _request_precision_slot(self, port_id: str) -> bool:
@@ -701,13 +717,19 @@ class WorkOrderController(QObject):
         if pressure_abs_psi is None or not math.isfinite(pressure_abs_psi):
             return
 
+        # Absolute PSI → display units. Do NOT use _to_display_pressure here:
+        # that helper expects gauge PSI when reference is gauge and would add baro again.
         unit_label = self._ui_bridge.get_pressure_unit() if self._ui_bridge else setup.units_label or 'PSI'
-        pressure_display = self._to_display_pressure(
-            port_id,
-            float(pressure_abs_psi),
-            unit_label,
-            setup.pressure_reference,
+        baro = self._get_barometric_pressure(port_id)
+        pressure_display = to_display_pressure(
+            value_abs_psi=float(pressure_abs_psi),
+            unit_label=unit_label,
+            barometric_psi=baro,
+            pressure_reference=setup.pressure_reference,
         )
+        if pressure_display is None or not math.isfinite(float(pressure_display)):
+            return
+        pressure_display = float(pressure_display)
         current = self._max_test_pressure_display.get(port_id)
         if current is None or pressure_display > current:
             self._max_test_pressure_display[port_id] = pressure_display
@@ -819,24 +841,33 @@ class WorkOrderController(QObject):
         self._db_sync_worker = run_async(_sync, _on_done)
     
     def _on_logout_requested(self) -> None:
-        """Handle logout/end work order - reset all ports and clear work order data."""
+        """Handle logout/end work order - reset all ports and clear work order data.
+
+        When a test is still running, only cancel the executor and advance the
+        state machine. Do **not** call ``_vent_port`` on the GUI thread — that
+        blocks Qt for up to ~90s/port and races the executor's own safe vent
+        (Cancel already avoids this race).
+        """
         self._reset_precision_coordination()
-        # Cancel any running test executors and reset ports
         for port_id in ('port_a', 'port_b'):
-            # Cancel any running executor first
             executor = self._test_executors.get(port_id)
-            if executor and executor.is_running:
-                executor.request_cancel()
-            
-            # Vent the port hardware
-            self._vent_port(port_id)
-            
-            # Reset state machine to END state
             sm = self._state_machines.get(port_id)
+            if executor and executor.is_running:
+                logger.info(
+                    '%s: End work order — cancelling running test '
+                    '(executor will vent; skipping sync GUI vent)',
+                    port_id,
+                )
+                executor.request_cancel()
+                if sm:
+                    if not sm.trigger('end_work_order'):
+                        sm.trigger('cancel')
+                continue
+
+            self._vent_port(port_id)
             if sm:
-                # Trigger end_work_order which will vent and transition to END state
                 sm.trigger('end_work_order')
-        
+
         # Clear work order data
         self._current_test_setup = None
         self._base_viz = None
@@ -850,7 +881,7 @@ class WorkOrderController(QObject):
         self._ui_bridge.set_work_order({})
         self._ui_bridge.update_progress(0, 0, 0, 0)
         self._ui_bridge.update_ptp_details({})
-        
+
         # Release serial numbers
         self._ui_bridge.release_serial('port_a')
         self._ui_bridge.release_serial('port_b')
@@ -989,7 +1020,7 @@ class WorkOrderController(QObject):
             for port_id in [PortId.PORT_A, PortId.PORT_B]:
                 port = self._port_manager.get_port(port_id)
                 if port:
-                    ok = port.alicat.configure_units_from_ptp(units_code)
+                    ok = port.alicat.configure_units_from_ptp_prefer_psi(units_code)
                     if not ok:
                         logger.warning(
                             'Alicat units verify failed during login for %s (requested code=%s)',
@@ -1046,6 +1077,27 @@ class WorkOrderController(QObject):
     
     def _on_barometric_pressure_updated(self, port_id: str, barometric_pressure: float) -> None:
         """Handle barometric pressure update from Alicat - update atmosphere reference."""
+        site = getattr(self, '_site_barometric_psi', None)
+        last = self._last_barometric_psi.get(port_id)
+        if (
+            is_plausible_barometric_psi(last)
+            and abs(float(barometric_pressure) - float(last)) > 0.75
+        ):
+            logger.warning(
+                '%s: Ignoring barometric signal jump %.4f -> %.4f PSI',
+                port_id,
+                last,
+                barometric_pressure,
+            )
+            return
+        if is_plausible_barometric_psi(site) and abs(float(barometric_pressure) - float(site)) > 1.5:
+            logger.warning(
+                '%s: Ignoring barometric signal far from site config %.4f (got %.4f)',
+                port_id,
+                site,
+                barometric_pressure,
+            )
+            return
         self._last_barometric_psi[port_id] = barometric_pressure
         # Use barometric pressure from any port (they should be similar)
         # Update visualization for all ports with the barometric reading
@@ -1261,8 +1313,18 @@ class WorkOrderController(QObject):
         return 0.0
 
     def _get_barometric_pressure(self, port_id: str) -> float:
+        site = getattr(self, '_site_barometric_psi', None)
+        executor = self._test_executors.get(port_id)
+        # Freeze gauge-zero while a test owns the port (matches TestExecutor lock).
+        if (
+            executor is not None
+            and getattr(executor, 'is_running', False)
+            and is_plausible_barometric_psi(site)
+        ):
+            self._last_barometric_psi[port_id] = float(site)
+            return float(site)
+
         reading = self._get_latest_reading(port_id)
-        inferred = infer_barometric_pressure(reading)
         last_value = self._last_barometric_psi.get(port_id)
         if not is_plausible_barometric_psi(last_value):
             last_value = next(
@@ -1271,8 +1333,9 @@ class WorkOrderController(QObject):
                     for other_port, value in self._last_barometric_psi.items()
                     if other_port != port_id and is_plausible_barometric_psi(value)
                 ),
-                None,
+                site,
             )
+        inferred = infer_barometric_pressure(reading, anchor_baro_psi=site or last_value)
         if inferred is not None and not is_plausible_barometric_psi(inferred):
             if not self._barometric_warning_issued.get(port_id, False):
                 logger.warning(
@@ -1281,14 +1344,16 @@ class WorkOrderController(QObject):
                     inferred,
                     resolve_barometric_psi(
                         reading,
+                        fallback=site or DEFAULT_BAROMETRIC_PSI,
                         last_value=last_value,
+                        anchor_baro_psi=site,
                     ),
                 )
                 self._barometric_warning_issued[port_id] = True
         elif (
             inferred is not None
             and is_plausible_barometric_psi(last_value)
-            and abs(float(inferred) - float(last_value)) > 1.0
+            and abs(float(inferred) - float(last_value)) > 0.75
         ):
             logger.warning(
                 '%s: Ignoring barometric jump %.4f -> %.4f PSI; using last good value',
@@ -1296,10 +1361,14 @@ class WorkOrderController(QObject):
                 last_value,
                 inferred,
             )
+            self._last_barometric_psi[port_id] = float(last_value)
+            return float(last_value)
 
         baro = resolve_barometric_psi(
             reading,
+            fallback=site or DEFAULT_BAROMETRIC_PSI,
             last_value=last_value,
+            anchor_baro_psi=site,
         )
         self._last_barometric_psi[port_id] = baro
         return baro
@@ -1807,6 +1876,17 @@ class WorkOrderController(QObject):
             return target
         # Decreasing switches actuate while pressure falls, so manual
         # pressurize must first move above the reset/deactivation side.
+        if ptp_limits_use_psia_scale(setup, {}, atmosphere_psi):
+            # Deep vacuum PTP bands are absolute-scale (e.g. 75/145 mmHg).
+            # Staging at max+120 Torr (~265 mmHg) is far above a 75 switch
+            # working range; sit just above the high band toward atmosphere.
+            band_overshoot = min(
+                overshoot_psi,
+                convert_pressure(40.0, 'Torr', 'PSI'),
+            )
+            target = max_psi + band_overshoot
+            atmosphere_margin = convert_pressure(10.0, 'Torr', 'PSI')
+            return min(target, max(0.0, atmosphere_psi - atmosphere_margin))
         return max(activation_psi, max_psi) + overshoot_psi
 
     # ------------------------------------------------------------------
@@ -2850,9 +2930,10 @@ class WorkOrderController(QObject):
         self._reset_precision_coordination()
         self._port_manager.stop_polling()
         self._port_manager.disconnect_all()
-        connected = self._port_manager.connect_all()
+        connected = self._port_manager.connect_all(safe_idle_on_connect=False)
         self._port_manager.start_polling()
         self._port_manager.set_alicat_poll_profile(None)
+        self._port_manager.safe_idle_connected_ports()
         self._refresh_hardware_status()
         level = self._ui_bridge.show_info_message if connected else self._ui_bridge.show_error_message
         level('Admin', 'Hardware reconnect completed.' if connected else 'Hardware reconnect completed with failures.')

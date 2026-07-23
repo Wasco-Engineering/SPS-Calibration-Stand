@@ -123,7 +123,7 @@ software today.
 | Signal | Port A | Port B | Notes |
 |--------|--------|--------|-------|
 | **Transducer AI** | `AIN0/AIN1` (differential) | `AIN2/AIN3` (differential) | 0.5–4.5 V ratiometric (0–115 PSI), differential mode |
-| **Switch COM** | PTP `CommonTerminal` -> DB9 pin -> DIO | PTP `CommonTerminal` -> DB9 pin -> DIO | Output, driven LOW; provides reference for switch reads |
+| **Switch COM** | PTP `CommonTerminal` -> DB9 pin -> DIO | PTP `CommonTerminal` -> DB9 pin -> DIO | Output; STINGER_03 drives LOW (`switch_com_state: 0`). Closed contact reads low; open floats high (clear edge). COM HIGH can mask open contacts on this bench. |
 | **Switch sensed DI** | DB9 pin 3 (`DIO2`) | DB9 pin 3 (`DIO11`) | Input; PTP decides whether the sensed terminal is NO or NC for the active part/sequence |
 | **Derived contact** | Complement of sensed NO/NC when only one terminal is wired | Complement of sensed NO/NC when only one terminal is wired | Used only after PTP resolution identifies which terminal is physically sensed |
 | **Solenoid DO** | `DIO19` | `DIO18` | DO=1 vacuum, DO=0 atmosphere |

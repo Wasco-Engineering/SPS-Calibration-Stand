@@ -330,6 +330,69 @@ def _lookup_detail_sequence_online(shop_order: str, part_id: str) -> str:
         return ''
 
 
+def _normalize_sequence_token(sequence_id: str) -> str:
+    """Normalize sequence text to an integer string when possible (e.g. 0600 → 600)."""
+    cleaned = _clean_string(sequence_id)
+    if not cleaned:
+        return ''
+    try:
+        return str(int(cleaned))
+    except ValueError:
+        return cleaned
+
+
+def _ptp_sequence_available(part_id: str, sequence_id: str) -> bool:
+    """True when PTP parameters exist for part/sequence (SQL, cache, or dump)."""
+    part_id_clean = _clean_string(part_id)
+    sequence_norm = _normalize_sequence_token(sequence_id)
+    if not part_id_clean or not sequence_norm:
+        return False
+    cached = local_cache.load_ptp(part_id_clean, sequence_norm)
+    if cached:
+        return True
+    try:
+        if load_test_parameters(part_id_clean, sequence_norm):
+            return True
+    except Exception:
+        logger.debug(
+            'PTP availability check failed for %s/%s',
+            part_id_clean,
+            sequence_norm,
+            exc_info=True,
+        )
+    try:
+        from app.services.ptp_service import load_ptp_from_dump
+
+        return bool(load_ptp_from_dump(part_id_clean, sequence_norm))
+    except Exception:
+        return False
+
+
+def prefer_sps_entry_sequence(part_id: str, sequence_id: str) -> str:
+    """Prefer QAL15 (300) for SPS parts when login would default to a check sequence.
+
+    ``LastSequenceCalibrated`` / detail frequency often land on 600 (QAL16) after
+    prior checks. SPS Calibration Stand operators usually enter for calibration
+    (300) first; keep 600/650 only when PTP for 300 is unavailable.
+    """
+    part_id_clean = _clean_string(part_id)
+    suggested = _normalize_sequence_token(sequence_id)
+    if not part_id_clean.upper().startswith('SPS'):
+        return _clean_string(sequence_id) or suggested
+    if suggested == '300':
+        return suggested
+    if suggested not in ('', '600', '650'):
+        return suggested
+    if _ptp_sequence_available(part_id_clean, '300'):
+        logger.info(
+            'Preferring SPS entry sequence 300 over %s for %s',
+            suggested or '(empty)',
+            part_id_clean,
+        )
+        return '300'
+    return suggested
+
+
 def is_calibration_database_available() -> bool:
     """Return whether WASCO_Calibration (PTP / results) can be reached."""
     try:
@@ -494,6 +557,7 @@ def validate_shop_order(shop_order: str) -> Optional[Dict[str, Any]]:
             sequence_id = _clean_string(master.get('SequenceID'))
         if not sequence_id:
             sequence_id = _lookup_detail_sequence_online(shop_order_clean, part_id)
+        sequence_id = prefer_sps_entry_sequence(part_id, sequence_id)
         if sequence_id:
             details['SequenceID'] = sequence_id
             details['LastSequenceCalibrated'] = sequence_id
@@ -509,6 +573,13 @@ def validate_shop_order(shop_order: str) -> Optional[Dict[str, Any]]:
     if max_lookup_failed:
         master = lookup_work_order_master(shop_order_clean)
         if master:
+            preferred = prefer_sps_entry_sequence(
+                str(master.get('PartID') or ''),
+                str(master.get('SequenceID') or ''),
+            )
+            if preferred:
+                master['SequenceID'] = preferred
+                master['LastSequenceCalibrated'] = preferred
             logger.info(
                 'Work order validated from OrderCalibrationMaster fallback: %s -> %s/%s',
                 master.get('ShopOrder'),
@@ -519,6 +590,13 @@ def validate_shop_order(shop_order: str) -> Optional[Dict[str, Any]]:
 
         cached = local_cache.get_master(shop_order_clean)
         if cached:
+            preferred = prefer_sps_entry_sequence(
+                str(cached.get('PartID') or ''),
+                str(cached.get('SequenceID') or ''),
+            )
+            if preferred:
+                cached['SequenceID'] = preferred
+                cached['LastSequenceCalibrated'] = preferred
             logger.info(
                 'Work order validated from local cache: %s -> %s/%s',
                 cached.get('ShopOrder'),

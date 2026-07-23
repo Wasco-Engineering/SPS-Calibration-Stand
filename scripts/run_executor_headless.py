@@ -96,14 +96,36 @@ def run_headless_executor(
         events.append({'ts': time.time(), 'event': name, 'payload': payload})
         logger.info('EVENT %s %s', name, payload)
 
+    last_worker_alicat_s = {'value': 0.0}
+    transducer_installed = bool(
+        (config.get('hardware', {}).get('labjack', {}).get(port_id, {}) or {}).get(
+            'transducer_installed', True
+        )
+    )
+
     def get_latest(_pid: str) -> Optional[PortReading]:
+        # Alicat-only stands need a live serial refresh; cached read_fast alone
+        # freezes pressure during cycle prep / edge waits.
+        if not transducer_installed:
+            now = time.perf_counter()
+            if now - last_worker_alicat_s['value'] >= 0.05:
+                port.refresh_alicat()
+                last_worker_alicat_s['value'] = now
         return port.read_fast()
 
     last_baro: dict[str, Optional[float]] = {'value': None}
 
     def get_baro(_pid: str) -> float:
-        reading = port.read_precision_fast()
-        baro = resolve_barometric_psi(reading, last_value=last_baro['value'])
+        if not transducer_installed:
+            port.refresh_alicat()
+        reading = port.read_fast()
+        labjack_cfg = config.get('hardware', {}).get('labjack', {})
+        fallback = float(labjack_cfg.get('local_barometric_psi', 14.7))
+        baro = resolve_barometric_psi(
+            reading,
+            fallback=fallback,
+            last_value=last_baro['value'],
+        )
         last_baro['value'] = baro
         return baro
 
@@ -233,7 +255,11 @@ def main() -> int:
     parser.add_argument('--sequence', default='399')
     parser.add_argument('--port', choices=['port_a', 'port_b'], default='port_b')
     parser.add_argument('--both-ports', action='store_true', help='Run port_a then port_b sequentially.')
-    parser.add_argument('--port-b-part', default='17036', help='Part id for port_b when using --both-ports.')
+    parser.add_argument(
+        '--port-b-part',
+        default=None,
+        help='Part id for port_b when using --both-ports (defaults to --part).',
+    )
     parser.add_argument('--sample-interval-ms', type=int, default=20)
     parser.add_argument('--alicat-refresh-interval-ms', type=int, default=100)
     parser.add_argument('--max-duration-s', type=float, default=300.0)
@@ -274,9 +300,10 @@ def main() -> int:
 
     runs = [(args.port, args.part, args.sequence)]
     if args.both_ports:
+        port_b_part = args.port_b_part or args.part
         runs = [
             ('port_a', args.part, args.sequence),
-            ('port_b', args.port_b_part, args.sequence),
+            ('port_b', port_b_part, args.sequence),
         ]
 
     exit_code = 0

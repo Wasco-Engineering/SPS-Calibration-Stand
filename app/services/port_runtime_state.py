@@ -21,10 +21,10 @@ class PortRuntimeState:
     debug_solenoid_last_route: Dict[str, Optional[bool]] = field(default_factory=dict)
 
     @classmethod
-    def with_defaults(cls) -> 'PortRuntimeState':
+    def with_defaults(cls, *, barometric_psi: float = 14.7) -> 'PortRuntimeState':
         ports = ('port_a', 'port_b')
         return cls(
-            last_barometric_psi={pid: 14.7 for pid in ports},
+            last_barometric_psi={pid: float(barometric_psi) for pid in ports},
             barometric_warning_issued={pid: False for pid in ports},
             cycle_estimates_abs_psi={
                 pid: {'activation': None, 'deactivation': None, 'count': 0}

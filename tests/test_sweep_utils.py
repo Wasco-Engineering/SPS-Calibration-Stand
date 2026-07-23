@@ -8,6 +8,7 @@ from app.services.ptp_service import TestSetup, convert_pressure
 from app.services.sweep_utils import (
     band_midpoint,
     narrow_bounds,
+    ptp_limits_use_psia_scale,
     resolve_cycle_ramp_targets,
     resolve_sweep_bounds,
     resolve_sweep_mode,
@@ -133,6 +134,29 @@ def test_resolve_sweep_mode_pressure_for_mmhg_at_0c_gauge_above_atmosphere() -> 
     low, high = resolve_sweep_bounds(setup, fallback_port_cfg={})
     assert low == pytest.approx(convert_pressure(380.0, 'mmHg @ 0 C', 'PSI'))
     assert high == pytest.approx(convert_pressure(594.0, 'mmHg @ 0 C', 'PSI'))
+
+
+def test_resolve_sweep_mode_pressure_for_mmhg_gauge_75_goes_up_not_vacuum() -> None:
+    """SPS01438-02/300: Gauge mmHg @ 75 is true gauge — pressurize up, not vacuum down."""
+    setup = TestSetup(
+        part_id='SPS01438-02',
+        sequence_id='300',
+        units_code='19',
+        units_label='mmHg @ 0 C',
+        activation_direction='Decreasing',
+        activation_target=75.0,
+        pressure_reference='gauge',
+        terminals={},
+        bands={
+            'increasing': {'lower': float('-inf'), 'upper': 145.0},
+            'decreasing': {'lower': 73.0, 'upper': 77.0},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+
+    assert resolve_sweep_mode(setup, atmosphere_psi=13.48) == 'pressure'
+    assert ptp_limits_use_psia_scale(setup, {}, 13.48) is False
 
 
 def test_resolve_sweep_bounds_uses_setup_when_available() -> None:

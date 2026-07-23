@@ -17,30 +17,73 @@ def is_gauge_unit_label(unit_label: Optional[str]) -> bool:
     return label in _GAUGE_LABELS
 
 
-def infer_barometric_pressure(reading: Optional[PortReading]) -> Optional[float]:
-    """Infer barometric PSI from an Alicat reading if available."""
-    if reading is None or reading.alicat is None:
-        return None
-    return infer_barometric_pressure_from_alicat(reading.alicat)
-
-
 def _alicat_status_indicates_vented(reading: AlicatReading) -> bool:
-    """True when the Alicat status line looks like exhaust/hold at atmosphere."""
+    """True when the Alicat status line looks parked at local atmosphere.
+
+    EXH on Stinger stands is **not** local atmosphere (it vents toward vacuum),
+    so EXH must never be treated as a barometric source.
+    """
     raw = (reading.raw_response or '').upper()
-    if 'EXH' in raw or 'ATM' in raw:
+    if 'EXH' in raw:
+        return False
+    if 'ATM' in raw:
         return True
     if 'HLD' in raw and reading.pressure is not None:
-        if is_plausible_barometric_psi(float(reading.pressure)):
-            return True
+        # Only idle holds near atmosphere — pressurized HLD (e.g. ~16 PSIA
+        # during a gauge cycle) must not become the gauge zero.
+        pressure = float(reading.pressure)
+        if not (11.0 <= pressure <= 15.2):
+            return False
+        if reading.setpoint is not None:
+            setpoint = float(reading.setpoint)
+            return abs(pressure - setpoint) <= 0.75
+        return True
     if reading.setpoint is not None and abs(float(reading.setpoint)) <= 0.25:
         return 'HLD' in raw
     return False
 
 
-def infer_barometric_pressure_from_alicat(reading: Optional[AlicatReading]) -> Optional[float]:
-    """Infer barometric PSI directly from Alicat absolute/gauge fields."""
+def infer_barometric_pressure_from_alicat(
+    reading: Optional[AlicatReading],
+    *,
+    anchor_baro_psi: Optional[float] = None,
+) -> Optional[float]:
+    """Infer barometric PSI directly from Alicat absolute/gauge fields.
+
+    When ``anchor_baro_psi`` is provided (site config / last good), line-pressure
+    heuristics are only accepted within 0.75 PSI of that anchor. This prevents
+    pressurized HLD / mid-vent samples from becoming the gauge zero.
+
+    Explicit Alicat barometric index and ``P_abs − P_gauge`` are always trusted
+    when plausible (those are device-reported, not line-as-baro guesses).
+    """
     if reading is None:
         return None
+    direct = _direct_barometric_from_alicat_fields(reading)
+    if direct is not None:
+        return direct
+
+    raw = (reading.raw_response or '').upper()
+    if 'EXH' in raw:
+        return None
+
+    if (
+        reading.pressure is not None
+        and float(reading.pressure) >= 12.0
+        and is_plausible_barometric_psi(reading.pressure)
+        and _alicat_status_indicates_vented(reading)
+    ):
+        pressure = float(reading.pressure)
+        if is_plausible_barometric_psi(anchor_baro_psi):
+            if abs(pressure - float(anchor_baro_psi)) <= 0.75:
+                return pressure
+            return None
+        return pressure
+    return None
+
+
+def _direct_barometric_from_alicat_fields(reading: AlicatReading) -> Optional[float]:
+    """Return device-reported baro (index or P−gauge), ignoring line heuristics."""
     if reading.barometric_pressure is not None:
         baro = float(reading.barometric_pressure)
         if is_plausible_barometric_psi(baro):
@@ -49,28 +92,49 @@ def infer_barometric_pressure_from_alicat(reading: Optional[AlicatReading]) -> O
         inferred = float(reading.pressure - reading.gauge_pressure)
         if is_plausible_barometric_psi(inferred):
             return inferred
-    if (
-        reading.pressure is not None
-        and float(reading.pressure) >= 12.0
-        and is_plausible_barometric_psi(reading.pressure)
-        and _alicat_status_indicates_vented(reading)
-    ):
-        return float(reading.pressure)
-    # Short status packets (pressure + setpoint only) omit barometric index.
-    # When vented to atmosphere the absolute line pressure is local baro.
-    if (
-        reading.pressure is not None
-        and reading.setpoint is not None
-        and abs(float(reading.setpoint)) <= 0.25
-        and float(reading.pressure) >= 12.0
-        and is_plausible_barometric_psi(reading.pressure)
-        and _alicat_status_indicates_vented(reading)
-    ):
-        return float(reading.pressure)
     return None
 
 
+def infer_barometric_pressure(
+    reading: Optional[PortReading],
+    *,
+    anchor_baro_psi: Optional[float] = None,
+) -> Optional[float]:
+    """Infer barometric PSI from an Alicat reading if available."""
+    if reading is None or reading.alicat is None:
+        return None
+    return infer_barometric_pressure_from_alicat(
+        reading.alicat,
+        anchor_baro_psi=anchor_baro_psi,
+    )
+
+
 DEFAULT_BAROMETRIC_PSI = 14.7
+_BARO_MAX_JUMP_PSI = 0.75
+
+
+def configured_barometric_psi(config: Optional[dict] = None) -> float:
+    """Return site-local barometric PSI from config, else sea-level default."""
+    if not isinstance(config, dict):
+        return DEFAULT_BAROMETRIC_PSI
+    hardware = config.get('hardware') if isinstance(config.get('hardware'), dict) else {}
+    labjack = hardware.get('labjack') if isinstance(hardware.get('labjack'), dict) else {}
+    # Prefer shared / port_a local_barometric when present.
+    for section in (
+        labjack,
+        labjack.get('port_a') if isinstance(labjack.get('port_a'), dict) else {},
+        labjack.get('port_b') if isinstance(labjack.get('port_b'), dict) else {},
+    ):
+        raw = section.get('local_barometric_psi') if isinstance(section, dict) else None
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if is_plausible_barometric_psi(value):
+            return value
+    return DEFAULT_BAROMETRIC_PSI
 
 
 def is_plausible_barometric_psi(
@@ -89,10 +153,18 @@ def resolve_barometric_psi(
     *,
     fallback: float = DEFAULT_BAROMETRIC_PSI,
     last_value: Optional[float] = None,
-    max_jump_psi: float = 2.0,
+    max_jump_psi: float = _BARO_MAX_JUMP_PSI,
+    anchor_baro_psi: Optional[float] = None,
 ) -> float:
     """Return a usable barometric PSI for conversions and vacuum safety checks."""
-    inferred = infer_barometric_pressure(reading)
+    # Device-reported baro (index / P−gauge) updates the zero without jump clamp.
+    if reading is not None and reading.alicat is not None:
+        direct = _direct_barometric_from_alicat_fields(reading.alicat)
+        if is_plausible_barometric_psi(direct):
+            return float(direct)
+
+    anchor = anchor_baro_psi if is_plausible_barometric_psi(anchor_baro_psi) else last_value
+    inferred = infer_barometric_pressure(reading, anchor_baro_psi=anchor)
     if is_plausible_barometric_psi(inferred):
         if (
             is_plausible_barometric_psi(last_value)
@@ -102,6 +174,8 @@ def resolve_barometric_psi(
         return float(inferred)
     if is_plausible_barometric_psi(last_value):
         return float(last_value)
+    if is_plausible_barometric_psi(anchor_baro_psi):
+        return float(anchor_baro_psi)
     return float(fallback)
 
 

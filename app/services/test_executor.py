@@ -20,6 +20,8 @@ from app.services.measurement_source import (
     select_ui_pressure_abs_psi,
 )
 from app.services.pressure_domain import (
+    configured_barometric_psi,
+    is_plausible_barometric_psi,
     resolve_alicat_setpoint_reference_for_test,
     to_absolute_pressure,
     to_alicat_setpoint_psi,
@@ -825,7 +827,9 @@ class TestExecutor:
         self._test_setup = test_setup
         self._config = config
         self._get_latest_reading = get_latest_reading
-        self._get_barometric_psi = get_barometric_psi
+        self._get_barometric_psi_live = get_barometric_psi
+        # Must exist before _near_atmosphere_precision_delta_psi() during init.
+        self._locked_baro_psi: Optional[float] = None
 
         # Callbacks
         self._on_cycling_complete = on_cycling_complete
@@ -920,6 +924,12 @@ class TestExecutor:
         self._last_precision_missing_edge: Optional[str] = None
         self._cycle_phase_runner = CyclePhaseRunner(self)
         self._precision_phase_runner = PrecisionPhaseRunner(self)
+
+    def _get_barometric_psi(self, port_id: str) -> float:
+        """Barometric PSI for this run — locked after start so gauge zero cannot drift."""
+        if self._locked_baro_psi is not None:
+            return float(self._locked_baro_psi)
+        return float(self._get_barometric_psi_live(port_id))
 
     # ------------------------------------------------------------------
     # Public API
@@ -1027,6 +1037,7 @@ class TestExecutor:
         """Main test execution sequence (runs in background thread)."""
         try:
             self._emit_event('run_started')
+            self._lock_run_barometric_psi()
             self._ensure_alicat_units()
             self._lock_alicat_setpoint_reference()
             self._run_atmosphere_psi = None
@@ -1044,7 +1055,7 @@ class TestExecutor:
             baro_psi = self._get_barometric_psi(self._port_id)
             logger.info(
                 '%s: Sweep config mode=%s ref=%s bounds=%.4f..%.4f psi '
-                'test_atm=%.4f baro=%.4f psi vacuum_no_open=%s',
+                'test_atm=%.4f baro=%.4f psi (locked) vacuum_no_open=%s',
                 self._port_id,
                 sweep_mode,
                 pressure_ref,
@@ -1131,6 +1142,29 @@ class TestExecutor:
             )
         finally:
             self._run_atmosphere_psi = None
+            self._locked_baro_psi = None
+
+    def _lock_run_barometric_psi(self) -> None:
+        """Freeze gauge-zero for the whole test run.
+
+        Use the stand site barometric (one value for both ports). Live Alicat
+        line inference wanders during a run and also disagrees port-to-port when
+        residual pressure remains — either makes gauge mmHg look systematically
+        high or low vs other stands. Freeze site config for the whole run.
+        """
+        site = configured_barometric_psi(self._config)
+        if is_plausible_barometric_psi(site):
+            self._locked_baro_psi = float(site)
+            source = 'site-config'
+        else:
+            self._locked_baro_psi = float(self._get_barometric_psi_live(self._port_id))
+            source = 'live-fallback'
+        logger.info(
+            '%s: Locked run barometric pressure to %.4f PSIA (%s)',
+            self._port_id,
+            self._locked_baro_psi,
+            source,
+        )
 
     # ------------------------------------------------------------------
     # Cycling
@@ -1212,15 +1246,23 @@ class TestExecutor:
         for edge in get_history()[port_edges_before:]:
             if not self._cycle_edge_switch_state_allowed(edge_type, bool(edge.activated)):
                 continue
-            pressure_test: Optional[float] = None
-            reading = self._get_latest_reading(self._port_id)
-            if reading is not None:
-                pressure_test = self._reading_pressure_test_psi(reading)
+            # Use the pressure stamped on the edge itself. Latest live pressure can
+            # already be deep into the band by the time we notice a high-P bounce,
+            # which would incorrectly pass the PTP window check.
+            pressure_test = self._absolute_to_test_reference(float(edge.pressure))
             if pressure_test is None or not math.isfinite(pressure_test):
-                pressure_test = self._absolute_to_test_reference(edge.pressure)
-            if not math.isfinite(pressure_test):
+                reading = self._get_latest_reading(self._port_id)
+                if reading is not None:
+                    pressure_test = self._reading_pressure_test_psi(reading)
+            if pressure_test is None or not math.isfinite(pressure_test):
                 continue
             if not self._cycle_edge_pressure_allowed(edge_type, pressure_test):
+                logger.debug(
+                    '%s: ignoring port %s edge at %.4f PSI (outside traverse window)',
+                    self._port_id,
+                    edge_type,
+                    pressure_test,
+                )
                 continue
             self._cycle_observed_edge_states[edge_type] = bool(edge.activated)
             samples_list.append(pressure_test)
@@ -1737,6 +1779,35 @@ class TestExecutor:
                 or (direction < 0 and pressure >= max_psi)
             )
             prep_state = not self._cycle_target_switch_state(edge_type)
+            # Decreasing vacuum already on the high-pressure/reset side must not
+            # nudge *down* toward the band just because the DI looks activated
+            # (open fittings / floating sense). Rely on the activation ramp edge.
+            if (
+                starts_before_edge
+                and direction < 0
+                and self._resolve_sweep_mode() == 'vacuum'
+            ):
+                reading = self._get_latest_reading(self._port_id)
+                if reading is not None and reading.switch is not None:
+                    self._cycle_debounce_state = self._spdt_debounce_from_switch(reading.switch)
+                else:
+                    self._cycle_debounce_state = SpdtDebounceState()
+                if switch_state != prep_state:
+                    logger.warning(
+                        '%s: Switch looks %s at %.4f PSI on vacuum reset side; '
+                        'skipping prep (will wait for activation edge while ramping)',
+                        self._port_id,
+                        'activated' if switch_state else 'deactivated',
+                        pressure,
+                    )
+                else:
+                    logger.info(
+                        '%s: Cycle prep skipped for %s leg; pressure %.4f PSI is already before edge band',
+                        self._port_id,
+                        edge_type,
+                        pressure,
+                    )
+                return
             if starts_before_edge and switch_state == prep_state:
                 reading = self._get_latest_reading(self._port_id)
                 if reading is not None and reading.switch is not None:
@@ -1854,6 +1925,10 @@ class TestExecutor:
         else:
             if direction > 0:
                 nudge_target = max(hw_min_psi, min_psi - nudge_psi)
+            elif self._resolve_sweep_mode() == 'vacuum':
+                # Decreasing vacuum resets toward atmosphere, not just above band.
+                atm = self._determine_atmosphere_psi()
+                nudge_target = max(min(hw_max_psi, max_psi + nudge_psi), atm)
             else:
                 nudge_target = min(hw_max_psi, max_psi + nudge_psi)
             substate = 'cycling.prep_deactivated'
@@ -2642,26 +2717,29 @@ class TestExecutor:
 
     def _vacuum_switch_trips_on_no_open(self) -> bool:
         port_cfg = self._config.get('hardware', {}).get('labjack', {}).get(self._port_id, {})
-        # PTP resolution can change which physical contact the single sensed
-        # DB9 pin represents from part to part. Prefer the live resolved mode;
-        # the port-level knob is only a fallback/default when no PTP-derived
-        # single-sense mode has been applied yet.
         daq = getattr(self._port, 'daq', None)
-        if daq is not None:
-            derived_from_no = bool(getattr(daq, 'switch_nc_derived_from_no', False))
-            if derived_from_no:
-                return True
-            derived_from_nc = bool(getattr(daq, 'switch_no_derived_from_nc', False))
-            if derived_from_nc:
-                return False
 
-        if 'vacuum_switch_trips_on_no_open' in port_cfg:
-            return _config_bool(port_cfg.get('vacuum_switch_trips_on_no_open'))
+        # PTP single-wire mode encodes historical COM-LOW trip polarity:
+        #   derive_nc_from_no -> trip opens NO -> activated False (vacuum_no_open True)
+        #   derive_no_from_nc -> trip opens NC -> activated True  (vacuum_no_open False)
+        # Stand config is only a fallback when PTP did not select a derive mode.
+        if daq is not None and bool(getattr(daq, 'switch_nc_derived_from_no', False)):
+            base = True
+        elif daq is not None and bool(getattr(daq, 'switch_no_derived_from_nc', False)):
+            base = False
+        elif 'vacuum_switch_trips_on_no_open' in port_cfg:
+            base = _config_bool(port_cfg.get('vacuum_switch_trips_on_no_open'))
+        else:
+            # Single-wire fallback: derive NC from NO / trip opens NO.
+            base = _config_bool(port_cfg.get('switch_nc_derived_from_no'))
 
-        # Single-wire switch sensing derives NC from NO. On the current vacuum
-        # bench wiring, the trip opens NO; default that way when the more
-        # explicit knob is missing so activation/deactivation are not inverted.
-        return _config_bool(port_cfg.get('switch_nc_derived_from_no'))
+        # COM driven HIGH + active_low inverts open-contact -> activated mapping
+        # relative to those COM-LOW defaults (STINGER_03 bench wiring).
+        com_high = daq is not None and int(getattr(daq, 'switch_com_state', 0) or 0) == 1
+        active_low = daq is not None and bool(getattr(daq, 'switch_active_low', False))
+        if com_high and active_low:
+            return not base
+        return base
 
     def _cycle_target_switch_state(self, edge_type: str) -> bool:
         """``switch_activated`` value that means this cycle edge (vacuum bench may invert)."""
@@ -3019,12 +3097,17 @@ class TestExecutor:
             logger.error('%s: Failed to vent: %s', self._port_id, exc)
 
     def _ensure_alicat_units(self) -> None:
-        """Best-effort sync of Alicat display units with current test setup."""
+        """Best-effort sync of Alicat display units with current test setup.
+
+        Keep the Alicat in PSI for mmHg/Torr PTP codes. Driving the controller
+        in mmHg and converting every sample introduces avoidable round-trip
+        error; the UI still displays PTP units.
+        """
         units_code = self._test_setup.units_code if self._test_setup else None
         if not units_code:
             return
         try:
-            ok = self._port.alicat.configure_units_from_ptp(units_code)
+            ok = self._port.alicat.configure_units_from_ptp_prefer_psi(units_code)
             if not ok:
                 logger.warning(
                     '%s: Alicat units verify failed (requested code=%s); continuing with current controller units',

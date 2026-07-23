@@ -590,7 +590,9 @@ def test_port_manager_disconnect_all_clears_ports(monkeypatch: Any) -> None:
         assert port.disconnect_calls == 1
 
 
-def test_vent_to_atmosphere_locks_atmosphere_hold_without_exhaust(monkeypatch: Any) -> None:
+def test_vent_to_atmosphere_locks_hold_when_already_near_baro_in_exh(
+    monkeypatch: Any,
+) -> None:
     port = _make_port(monkeypatch)
     alicat = port.alicat
     assert isinstance(alicat, _FakeAlicatController)
@@ -603,6 +605,7 @@ def test_vent_to_atmosphere_locks_atmosphere_hold_without_exhaust(monkeypatch: A
         raw_response='A +014.68 +000.50 EXH',
     )
     assert port.vent_to_atmosphere() is True
+    # Already in-band under EXH: lock closed without re-commanding EXH.
     assert alicat.exhaust_calls == 0
     assert alicat.hold_calls == 1
     assert alicat.hold_closed is True
@@ -682,7 +685,7 @@ def test_disconnect_restores_atmosphere_hold(monkeypatch: Any) -> None:
     port.disconnect(restore_safe_state=True)
     alicat = port.alicat
     assert isinstance(alicat, _FakeAlicatController)
-    assert alicat.exhaust_calls == 0
+    # Near-baro EXH path locks closed; no need to re-command EXH.
     assert alicat.hold_calls >= 1
     assert alicat.hold_closed is True
     assert alicat.disconnect_calls == 1
@@ -702,8 +705,8 @@ def test_port_manager_disconnect_all_vents_before_shared_disconnect(monkeypatch:
         assert port.disconnect_calls == 1
 
 
-def test_vent_to_atmosphere_open_fitting_bleeds_without_exhaust(monkeypatch: Any) -> None:
-    """Open fittings must pressurize up on the atmosphere route; EXH pulls vacuum."""
+def test_vent_to_atmosphere_open_fitting_bleeds_from_vacuum(monkeypatch: Any) -> None:
+    """Open fittings recover from vacuum via closed-loop pressure (not EXH)."""
     port = _make_port(
         monkeypatch,
         labjack_overrides={
@@ -743,7 +746,47 @@ def test_vent_to_atmosphere_open_fitting_bleeds_without_exhaust(monkeypatch: Any
     assert abs(alicat.set_pressure_calls[-1] - 13.48) < 0.05
 
 
-def test_vent_to_atmosphere_bleeds_low_pressure_before_exhaust(monkeypatch: Any) -> None:
+def test_vent_to_atmosphere_uses_exhaust_for_overpressure(monkeypatch: Any) -> None:
+    """Over-pressure (gauge pressurize) must EXH down, not lock and skip."""
+    port = _make_port(
+        monkeypatch,
+        labjack_overrides={
+            'open_fitting': True,
+            'transducer_installed': False,
+            'local_barometric_psi': 13.48,
+        },
+    )
+    alicat = port.alicat
+    assert isinstance(alicat, _FakeAlicatController)
+    high = AlicatReading(
+        pressure=21.0,
+        setpoint=19.0,
+        timestamp=1.0,
+        raw_response='A +021.00 +019.00 HLD',
+    )
+    near = AlicatReading(
+        pressure=13.50,
+        setpoint=13.48,
+        timestamp=3.0,
+        raw_response='A +013.50 +013.48 EXH',
+    )
+    state = {'exhausted': False}
+
+    def _next_reading() -> AlicatReading:
+        if alicat.exhaust_calls > 0:
+            state['exhausted'] = True
+        return near if state['exhausted'] else high
+
+    alicat.read_status = _next_reading  # type: ignore[method-assign]
+    port.read_all = lambda: PortReading(alicat=_next_reading(), timestamp=1.0)  # type: ignore[method-assign]
+
+    assert port.vent_to_atmosphere(bleed_installed_dut=True, timeout_s=5.0) is True
+    assert alicat.exhaust_calls >= 1
+    assert alicat.hold_calls >= 1
+    assert alicat.hold_closed is True
+
+
+def test_vent_to_atmosphere_bleeds_from_vacuum(monkeypatch: Any) -> None:
     port = _make_port(monkeypatch)
     alicat = port.alicat
     assert isinstance(alicat, _FakeAlicatController)
@@ -752,14 +795,14 @@ def test_vent_to_atmosphere_bleeds_low_pressure_before_exhaust(monkeypatch: Any)
         setpoint=0.5,
         timestamp=1.0,
         barometric_pressure=14.7,
-        raw_response='A +000.05 +000.50 EXH',
+        raw_response='A +000.05 +000.50 HLD',
     )
     high = AlicatReading(
         pressure=14.6,
         setpoint=14.7,
         timestamp=3.0,
         barometric_pressure=14.7,
-        raw_response='A +014.60 +014.70',
+        raw_response='A +014.60 +014.70 HLD',
     )
     readings = [low] * 12 + [high]
     state = {'index': 0}
@@ -778,4 +821,5 @@ def test_vent_to_atmosphere_bleeds_low_pressure_before_exhaust(monkeypatch: Any)
     assert daq.solenoid_calls
     assert daq.solenoid_calls[-1] is False
     assert alicat.exhaust_calls == 0
-    assert alicat.hold_calls >= 1
+    assert alicat.set_pressure_calls
+    assert abs(alicat.set_pressure_calls[0] - 14.7) < 0.05

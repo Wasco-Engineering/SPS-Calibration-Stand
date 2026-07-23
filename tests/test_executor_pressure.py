@@ -678,24 +678,34 @@ def test_decreasing_vacuum_activation_prep_skips_when_already_reset_side() -> No
     assert port.solenoid_calls == []
 
 
-def test_nc_derived_runtime_mode_overrides_stale_vacuum_no_open_config() -> None:
+def test_com_high_active_low_inverts_ptp_derived_vacuum_no_open() -> None:
+    """COM HIGH + active_low flips COM-LOW PTP defaults (STINGER_03 wiring)."""
     port = _FakePort([True])
+    # Seq 600 style: sense NC on pin 3
     port.daq = SimpleNamespace(
         switch_nc_derived_from_no=False,
         switch_no_derived_from_nc=True,
+        switch_com_state=1,
+        switch_active_low=True,
     )
     executor = _build_executor(port)
     executor._config = {
-        'hardware': {
-            'labjack': {
-                'port_a': {
-                    'vacuum_switch_trips_on_no_open': True,
-                },
-            },
-        },
+        'hardware': {'labjack': {'port_a': {}}},
         'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}},
     }
 
+    # COM-LOW default for derive_no_from_nc is False; COM-HIGH inverts to True.
+    assert executor._vacuum_switch_trips_on_no_open() is True
+    assert executor._cycle_target_switch_state('activation') is False
+    assert executor._cycle_target_switch_state('deactivation') is True
+
+    # Seq 300 / 17021 style: sense NO on pin 3
+    port.daq = SimpleNamespace(
+        switch_nc_derived_from_no=True,
+        switch_no_derived_from_nc=False,
+        switch_com_state=1,
+        switch_active_low=True,
+    )
     assert executor._vacuum_switch_trips_on_no_open() is False
     assert executor._cycle_target_switch_state('activation') is True
     assert executor._cycle_target_switch_state('deactivation') is False
@@ -738,10 +748,10 @@ def test_sps01496_seq600_uses_nc_derived_runtime_vacuum_target_on_both_ports() -
     config = {
         'hardware': {
             'labjack': {
-                # The old port-level default is stale for this PTP setup; the
-                # runtime PTP switch resolution must decide the target state.
-                'port_a': {'vacuum_switch_trips_on_no_open': True},
-                'port_b': {'vacuum_switch_trips_on_no_open': True},
+                # Omit vacuum_switch_trips_on_no_open so PTP-derived NC sense
+                # selects the runtime target (activation = True on open).
+                'port_a': {},
+                'port_b': {},
             },
         },
         'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}},

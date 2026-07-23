@@ -215,24 +215,25 @@ def test_barometric_plausibility_guard() -> None:
     assert not is_plausible_barometric_psi(0.2635)
 
 
-def test_infer_barometric_from_short_exh_status_packet() -> None:
+def test_infer_barometric_ignores_exh_status_packet() -> None:
+    """EXH is not local atmosphere on Stinger — do not use line P as baro."""
     reading = AlicatReading(
         pressure=13.51,
         setpoint=0.0,
         timestamp=0.0,
         raw_response='B +013.51 +000.00 EXH',
     )
-    assert infer_barometric_pressure_from_alicat(reading) == pytest.approx(13.51, rel=1e-6)
+    assert infer_barometric_pressure_from_alicat(reading) is None
 
 
-def test_infer_barometric_from_exh_status_with_stale_setpoint() -> None:
+def test_infer_barometric_ignores_exh_with_stale_setpoint() -> None:
     reading = AlicatReading(
         pressure=13.51,
         setpoint=8.0,
         timestamp=0.0,
         raw_response='B +013.51 +008.00 EXH',
     )
-    assert infer_barometric_pressure_from_alicat(reading) == pytest.approx(13.51, rel=1e-6)
+    assert infer_barometric_pressure_from_alicat(reading) is None
 
 
 def test_infer_barometric_ignores_transient_low_exh_pressure() -> None:
@@ -242,6 +243,29 @@ def test_infer_barometric_ignores_transient_low_exh_pressure() -> None:
         timestamp=0.0,
         raw_response='B +011.73 +013.00 EXH',
     )
+    assert infer_barometric_pressure_from_alicat(reading) is None
+
+
+def test_infer_barometric_from_idle_hold_near_anchor() -> None:
+    reading = AlicatReading(
+        pressure=13.50,
+        setpoint=13.48,
+        timestamp=0.0,
+        raw_response='A +013.50 +013.48 HLD',
+    )
+    assert infer_barometric_pressure_from_alicat(
+        reading, anchor_baro_psi=13.48
+    ) == pytest.approx(13.50, rel=1e-6)
+
+
+def test_infer_barometric_ignores_pressurized_hold() -> None:
+    reading = AlicatReading(
+        pressure=16.20,
+        setpoint=16.20,
+        timestamp=0.0,
+        raw_response='A +016.20 +016.20 HLD',
+    )
+    assert infer_barometric_pressure_from_alicat(reading, anchor_baro_psi=13.48) is None
     assert infer_barometric_pressure_from_alicat(reading) is None
 
 

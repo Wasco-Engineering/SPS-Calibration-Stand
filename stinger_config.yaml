@@ -4,7 +4,7 @@ app:
 hardware:
   labjack:
     # Idaho bench: open fittings sit near ~13.5 PSIA, not 14.7 sea level.
-    local_barometric_psi: 13.48
+    local_barometric_psi: 13.53
     device_type: T7
     connection_type: USB
     identifier: ANY
@@ -25,9 +25,10 @@ hardware:
       open_fitting: true
       switch_sensed_db9_pins:
       - 3
-      # Bench: DB9 pin 3 opens on SPS01496-02/600 vacuum trip (DIO high);
-      # with NO derived from NC, that is switch_activated=True.
-      vacuum_switch_trips_on_no_open: false
+      # Bench (STINGER_03): COM driven LOW. With active-low sense + LabJack
+      # pull-up behavior, closed contact reads 0 and open floats to 1 — clear
+      # trip edges. COM HIGH masks the open state (sense stays 1).
+      # Trip polarity follows PTP derive mode (no COM-high invert).
       switch_com_state: 0
       switch_active_low: true
       solenoid_dio: 19
@@ -50,9 +51,7 @@ hardware:
       transducer_reference: absolute
       switch_sensed_db9_pins:
       - 3
-      # Bench: DB9 pin 3 opens on SPS01496-02/600 vacuum trip (DIO high);
-      # with NO derived from NC, that is switch_activated=True.
-      vacuum_switch_trips_on_no_open: false
+      # Bench (STINGER_03): COM driven LOW — see port_a notes.
       switch_com_state: 0
       switch_active_low: true
       solenoid_dio: 18
