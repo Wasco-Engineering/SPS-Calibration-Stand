@@ -3,8 +3,11 @@ app:
   version: 1.0.0
 hardware:
   labjack:
-    # Idaho bench: open fittings sit near ~13.5 PSIA, not 14.7 sea level.
-    local_barometric_psi: 13.53
+    # Peer-stand correlated gauge zero for Idaho SPS01438 gauge work.
+    # Open-fitting Alicat often sits ~13.53 PSIA; using that made this stand
+    # read ~2 mmHg low vs the Functional Stand (72.7 vs 74.7 on the same switch).
+    # 13.49 restores parity: abs_trip≈14.94 → gauge≈74.7 mmHg.
+    local_barometric_psi: 13.49
     device_type: T7
     connection_type: USB
     identifier: ANY
