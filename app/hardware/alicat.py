@@ -11,6 +11,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any, Dict, List, Optional
 
 from app.services.pressure_calibration import apply_error_model
@@ -29,6 +30,16 @@ except ImportError:
 # ``serial.tools.list_ports.comports()`` can stall for many seconds on Windows when USB
 # devices are queried; cache briefly so repeated connects (e.g. diagnostics) stay responsive.
 _list_ports_cache: Optional[tuple[float, frozenset[str]]] = None
+
+
+def _serialized_operation(method: Any) -> Any:
+    """Keep status parsing and multi-command configuration internally consistent."""
+    @wraps(method)
+    def wrapped(self: 'AlicatController', *args: Any, **kwargs: Any) -> Any:
+        with self._operation_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 
 def _cached_serial_device_names(ttl_s: float = 15.0) -> frozenset[str]:
@@ -103,6 +114,7 @@ class AlicatController:
         self._serial = None
         self._owns_serial = False  # True if we created the connection
         self._lock = threading.Lock()
+        self._operation_lock = threading.RLock()
 
         self._is_connected = False
         self._last_status = "Not Initialized"
@@ -450,6 +462,7 @@ class AlicatController:
         )
         return False
 
+    @_serialized_operation
     def configure_units_from_ptp(self, units_code: str) -> bool:
         """Configure Alicat units based on PTP UnitsOfMeasure numeric code."""
         normalized_code = str(units_code).strip()
@@ -619,6 +632,7 @@ class AlicatController:
         else:
             self._error_model = None
 
+    @_serialized_operation
     def read_status(self) -> Optional[AlicatReading]:
         """
         Read current pressure and setpoint from the Alicat.
@@ -714,6 +728,7 @@ class AlicatController:
         
         return None
     
+    @_serialized_operation
     def set_pressure(self, setpoint_psi: float) -> bool:
         """
         Set the pressure setpoint.
@@ -785,7 +800,15 @@ class AlicatController:
             )
 
         return success
+
+    @_serialized_operation
+    def resume_and_set_pressure(self, setpoint_psi: float) -> bool:
+        """Enter control mode and send a new setpoint as one serialized operation."""
+        if not self.cancel_hold():
+            return False
+        return self.set_pressure(setpoint_psi)
     
+    @_serialized_operation
     def set_ramp_rate(self, rate_psi: float, time_unit: str = 's') -> bool:
         """
         Set the pressure ramp rate.
@@ -848,6 +871,7 @@ class AlicatController:
         )
         return False
     
+    @_serialized_operation
     def cancel_hold(self) -> bool:
         """
         Cancel hold mode and resume closed-loop control.
@@ -858,6 +882,7 @@ class AlicatController:
         response = self._send_command("C")
         return self._is_ack(response)
     
+    @_serialized_operation
     def hold_valve(self, closed: bool = False) -> bool:
         """
         Engage valve hold mode.
@@ -872,6 +897,7 @@ class AlicatController:
         response = self._send_command(command)
         return self._is_ack(response)
     
+    @_serialized_operation
     def exhaust(self) -> bool:
         """
         Activate exhaust mode (vent to atmosphere).
@@ -882,6 +908,7 @@ class AlicatController:
         response = self._send_command("E")
         return self._is_ack(response)
     
+    @_serialized_operation
     def tare(self) -> bool:
         """
         Tare (zero) the pressure reading.

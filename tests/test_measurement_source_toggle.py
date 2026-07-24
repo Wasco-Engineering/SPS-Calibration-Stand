@@ -378,10 +378,23 @@ def test_ui_pressure_honors_explicit_alicat_source() -> None:
     assert ui_src == MEASUREMENT_SOURCE_ALICAT
 
 
-def test_executor_control_pressure_prefers_transducer() -> None:
+def test_executor_control_pressure_uses_main_auto_policy() -> None:
     executor = _build_executor('auto')
     reading = build_port_reading(transducer_pressure=10.0, alicat_pressure=26.0)
     assert executor._reading_pressure_abs_psi(reading) == 10.0
 
     high_reading = build_port_reading(transducer_pressure=31.0, alicat_pressure=31.5)
-    assert executor._reading_pressure_abs_psi(high_reading) == pytest.approx(31.0)
+    assert executor._reading_pressure_abs_psi(high_reading) == pytest.approx(31.5)
+    assert executor.last_pressure_source_used == MEASUREMENT_SOURCE_ALICAT
+
+
+def test_executor_uses_alicat_above_stinger_five_psi_cutover() -> None:
+    executor = _build_executor('auto')
+    measurement = executor._config['hardware']['measurement']
+    measurement['transducer_only_below_psi'] = 5.0
+    measurement['alicat_only_above_psi'] = 5.0
+
+    reading = build_port_reading(transducer_pressure=7.70, alicat_pressure=7.82)
+
+    assert executor._reading_pressure_abs_psi(reading) == pytest.approx(7.82)
+    assert executor.last_pressure_source_used == MEASUREMENT_SOURCE_ALICAT

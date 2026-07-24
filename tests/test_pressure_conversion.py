@@ -10,6 +10,7 @@ from app.services.pressure_domain import (
     infer_setpoint_reference,
     is_plausible_barometric_psi,
     resolve_alicat_setpoint_reference_for_test,
+    resolve_barometric_psi,
     to_alicat_setpoint_psi,
 )
 from app.services.ptp_service import build_pressure_visualization, convert_pressure, derive_test_setup
@@ -266,6 +267,18 @@ def test_infer_barometric_from_exh_status_with_stale_setpoint() -> None:
         raw_response='B +013.51 +008.00 EXH',
     )
     assert infer_barometric_pressure_from_alicat(reading) == pytest.approx(13.51, rel=1e-6)
+
+
+def test_resolve_barometric_holds_last_value_during_short_exh_status() -> None:
+    reading = build_port_reading(
+        alicat_pressure=13.83,
+        alicat_setpoint=9.4,
+    )
+    assert reading.alicat is not None
+    reading.alicat.barometric_pressure = None
+    reading.alicat.raw_response = 'A +0715.2 +0486.2 EXH'
+
+    assert resolve_barometric_psi(reading, last_value=14.61) == pytest.approx(14.61)
 
 
 def test_infer_barometric_ignores_transient_low_exh_pressure() -> None:

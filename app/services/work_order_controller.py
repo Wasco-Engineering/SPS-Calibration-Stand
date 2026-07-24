@@ -70,6 +70,16 @@ LOW_PRESSURE_TRANSDUCER_LOCKOUT_MESSAGE = (
 )
 
 
+def _detail_equipment_id(base_equipment_id: str, port_id: str) -> str:
+    """Return the database EquipmentID that identifies the physical test side."""
+    suffixes = {
+        PortId.PORT_A.value: 'L',
+        PortId.PORT_B.value: 'R',
+    }
+    suffix = suffixes.get(str(port_id))
+    return f'{base_equipment_id}-{suffix}' if suffix else base_equipment_id
+
+
 def _config_bool(value: Any, default: bool = False) -> bool:
     """Coerce YAML/env-style booleans without making 'false' truthy."""
     if value is None:
@@ -2649,7 +2659,8 @@ class WorkOrderController(QObject):
         sequence_id = wo.get('sequence_id', '')
         operator_id = wo.get('operator_id', '')
         test_params = self._config.get('test_parameters', {})
-        equipment_id = test_params.get('equipment_id', 'STINGER_01')
+        master_equipment_id = test_params.get('equipment_id', 'STINGER_01')
+        equipment_id = _detail_equipment_id(master_equipment_id, port_id)
         try:
             temperature_c = float(test_params.get('default_temperature_c', 25.0))
         except (TypeError, ValueError):
@@ -2715,6 +2726,7 @@ class WorkOrderController(QObject):
                 units_of_measure=units_str or 'PSI',
                 operator_id=operator_id,
                 equipment_id=equipment_id,
+                master_equipment_id=master_equipment_id,
                 activation_id=activation_id,
                 max_pressure_achieved=observed_max_pressure,
                 gage_reference_diff=gage_reference_diff,

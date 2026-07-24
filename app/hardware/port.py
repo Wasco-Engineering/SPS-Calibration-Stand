@@ -79,6 +79,7 @@ class Port:
 
         # Cached Alicat reading for fast polling (updated every Nth cycle)
         self._cached_alicat: Optional[AlicatReading] = None
+        self._cached_alicat_lock = threading.Lock()
         
         # Current test context
         self._no_pin: Optional[int] = None
@@ -180,9 +181,19 @@ class Port:
         """Read all sensors for this port."""
         return self._read(use_cached_alicat=False)
     
-    def refresh_alicat(self) -> None:
+    def refresh_alicat(self) -> bool:
         """Update the cached Alicat reading (slow serial I/O)."""
-        self._cached_alicat = self.alicat.read_status()
+        reading = self.alicat.read_status()
+        if reading is None:
+            return False
+        with self._cached_alicat_lock:
+            self._cached_alicat = reading
+        return True
+
+    def get_cached_alicat(self) -> Optional[AlicatReading]:
+        """Return the most recent complete Alicat status reading."""
+        with self._cached_alicat_lock:
+            return self._cached_alicat
 
     def read_fast(self) -> PortReading:
         """Read LabJack-only sensors (fast path) using cached Alicat.
@@ -205,7 +216,7 @@ class Port:
         import time
 
         timestamp = time.time()
-        alicat_reading = self._cached_alicat if use_cached_alicat else self.alicat.read_status()
+        alicat_reading = self.get_cached_alicat() if use_cached_alicat else self.alicat.read_status()
 
         reading = PortReading(
             transducer=self.daq.read_transducer() if self._transducer_installed else None,
@@ -269,17 +280,27 @@ class Port:
     def _physical_abs_pressure_psi_for_solenoid_guard(self) -> tuple[Optional[float], float]:
         """Best-effort absolute pressure and barometric basis for vacuum-route safety."""
         if self._transducer_installed:
-            transducer = self.daq.read_transducer()
-            reading = PortReading(transducer=transducer, alicat=self._cached_alicat)
-            self._normalize_transducer_reference(reading)
-            pressure = self._physical_abs_pressure_psi(reading)
-            if pressure is not None:
+            # Differential AIN reads can occasionally contain a single mux-settling
+            # outlier after switching between the two transducer pairs.  A lone high
+            # sample must not strand a safely vented port, while a genuinely
+            # pressurized line will remain high across this short sample group.
+            samples: list[float] = []
+            for _ in range(5):
+                transducer = self.daq.read_transducer()
+                reading = PortReading(transducer=transducer, alicat=self.get_cached_alicat())
+                self._normalize_transducer_reference(reading)
+                pressure = self._physical_abs_pressure_psi(reading)
+                if pressure is not None:
+                    samples.append(float(pressure))
+            if samples:
+                samples.sort()
+                pressure = samples[len(samples) // 2]
                 barometric = _ATMOSPHERE_PSI
                 if reading.alicat and reading.alicat.barometric_pressure is not None:
                     barometric = float(reading.alicat.barometric_pressure)
                 return pressure, barometric
 
-        alicat_reading = self.alicat.read_status() or self._cached_alicat
+        alicat_reading = self.alicat.read_status() or self.get_cached_alicat()
         barometric = _ATMOSPHERE_PSI
         if alicat_reading and alicat_reading.barometric_pressure is not None:
             barometric = float(alicat_reading.barometric_pressure)
@@ -327,7 +348,13 @@ class Port:
         return self._edge_history.copy()
     
     def set_pressure(self, setpoint: float) -> bool:
-        """Set the Alicat pressure setpoint."""
+        """Exit EXH/hold and set the Alicat pressure setpoint."""
+        combined = getattr(self.alicat, 'resume_and_set_pressure', None)
+        if callable(combined):
+            return bool(combined(setpoint))
+        if not self.alicat.cancel_hold():
+            logger.warning('%s: Failed to enter Alicat control mode before setpoint', self.port_id.value)
+            return False
         return self.alicat.set_pressure(setpoint)
     
     def set_ramp_rate(self, rate: float) -> bool:
@@ -385,7 +412,6 @@ class Port:
 
         self.daq.set_solenoid_safe()
         self.daq.reset_filter()
-        self.alicat.cancel_hold()
         if not self.alicat.exhaust():
             return None
         deadline = time.perf_counter() + max(0.5, timeout_s)
@@ -494,9 +520,7 @@ class Port:
     def _exit_alicat_exhaust(self, target_psia: float = _ATMOSPHERE_PSI) -> None:
         """Leave Alicat EXH so closed-loop setpoints can move the DUT line."""
         for attempt in range(3):
-            self.alicat.cancel_hold()
-            time.sleep(0.15)
-            self.alicat.set_pressure(target_psia)
+            self.set_pressure(target_psia)
             time.sleep(0.4)
             if not self._alicat_in_exhaust_mode():
                 return
@@ -533,9 +557,8 @@ class Port:
             return False
         self.daq.reset_filter()
         self._exit_alicat_exhaust(target_psia)
-        self.alicat.cancel_hold()
         self.alicat.set_ramp_rate(8.0)
-        if not self.alicat.set_pressure(target_psia):
+        if not self.set_pressure(target_psia):
             logger.warning('%s: Failed to command atmosphere bleed setpoint', self.port_id.value)
             return False
 
@@ -579,16 +602,23 @@ class Port:
         reading = self.read_all()
         current = self._alicat_abs_psia(reading, barometric_psia)
         low_threshold = barometric_psia - _IDLE_ATMOSPHERE_TOLERANCE_PSIA
-        in_band = current is not None and current >= low_threshold
+        high_threshold = (
+            barometric_psia + _IDLE_ATMOSPHERE_TOLERANCE_PSIA
+            if self._open_fitting_line()
+            else barometric_psia + 2.0
+        )
+        in_band = (
+            current is not None
+            and low_threshold <= current <= high_threshold
+        )
         in_exh = self._alicat_in_exhaust_mode()
         if in_exh:
             self._exit_alicat_exhaust(barometric_psia)
 
         need_pressure_command = command_pressure and (in_exh or not in_band)
         if need_pressure_command:
-            self.alicat.cancel_hold()
             self.alicat.set_ramp_rate(8.0)
-            if not self.alicat.set_pressure(barometric_psia):
+            if not self.set_pressure(barometric_psia):
                 logger.warning(
                     '%s: Failed to command atmosphere idle setpoint',
                     self.port_id.value,
@@ -620,7 +650,7 @@ class Port:
         )
         return ok
 
-    def vent_to_atmosphere(
+    def _vent_to_atmosphere_via_setpoint(
         self,
         *,
         bleed_installed_dut: bool = True,
@@ -657,7 +687,12 @@ class Port:
         reading = self.read_all()
         current = self._alicat_abs_psia(reading, barometric_psia)
         low_threshold = barometric_psia - _IDLE_ATMOSPHERE_TOLERANCE_PSIA
-        if current is not None and current >= low_threshold:
+        high_threshold = (
+            barometric_psia + _IDLE_ATMOSPHERE_TOLERANCE_PSIA
+            if self._open_fitting_line()
+            else barometric_psia + 2.0
+        )
+        if current is not None and low_threshold <= current <= high_threshold:
             logger.info(
                 '%s: Near atmosphere (%.2f psia) — gentle idle lock only',
                 self.port_id.value,
@@ -683,16 +718,59 @@ class Port:
 
         return self._lock_idle_at_atmosphere(barometric_psia)
 
+    def vent_to_atmosphere(
+        self,
+        *,
+        bleed_installed_dut: bool = True,
+        timeout_s: float = _IDLE_BLEED_TIMEOUT_S,
+    ) -> bool:
+        """Vent with Alicat EXH and leave EXH active at atmospheric pressure."""
+        del bleed_installed_dut  # Retained for compatibility with existing callers.
+        barometric_psia = _ATMOSPHERE_PSI
+        try:
+            barometric_psia = self._infer_barometric_psia()
+        except Exception:
+            pass
+
+        if self.is_at_atmospheric_idle(barometric_psia):
+            return True
+        if not self.daq.set_solenoid_safe():
+            logger.warning('%s: Failed to engage atmosphere route for EXH vent', self.port_id.value)
+            return False
+        self.daq.reset_filter()
+        if not self.alicat.exhaust():
+            logger.warning('%s: Failed to enable Alicat EXH', self.port_id.value)
+            return False
+
+        tolerance = _IDLE_ATMOSPHERE_TOLERANCE_PSIA if self._open_fitting_line() else 2.0
+        deadline = time.perf_counter() + max(0.5, timeout_s)
+        current: Optional[float] = None
+        while time.perf_counter() < deadline:
+            reading = self.read_all()
+            current = self._alicat_abs_psia(reading, barometric_psia)
+            if current is not None and abs(current - barometric_psia) <= tolerance:
+                logger.info('%s: EXH vent complete at %.2f psia', self.port_id.value, current)
+                return True
+            time.sleep(0.25)
+
+        logger.warning(
+            '%s: EXH vent timed out (P=%.2f psia, target=%.2f psia)',
+            self.port_id.value,
+            current if current is not None else float('nan'),
+            barometric_psia,
+        )
+        # Leave EXH enabled on a timeout; closing the valve could trap pressure.
+        return False
+
     def prepare_vacuum_route_for_test(self, barometric_psi: float = _ATMOSPHERE_PSI) -> bool:
         """Vent on atmosphere, then route to vacuum for test cycling (transducer-guarded)."""
         self.vent_to_atmosphere()
-        self.alicat.cancel_hold()
         if self._transducer_installed:
             transducer = self.daq.read_transducer()
             if transducer is not None and transducer.pressure is not None:
                 from app.services.measurement_source import _transducer_pressure_abs_psi
 
-                tr_reading = PortReading(transducer=transducer, alicat=self._cached_alicat)
+                tr_reading = PortReading(transducer=transducer, alicat=self.get_cached_alicat())
                 self._normalize_transducer_reference(tr_reading)
                 transducer_psi = _transducer_pressure_abs_psi(tr_reading, barometric_psi)
                 if transducer_psi is not None and transducer_psi > barometric_psi + 3.0:
@@ -766,6 +844,19 @@ class PortManager:
             1, int(timing_cfg.get('labjack_poll_divisor_sibling', self._alicat_poll_divisor_normal))
         )
         self._poll_interval_ms_precision = int(timing_cfg.get('hardware_poll_interval_ms_precision', 0))
+        self._alicat_background_enabled = bool(
+            timing_cfg.get('alicat_background_polling_enabled', False)
+        )
+        self._alicat_background_hz = max(
+            1.0, float(timing_cfg.get('alicat_background_poll_hz', 120.0))
+        )
+        self._alicat_background_thread: Optional[threading.Thread] = None
+        self._alicat_background_stop = threading.Event()
+        self._alicat_background_metrics_lock = threading.Lock()
+        self._alicat_background_started_s = 0.0
+        self._alicat_background_cycles = 0
+        self._alicat_background_successes: Dict[PortId, int] = {}
+        self._alicat_background_failures: Dict[PortId, int] = {}
         self._poll_callback: Optional[Callable[[Dict[PortId, PortReading]], None]] = None
         self._poll_policy_lock = threading.Lock()
         self._alicat_poll_divisors: Dict[PortId, int] = {}
@@ -967,6 +1058,7 @@ class PortManager:
     
     def disconnect_all(self, *, restore_safe_state: bool = True) -> None:
         """Disconnect all ports."""
+        self._stop_alicat_background_polling()
         ports = list(self.ports.items())
         if restore_safe_state:
             for port_id, port in ports:
@@ -1072,9 +1164,10 @@ class PortManager:
             return False
 
         self._seed_alicat_cache()
+        self._start_alicat_background_polling()
         self._hardware_ready = True
         logger.info(
-            "PortManager: Live hardware polling enabled (GUI thread, interval target=%sms)",
+            "PortManager: Live hardware polling enabled (GUI LabJack thread, interval target=%sms)",
             self._poll_interval_ms,
         )
         return True
@@ -1082,12 +1175,120 @@ class PortManager:
     def stop_polling(self) -> None:
         """Disable hardware reads."""
         self._hardware_ready = False
+        self._stop_alicat_background_polling()
         if self._polling:
             self._polling = False
             if self._poll_thread:
                 self._poll_thread.join(timeout=1.0)
                 self._poll_thread = None
         logger.info("PortManager: Stopped polling")
+
+    def _start_alicat_background_polling(self) -> bool:
+        """Start the independent shared-COM Alicat cache poller when configured."""
+        if not self._alicat_background_enabled or not self.ports:
+            return False
+        thread = self._alicat_background_thread
+        if thread is not None and thread.is_alive():
+            return True
+
+        self._alicat_background_stop.clear()
+        with self._alicat_background_metrics_lock:
+            self._alicat_background_started_s = time.perf_counter()
+            self._alicat_background_cycles = 0
+            self._alicat_background_successes = {port_id: 0 for port_id in self.ports}
+            self._alicat_background_failures = {port_id: 0 for port_id in self.ports}
+        self._alicat_background_thread = threading.Thread(
+            target=self._alicat_background_poll_loop,
+            name='alicat-cache-poller',
+            daemon=True,
+        )
+        self._alicat_background_thread.start()
+        logger.info(
+            'PortManager: Alicat background polling started at %.1f Hz per controller',
+            self._alicat_background_hz,
+        )
+        return True
+
+    def _stop_alicat_background_polling(self) -> None:
+        """Stop the Alicat cache poller before disconnecting serial hardware."""
+        thread = self._alicat_background_thread
+        if thread is None:
+            return
+        self._alicat_background_stop.set()
+        thread.join(timeout=2.0)
+        if thread.is_alive():
+            logger.warning('PortManager: Alicat background polling did not stop within 2 seconds')
+            return
+        self._alicat_background_thread = None
+
+    def _alicat_background_poll_loop(self) -> None:
+        """Poll every Alicat once per target period and atomically refresh each cache."""
+        period_s = 1.0 / self._alicat_background_hz
+        next_cycle_s = time.perf_counter()
+        last_warning_s = 0.0
+        while not self._alicat_background_stop.is_set():
+            for port_id, port in list(self.ports.items()):
+                if self._alicat_background_stop.is_set():
+                    break
+                ok = False
+                try:
+                    ok = bool(port.refresh_alicat())
+                except Exception as exc:
+                    now = time.perf_counter()
+                    if now - last_warning_s >= 5.0:
+                        logger.warning(
+                            'PortManager: Background Alicat refresh failed for %s: %s',
+                            port_id.value,
+                            exc,
+                        )
+                        last_warning_s = now
+                with self._alicat_background_metrics_lock:
+                    metric = (
+                        self._alicat_background_successes
+                        if ok
+                        else self._alicat_background_failures
+                    )
+                    metric[port_id] = metric.get(port_id, 0) + 1
+
+            with self._alicat_background_metrics_lock:
+                self._alicat_background_cycles += 1
+
+            next_cycle_s += period_s
+            now = time.perf_counter()
+            if next_cycle_s < now - period_s:
+                next_cycle_s = now
+            self._alicat_background_stop.wait(max(0.0, next_cycle_s - now))
+
+    def is_alicat_background_polling(self) -> bool:
+        """True while the independent Alicat cache thread is alive."""
+        thread = self._alicat_background_thread
+        return bool(thread is not None and thread.is_alive())
+
+    def get_alicat_background_poll_status(self) -> Dict[str, Any]:
+        """Return target and achieved per-controller background polling rates."""
+        now = time.perf_counter()
+        with self._alicat_background_metrics_lock:
+            elapsed_s = max(0.0, now - self._alicat_background_started_s)
+            successes = dict(self._alicat_background_successes)
+            failures = dict(self._alicat_background_failures)
+            cycles = int(self._alicat_background_cycles)
+        return {
+            'enabled': self._alicat_background_enabled,
+            'running': self.is_alicat_background_polling(),
+            'target_hz_per_controller': self._alicat_background_hz,
+            'elapsed_s': elapsed_s,
+            'cycles': cycles,
+            'ports': {
+                port_id.value: {
+                    'successes': int(successes.get(port_id, 0)),
+                    'failures': int(failures.get(port_id, 0)),
+                    'achieved_hz': (
+                        float(successes.get(port_id, 0)) / elapsed_s if elapsed_s > 0 else 0.0
+                    ),
+                }
+                for port_id in self.ports
+            },
+        }
 
     def _seed_alicat_cache(self) -> None:
         """Prime Alicat caches so the first GUI poll has serial data."""
@@ -1117,7 +1318,7 @@ class PortManager:
 
     def _collect_poll_readings(self, *, labjack_only: bool = False) -> Dict[PortId, PortReading]:
         """Single poll cycle: refresh Alicat when due, then read LabJack (+ cached Alicat)."""
-        if not labjack_only:
+        if not labjack_only and not self.is_alicat_background_polling():
             for port_id, port in self.ports.items():
                 should_refresh = False
                 with self._poll_policy_lock:

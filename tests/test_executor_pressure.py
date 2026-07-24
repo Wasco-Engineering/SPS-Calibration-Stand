@@ -98,7 +98,8 @@ def test_executor_set_pressure_recovers_after_one_failure() -> None:
     executor._set_pressure_or_raise(7.0)
     alicat = cast(_FakeAlicat, executor._port.alicat)
     assert alicat.configure_calls >= 1
-    assert alicat.cancel_hold_calls == 1
+    assert alicat.cancel_hold_calls == 0
+    assert executor._port.set_pressure_calls == [7.0, 7.0]
 
 
 def test_executor_set_pressure_raises_after_second_failure() -> None:
@@ -1260,7 +1261,7 @@ def test_precision_direct_handoff_skips_fast_approach_when_switch_is_reset() -> 
     assert called['fast_approach'] is False
 
 
-def test_precision_reapproaches_after_reset_side_arming() -> None:
+def test_precision_starts_slow_sweep_from_reset_side_after_arming() -> None:
     executor = _build_executor(_FakePort([True]))
     fast_targets: list[tuple[str, float]] = []
 
@@ -1282,7 +1283,7 @@ def test_precision_reapproaches_after_reset_side_arming() -> None:
     result = executor._run_precision_sweep('vacuum', (0.5, 3.0), skip_atmosphere_gate=True)
 
     assert result is not None
-    assert fast_targets == [('vacuum', 1.4), ('vacuum', 1.4)]
+    assert fast_targets == [('vacuum', 1.4)]
 
 
 def test_precision_direct_handoff_requires_pressure_near_close_limit() -> None:
@@ -1357,7 +1358,7 @@ def test_precision_arming_uses_reset_target_when_already_activated_decreasing() 
     assert port.solenoid_calls == [True]
 
 
-def test_pressure_decreasing_activation_prep_resets_above_band() -> None:
+def test_pressure_decreasing_activation_prep_skips_when_already_above_band() -> None:
     port = _FakePort([True])
     executor = _build_executor(port)
     executor._resolve_sweep_mode = lambda: 'pressure'  # type: ignore[method-assign]
@@ -1380,8 +1381,8 @@ def test_pressure_decreasing_activation_prep_resets_above_band() -> None:
         hw_max_psi=30.0,
     )
 
-    assert commanded == [pytest.approx(9.98)]
-    assert port.solenoid_calls == [True]
+    assert commanded == []
+    assert port.solenoid_calls == []
 
 
 def test_pressure_decreasing_derive_nc_from_no_inverts_cycle_targets() -> None:
@@ -1979,7 +1980,7 @@ def _build_flow_executor(setup: TestSetup, sim: _FlowSimulator) -> tuple[_TestEx
     return executor, port, captured
 
 
-def test_executor_control_pressure_prefers_transducer_over_stale_alicat() -> None:
+def test_executor_control_pressure_uses_configured_alicat_above_cutover() -> None:
     setup = TestSetup(
         part_id='17025',
         sequence_id='399',
@@ -1995,7 +1996,8 @@ def test_executor_control_pressure_prefers_transducer_over_stale_alicat() -> Non
     sim = _FlowSimulator(14.7, 7.8, 9.2, -1, 14.7, 14.7)
     executor, _port, _captured = _build_flow_executor(setup, sim)
     reading = build_port_reading(transducer_pressure=12.0, alicat_pressure=25.0)
-    assert executor._reading_pressure_abs_psi(reading) == pytest.approx(12.0)
+    assert executor._reading_pressure_abs_psi(reading) == pytest.approx(25.0)
+    assert executor.last_pressure_source_used == 'alicat'
 
 
 def _run_full_flow_sim(port_key: str) -> None:

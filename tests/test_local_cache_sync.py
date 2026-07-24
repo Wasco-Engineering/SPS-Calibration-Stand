@@ -7,7 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.database import local_cache, operations
-from app.database.models import Base, OrderCalibrationDetail
+from app.database.models import Base, OrderCalibrationDetail, OrderCalibrationMaster
 
 
 def _patch_sql_session(monkeypatch, engine):
@@ -81,6 +81,38 @@ def test_sync_local_cache_uploads_queued_detail(monkeypatch, tmp_path) -> None:
         saved = session.query(OrderCalibrationDetail).one()
         assert saved.MaxPressureAchieved == 31.25
         assert float(saved.GageReferenceDiff) == 14.61
+
+
+def test_sync_local_cache_preserves_detail_suffix_and_shared_master(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv('STINGER_CONFIG_DIR', str(tmp_path))
+    engine = create_engine('sqlite:///:memory:')
+    Base.metadata.create_all(engine)
+    Session = _patch_sql_session(monkeypatch, engine)
+
+    local_cache.upsert_master(
+        {
+            'ShopOrder': 'WO-1',
+            'PartID': 'PART-1',
+            'SequenceID': '399',
+            'OrderQTY': 1,
+            'OperatorID': 'OP-1',
+            'EquipmentID': 'CA-SPS-01',
+        },
+        source='queued',
+    )
+    local_cache.upsert_detail(
+        _detail(EquipmentID='CA-SPS-01-L'),
+        sync_status=local_cache.SYNC_QUEUED,
+    )
+
+    result = operations.sync_local_cache()
+
+    assert result['synced'] == 1
+    with Session() as session:
+        detail = session.query(OrderCalibrationDetail).one()
+        master = session.query(OrderCalibrationMaster).one()
+        assert detail.EquipmentID == 'CA-SPS-01-L'
+        assert master.EquipmentID == 'CA-SPS-01'
 
 
 def test_sync_local_cache_marks_conflict_for_other_equipment(monkeypatch, tmp_path) -> None:

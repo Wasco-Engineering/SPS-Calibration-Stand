@@ -17,7 +17,6 @@ from app.services.control_config import parse_control_config
 from app.services.measurement_source import (
     get_measurement_settings,
     select_main_pressure_abs_psi,
-    select_ui_pressure_abs_psi,
 )
 from app.services.pressure_domain import (
     resolve_alicat_setpoint_reference_for_test,
@@ -137,7 +136,6 @@ class CyclePhaseRunner:
                 f'Failed to set pre-approach ramp rate for {self._ctx._port_id}',
             )
         self._ctx._set_pressure_or_raise(pre_approach_abs)
-        self._ctx._port.alicat.cancel_hold()
 
         # Wait until close to the pre-approach target (generous tolerance)
         if sweep_mode == 'vacuum':
@@ -257,7 +255,6 @@ class CyclePhaseRunner:
         act_target = full_activation if not self._ctx._cycle_prep_confirmed else target_activation
         target_activation_abs = self._ctx._to_absolute(act_target)
         self._ctx._set_pressure_or_raise(target_activation_abs)
-        self._ctx._port.alicat.cancel_hold()
 
         logger.info(
             '%s: Cycle ramp toward activation (target=%.4f PSI%s)',
@@ -330,7 +327,6 @@ class CyclePhaseRunner:
                 f'Failed to set ramp rate for deactivation leg on {self._ctx._port_id}',
             )
         self._ctx._set_pressure_or_raise(target_deactivation_abs)
-        self._ctx._port.alicat.cancel_hold()
 
         logger.info(
             '%s: Cycle fast ramp to deactivation target %.4f PSI, waiting for reset edge%s',
@@ -404,7 +400,6 @@ class CyclePhaseRunner:
         # ---- Phase 1: sweep down to reset side; deactivation is the lower-pressure edge ----
         self._ctx._emit_substate('cycling.wait_deactivation')
         self._ctx._set_pressure_or_raise(self._ctx._to_absolute(low_target))
-        self._ctx._port.alicat.cancel_hold()
         logger.info(
             '%s: NC-derived vacuum cycle sweep low to %.4f PSI (deactivation leg)',
             self._ctx._port_id,
@@ -441,7 +436,6 @@ class CyclePhaseRunner:
         # ---- Phase 2: sweep upward through activation band ----
         self._ctx._emit_substate('cycling.wait_activation')
         self._ctx._set_pressure_or_raise(self._ctx._to_absolute(high_target))
-        self._ctx._port.alicat.cancel_hold()
         logger.info(
             '%s: NC-derived vacuum cycle sweep high to %.4f PSI (activation leg)',
             self._ctx._port_id,
@@ -555,11 +549,9 @@ class PrecisionPhaseRunner:
         )
         if armed_from_reset_side and not self._ctx._cancel_event.is_set():
             logger.info(
-                '%s: Precision reset-side arming complete; fast-positioning back to %.4f PSI',
+                '%s: Precision reset-side arming complete; starting slow sweep from reset side',
                 self._ctx._port_id,
-                approach_target,
             )
-            self._run_precision_fast_approach(sweep_mode, approach_target)
 
         logger.info('%s: Precision final return target=%.4f PSI', self._ctx._port_id, target_back)
         if sweep_mode == 'vacuum' and not self._ctx._port.set_solenoid(to_vacuum=True):
@@ -648,7 +640,6 @@ class PrecisionPhaseRunner:
         )
         target_abs = stable_atmosphere_psi if uses_absolute_atmosphere else stable_baro_psi
         self._ctx._set_pressure_or_raise(target_abs)
-        self._ctx._port.alicat.cancel_hold()
         self._ctx._emit_substate('precision.hold_atmosphere')
         atmosphere_tolerance = (
             max(self._ctx._atmosphere_tolerance_psi, 1.25)
@@ -676,15 +667,14 @@ class PrecisionPhaseRunner:
     ) -> None:
         self._ctx._emit_substate('precision.fast_approach')
         approach_target_abs = self._ctx._to_absolute(approach_target)
-        # Set pressure target and rate BEFORE canceling hold to prevent
-        # the Alicat from resuming toward the old (stale) cycling setpoint.
-        self._ctx._set_pressure_or_raise(approach_target_abs)
+        # Configure the ramp while EXH/hold is still active. Port.set_pressure()
+        # then enters control mode immediately before sending the new target.
         if not self._ctx._port.alicat.set_ramp_rate(self._ctx._fast_rate_psi):
             self._ctx._fail(
                 TestFailureCode.RAMP_RATE_FAILURE,
                 f'Failed to set fast approach ramp rate for {self._ctx._port_id}',
             )
-        self._ctx._port.alicat.cancel_hold()
+        self._ctx._set_pressure_or_raise(approach_target_abs)
         logger.info(
             '%s: Precision handoff commanding approach target=%.4f PSI before solenoid switch',
             self._ctx._port_id,
@@ -765,7 +755,6 @@ class PrecisionPhaseRunner:
                 f'Failed to set precision arming ramp rate for {self._ctx._port_id}',
             )
         self._ctx._set_pressure_or_raise(self._ctx._to_absolute(arm_target))
-        self._ctx._port.alicat.cancel_hold()
 
         start = time.perf_counter()
         near_target_since: Optional[float] = None
@@ -939,6 +928,7 @@ class TestExecutor:
         self._cycle_prep_confirmed: bool = True
         self._run_atmosphere_psi: Optional[float] = None
         self._alicat_setpoint_ref: Optional[str] = None
+        self._last_pressure_source_used: Optional[str] = None
         self._last_precision_missing_edge: Optional[str] = None
         self._cycle_phase_runner = CyclePhaseRunner(self)
         self._precision_phase_runner = PrecisionPhaseRunner(self)
@@ -1422,7 +1412,6 @@ class TestExecutor:
                     target_abs = self._to_absolute(target_psi)
                     target_test = self._cycle_ramp_target_test_reference(target_psi)
                     self._set_pressure_or_raise(self._to_absolute(target_psi))
-                    self._port.alicat.cancel_hold()
                     target_reached = False
                     target_reached_at = None
                     fallback_applied = True
@@ -1593,7 +1582,6 @@ class TestExecutor:
         if edge_type != 'deactivation' or pressure_test is None or not math.isfinite(pressure_test):
             return
         self._set_pressure_or_raise(self._to_absolute(pressure_test))
-        self._port.alicat.cancel_hold()
         logger.debug('%s: Holding at cycle reset edge %.4f PSI', self._port_id, pressure_test)
 
     def _wait_until_near_target(
@@ -1792,7 +1780,6 @@ class TestExecutor:
                         f'Failed to set ramp rate for cycle prep on {self._port_id}',
                     )
                 self._set_pressure_or_raise(self._to_absolute(nudge_target))
-                self._port.alicat.cancel_hold()
                 prep_timeout_s = min(3.0, self._edge_timeout_s)
                 prep_start = time.perf_counter()
                 near_target_since: Optional[float] = None
@@ -1851,6 +1838,7 @@ class TestExecutor:
             and math.isfinite(pressure)
             and pressure < max_psi
         ):
+            nudge_psi = max(overshoot, self._precision_prepass_nudge_psi)
             nudge_target = min(hw_max_psi, max_psi + nudge_psi)
             logger.info(
                 '%s: Switch already activated below band at %.4f PSI; '
@@ -1867,7 +1855,6 @@ class TestExecutor:
                     f'Failed to set ramp rate for cycle reset prep on {self._port_id}',
                 )
             self._set_pressure_or_raise(self._to_absolute(nudge_target))
-            self._port.alicat.cancel_hold()
             prep_timeout_s = min(5.0, self._edge_timeout_s)
             prep_start = time.perf_counter()
             near_target_since: Optional[float] = None
@@ -1901,13 +1888,13 @@ class TestExecutor:
                 else:
                     near_target_since = None
                 time.sleep(0.02)
-            self._fail(
-                TestFailureCode.NO_SWITCH_DETECTED,
-                (
-                    f'Switch did not reset below activation band before cycle on {self._port_id} '
-                    f'(stuck at {pressure:.3f} PSI)'
-                ),
+            logger.warning(
+                '%s: Switch did not reset below activation band before cycle '
+                '(stuck at %.3f PSI) — falling back to full-range traverse',
+                self._port_id,
+                pressure,
             )
+            self._cycle_prep_confirmed = False
             return
 
         # ----------------------------------------------------------------
@@ -1939,12 +1926,13 @@ class TestExecutor:
         if switch_state == prep_state or already_on_prep_side:
             self._seed_debounce_from_live_reading()
             logger.info(
-                '%s: Cycle prep skipped for %s leg; switch=%s pressure=%s PSI already on prep side '
+                '%s: Cycle prep skipped for %s leg; switch=%s pressure=%s PSI%s '
                 '(target %.4f PSI)',
                 self._port_id,
                 edge_type,
                 'activated' if switch_state else 'deactivated',
                 f'{pressure:.4f}' if pressure is not None else '--',
+                ' already on prep side' if already_on_prep_side else '',
                 prep_target,
             )
             self._cycle_prep_confirmed = True
@@ -1970,7 +1958,6 @@ class TestExecutor:
                 f'Failed to set ramp rate for cycle prep on {self._port_id}',
             )
         self._set_pressure_or_raise(self._to_absolute(prep_target))
-        self._port.alicat.cancel_hold()
 
         prep_timeout_s = min(5.0, self._edge_timeout_s)
         prep_start = time.perf_counter()
@@ -2905,7 +2892,6 @@ class TestExecutor:
                 )
         baro_psi = self._get_barometric_psi(self._port_id)
         self._set_pressure_or_raise(baro_psi)
-        self._port.alicat.cancel_hold()
         time.sleep(min(3.0, max(0.35, baro_psi / max(staging_rate, 0.1) + 0.1)))
 
     def _resolve_sweep_mode(self) -> str:
@@ -3278,26 +3264,30 @@ class TestExecutor:
         return bool(port_cfg.get('transducer_installed', True))
 
     def _reading_pressure_abs_psi(self, reading: PortReading) -> Optional[float]:
-        """Pressure for ramp/wait/edge control — transducer first when installed."""
+        """Pressure for ramp, wait, and edge control using the main source policy."""
         barometric_psi = self._get_barometric_psi(self._port_id)
         if not self._transducer_installed():
             from app.services.measurement_source import _alicat_pressure_abs_psi
 
-            return _alicat_pressure_abs_psi(reading, barometric_psi)
-        measurement_settings = get_measurement_settings(self._config)
-        pressure_abs, _source_used = select_ui_pressure_abs_psi(
-            reading=reading,
-            settings=measurement_settings,
-            barometric_psi=barometric_psi,
-        )
-        if pressure_abs is not None:
-            return pressure_abs
-        pressure_abs, _source_used = select_main_pressure_abs_psi(
-            reading=reading,
-            settings=measurement_settings,
-            barometric_psi=barometric_psi,
-        )
+            pressure_abs = _alicat_pressure_abs_psi(reading, barometric_psi)
+            source_used = 'alicat'
+        else:
+            measurement_settings = get_measurement_settings(self._config)
+            pressure_abs, source_used = select_main_pressure_abs_psi(
+                reading=reading,
+                settings=measurement_settings,
+                barometric_psi=barometric_psi,
+            )
+
+        if source_used != self._last_pressure_source_used:
+            logger.info('%s: Test pressure source -> %s', self._port_id, source_used)
+            self._last_pressure_source_used = source_used
         return pressure_abs
+
+    @property
+    def last_pressure_source_used(self) -> Optional[str]:
+        """Most recent source selected for test control and edge capture."""
+        return self._last_pressure_source_used
 
     def _absolute_to_test_reference(self, pressure_abs_psi: float) -> float:
         if self._ptp_limits_use_psia_scale():
@@ -3406,8 +3396,6 @@ class TestExecutor:
             target_abs_psi,
         )
         self._ensure_alicat_units()
-        self._port.alicat.cancel_hold()
-        time.sleep(0.05)
         command_psi = to_alicat_setpoint_psi(
             target_abs_psi,
             barometric_psi=baro,

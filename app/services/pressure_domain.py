@@ -92,6 +92,18 @@ def resolve_barometric_psi(
     max_jump_psi: float = 2.0,
 ) -> float:
     """Return a usable barometric PSI for conversions and vacuum safety checks."""
+    # These controllers often provide only pressure + setpoint, with no
+    # dedicated barometer field. EXH changes the process pressure on this
+    # stand, so once a valid atmosphere value has been established, do not
+    # reinterpret subsequent EXH process readings as changing weather.
+    if (
+        reading is not None
+        and reading.alicat is not None
+        and reading.alicat.barometric_pressure is None
+        and 'EXH' in (reading.alicat.raw_response or '').upper()
+        and is_plausible_barometric_psi(last_value)
+    ):
+        return float(last_value)
     inferred = infer_barometric_pressure(reading)
     if is_plausible_barometric_psi(inferred):
         if (

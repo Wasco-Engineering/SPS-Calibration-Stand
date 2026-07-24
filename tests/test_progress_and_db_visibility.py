@@ -211,6 +211,12 @@ def test_save_result_maps_increasing_direction_edges_to_database_fields(monkeypa
     assert captured['gage_reference_diff'] == 14.61
 
 
+def test_detail_equipment_ids_are_port_specific() -> None:
+    assert work_order_controller._detail_equipment_id('CA-SPS-01', 'port_a') == 'CA-SPS-01-L'
+    assert work_order_controller._detail_equipment_id('CA-SPS-01', 'port_b') == 'CA-SPS-01-R'
+    assert work_order_controller._detail_equipment_id('CA-SPS-01', 'other') == 'CA-SPS-01'
+
+
 def test_save_result_maps_decreasing_direction_edges_to_database_fields(monkeypatch) -> None:
     controller = _make_save_controller(activation_direction='Decreasing')
     captured = {}
@@ -399,6 +405,44 @@ def test_save_test_result_accepts_zero_no_switch_sentinel(monkeypatch, tmp_path)
         assert float(saved.GageReferenceDiff) == 14.61
         assert saved.InSpec is False
         assert master.CreatedBy == 'STINGER_01'
+
+
+def test_save_result_keeps_shared_master_equipment_id(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv('STINGER_CONFIG_DIR', str(tmp_path))
+    engine = create_engine('sqlite:///:memory:')
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+
+    @contextmanager
+    def _session_scope():
+        session = Session()
+        try:
+            yield session
+            session.commit()
+        finally:
+            session.close()
+
+    monkeypatch.setattr(operations, 'session_scope', _session_scope)
+
+    assert operations.save_test_result(
+        shop_order='WO-1',
+        part_id='PART-1',
+        sequence_id='1',
+        serial_number=1,
+        increasing_activation=12.3,
+        decreasing_deactivation=9.8,
+        in_spec=True,
+        temperature_c=25.0,
+        units_of_measure='PSI',
+        operator_id='OP-1',
+        equipment_id='CA-SPS-01-R',
+        master_equipment_id='CA-SPS-01',
+    )
+    with Session() as session:
+        detail = session.query(OrderCalibrationDetail).one()
+        master = session.query(OrderCalibrationMaster).one()
+        assert detail.EquipmentID == 'CA-SPS-01-R'
+        assert master.EquipmentID == 'CA-SPS-01'
 
 
 def test_ensure_work_order_master_uses_composite_key_without_rewriting_other_part(
