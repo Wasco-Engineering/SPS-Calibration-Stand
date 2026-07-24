@@ -136,7 +136,7 @@ def parse_control_config(config: dict[str, Any]) -> ControlConfig:
             timeout_sec=float(edge.get('timeout_sec', 60.0)),
             atmosphere_tolerance_psi=float(edge.get('atmosphere_tolerance_psi', 0.25)),
             precision_approach_tolerance_torr=float(edge.get('precision_approach_tolerance_torr', 8.0)),
-            precision_approach_settle_sec=float(edge.get('precision_approach_settle_sec', 0.25)),
+            precision_approach_settle_sec=float(edge.get('precision_approach_settle_sec', 0.75)),
             precision_start_atmosphere_hold_sec=float(edge.get('precision_start_atmosphere_hold_sec', 1.0)),
             precision_close_limit_offset_torr=float(edge.get('precision_close_limit_offset_torr', 20.0)),
             precision_prepass_nudge_torr=float(edge.get('precision_prepass_nudge_torr', 20.0)),
