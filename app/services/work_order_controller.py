@@ -120,6 +120,7 @@ class WorkOrderController(QObject):
         self._debug_alicat_mode = self._runtime_state.debug_alicat_mode
         self._debug_solenoid_last_route = self._runtime_state.debug_solenoid_last_route
         self._hw_serial_busy_ports: set[str] = set()
+        self._hw_action_cancel: Dict[str, threading.Event] = {}
         self._last_worker_alicat_refresh_s: Dict[str, float] = {}
         self._worker_alicat_refresh_interval_s = 0.10
         solenoid_cfg = self._config.get("hardware", {}).get("solenoid", {})
@@ -618,28 +619,18 @@ class WorkOrderController(QObject):
         self._port_manager.set_alicat_poll_profile(None)
     
     def _hardware_poll_labjack_only(self) -> bool:
-        """True when Alicat serial is owned by a worker — keep GUI polls LabJack-only."""
-        if self._hw_serial_busy_ports:
-            return True
-        for port_id, executor in self._test_executors.items():
-            if not executor.is_running:
-                continue
-            # Without a transducer the Alicat is the only live pressure source;
-            # skipping it freezes the operator graph and readout during cycling.
-            if not is_transducer_installed(self._config, port_id):
-                return False
-        return any(
-            executor.is_running
-            for executor in self._test_executors.values()
-        )
+        """GUI polls never touch Alicat serial — background thread owns refresh.
+
+        Always True so Qt stays responsive for switch LEDs and pressure display
+        (Alicat values come from the PortManager background cache).
+        """
+        return True
 
     def _poll_live_readings(self) -> None:
-        """Read transducer + Alicat on the GUI thread and push to the UI."""
+        """Read LabJack on the GUI thread; Alicat comes from background cache."""
         if not self._port_manager.is_hardware_ready:
             return
-        readings = self._port_manager.poll_once(
-            labjack_only=self._hardware_poll_labjack_only(),
-        )
+        readings = self._port_manager.poll_once(labjack_only=True)
         if not readings:
             return
         self._apply_poll_readings(readings)
@@ -1060,25 +1051,41 @@ class WorkOrderController(QObject):
         """
         executor = self._test_executors.get(port_id)
         if executor and executor.is_running:
-            port = self._port_manager.get_port(port_id)
-            if port is not None:
-                try:
-                    self._refresh_alicat_for_worker_if_due(port_id, port)
-                    if is_transducer_installed(self._config, port_id):
-                        reading = port.read_precision_fast()
-                    else:
-                        reading = port.read_fast()
-                    with self._latest_readings_lock:
-                        self._latest_readings[port_id] = reading
-                    return reading
-                except Exception as exc:
-                    logger.warning(
-                        '%s: Live test read failed, using cached poll: %s',
-                        port_id,
-                        exc,
-                    )
+            return self._read_live_hardware(port_id, refresh_alicat=True)
         with self._latest_readings_lock:
             return self._latest_readings.get(port_id)
+
+    def _read_live_hardware(
+        self,
+        port_id: str,
+        *,
+        refresh_alicat: bool = True,
+    ) -> Optional[PortReading]:
+        """Live LabJack (+ optional Alicat) read; publish to UI cache."""
+        port = self._port_manager.get_port(port_id)
+        if port is None:
+            return None
+        try:
+            if refresh_alicat:
+                if port_id in self._hw_serial_busy_ports or (
+                    self._test_executors.get(port_id)
+                    and self._test_executors[port_id].is_running
+                ):
+                    # Worker already owns serial — refresh directly.
+                    self._refresh_alicat_for_worker_if_due(port_id, port)
+                else:
+                    self._refresh_alicat_for_worker_if_due(port_id, port)
+            if is_transducer_installed(self._config, port_id):
+                reading = port.read_precision_fast()
+            else:
+                reading = port.read_fast()
+            with self._latest_readings_lock:
+                self._latest_readings[port_id] = reading
+            return reading
+        except Exception as exc:
+            logger.warning('%s: Live hardware read failed: %s', port_id, exc)
+            with self._latest_readings_lock:
+                return self._latest_readings.get(port_id)
 
     def _refresh_alicat_for_worker_if_due(self, port_id: str, port: Any) -> None:
         """Refresh cached Alicat pressure from the worker when tests use Alicat as source."""
@@ -1595,6 +1602,7 @@ class WorkOrderController(QObject):
 
     def _on_cancel(self, port_id: str) -> None:
         self._restore_normal_viz(port_id)
+        self._cancel_hw_action(port_id)
         was_owner = self._precision_owner_port == port_id
         self._remove_precision_waiter(port_id)
         executor = self._test_executors.get(port_id)
@@ -1616,7 +1624,20 @@ class WorkOrderController(QObject):
         if was_owner:
             self._release_precision_slot(port_id, reason='cancel')
 
+    def _cancel_hw_action(self, port_id: str) -> None:
+        """Signal any in-flight pressurize worker on this port to stop."""
+        event = self._hw_action_cancel.setdefault(port_id, threading.Event())
+        event.set()
+
+    def _begin_hw_action(self, port_id: str) -> threading.Event:
+        """Clear and return the cancel event for a new hardware worker."""
+        event = self._hw_action_cancel.setdefault(port_id, threading.Event())
+        event.clear()
+        return event
+
     def _on_vent(self, port_id: str) -> None:
+        # Stop a racing pressurize worker before taking the serial bus.
+        self._cancel_hw_action(port_id)
         executor = self._test_executors.get(port_id)
         if executor and executor.is_running:
             logger.info('%s: Vent requested during test — cancelling executor first', port_id)
@@ -1815,8 +1836,11 @@ class WorkOrderController(QObject):
 
     def _start_pressurize_hw(self, port_id: str) -> None:
         """Start pressurization in a background thread."""
+        cancel = self._begin_hw_action(port_id)
+
         def _pressurize() -> None:
             self._hw_serial_busy_ports.add(port_id)
+            self._port_manager.set_serial_busy(port_id, True)
             try:
                 port = self._port_manager.get_port(port_id)
                 if not port:
@@ -1913,35 +1937,27 @@ class WorkOrderController(QObject):
                     target_psi,
                     alicat_ref,
                 )
-                staging_rate = max(pressurize_rate, 50.0)
-                if not port.alicat.set_ramp_rate(staging_rate):
-                    logger.warning(
-                        '%s: High atmosphere staging ramp %.4f PSI/s rejected; falling back to %.4f PSI/s',
-                        port_id,
-                        staging_rate,
-                        pressurize_rate,
-                    )
-                    staging_rate = pressurize_rate
-                    if not port.alicat.set_ramp_rate(staging_rate):
-                        logger.error(
-                            '%s: Failed to set atmosphere staging ramp rate to %.4f PSI/s',
-                            port_id,
-                            staging_rate,
-                        )
-                        return
-                atmosphere_command = to_alicat_setpoint_psi(
-                    barometric_psi,
-                    barometric_psi=barometric_psi,
-                    setpoint_reference=alicat_ref,
-                )
-                if not port.set_pressure(atmosphere_command):
-                    logger.error('%s: Failed to stage Alicat setpoint at atmosphere', port_id)
+                if cancel.is_set():
+                    logger.info('%s: Pressurize cancelled before move', port_id)
                     return
-                port.alicat.cancel_hold()
-                time.sleep(min(3.0, max(0.35, barometric_psi / max(staging_rate, 0.1) + 0.1)))
+
+                # Leave vented EXH so closed-loop setpoints work, then go
+                # straight to the test route + target (no atmosphere staging
+                # pause that looked like a mystery Alicat move).
+                exit_exh = getattr(port, '_exit_alicat_exhaust', None)
+                if callable(exit_exh):
+                    exit_exh(barometric_psi)
+                else:
+                    port.alicat.cancel_hold()
+                if cancel.is_set():
+                    logger.info('%s: Pressurize cancelled after EXH exit', port_id)
+                    return
 
                 logger.info('%s: Connecting active test route for %s pressurize', port_id, sweep_mode)
                 if not self._set_active_test_route(port, port_id, sweep_mode, "manual pressurize"):
+                    return
+                if cancel.is_set():
+                    logger.info('%s: Pressurize cancelled after route connect', port_id)
                     return
                 if not port.alicat.set_ramp_rate(pressurize_rate):
                     logger.error('%s: Failed to set ramp rate to %.4f PSI/s', port_id, pressurize_rate)
@@ -1987,7 +2003,11 @@ class WorkOrderController(QObject):
                 last_pressure_abs_psi = None
                 last_source_used = None
                 while time.perf_counter() - start < timeout:
-                    reading = self._get_latest_reading(port_id)
+                    if cancel.is_set():
+                        logger.info('%s: Pressurize cancelled during ramp', port_id)
+                        return
+                    # Live Alicat read — cache is stale while this worker owns serial.
+                    reading = self._read_live_hardware(port_id, refresh_alicat=True)
                     if reading is not None:
                         current_switch_active = self._switch_is_activated(reading)
                         if initial_switch_state is None:
@@ -2027,6 +2047,10 @@ class WorkOrderController(QObject):
                             break
                     time.sleep(0.05)
 
+                if cancel.is_set():
+                    logger.info('%s: Pressurize cancelled before completion signal', port_id)
+                    return
+
                 if switch_actuated:
                     logger.info(
                         '%s: QAL15 pressurize completed on switch transition to %s',
@@ -2057,6 +2081,7 @@ class WorkOrderController(QObject):
                 self._sig_trigger_error.emit(port_id, str(exc))
             finally:
                 self._hw_serial_busy_ports.discard(port_id)
+                self._port_manager.set_serial_busy(port_id, False)
 
         threading.Thread(target=_pressurize, daemon=True).start()
 
@@ -2587,13 +2612,32 @@ class WorkOrderController(QObject):
     # ------------------------------------------------------------------
 
     def _vent_port(self, port_id: str) -> None:
-        """Vent a port to atmosphere."""
+        """Vent a port to atmosphere on a worker thread.
+
+        Vent can block for several seconds while ramping back to barometric
+        pressure. Running it off the GUI thread keeps the UI responsive and
+        marks the port serial-busy so live polls skip Alicat contention.
+        """
         port = self._port_manager.get_port(port_id)
-        if port:
+        if not port:
+            return
+
+        def _vent() -> None:
+            self._hw_serial_busy_ports.add(port_id)
+            self._port_manager.set_serial_busy(port_id, True)
             try:
                 port.vent_to_atmosphere()
             except Exception as exc:
                 logger.error('Vent failed for %s: %s', port_id, exc)
+            finally:
+                self._hw_serial_busy_ports.discard(port_id)
+                self._port_manager.set_serial_busy(port_id, False)
+
+        threading.Thread(
+            target=_vent,
+            name=f'vent-{port_id}',
+            daemon=True,
+        ).start()
 
     def _save_result(
         self,

@@ -450,6 +450,7 @@ def test_precision_result_uses_out_edge_as_activation_for_vacuum_no_open() -> No
         _target: float,
         _direction: int,
         edge_type: str | None = None,
+        **_kwargs: Any,
     ) -> EdgeDetection:
         return edges[edge_type or 'activation']
 
@@ -488,6 +489,63 @@ def test_precision_reasserts_ramp_rate_before_return_sweep() -> None:
 
     assert outcome.result is not None
     assert port.alicat.ramp_rates == [pytest.approx(0.0967), pytest.approx(0.0967)]
+
+
+def test_precision_rejects_inverted_deactivation_below_activation() -> None:
+    """Turnaround bounce that reports deact below act must not pass for decreasing."""
+    executor = _build_executor(_FakePort([True]))
+    edges = [
+        EdgeDetection(pressure_psi=1.4260, activated=False),
+        EdgeDetection(pressure_psi=1.4088, activated=True),
+    ]
+
+    executor._sweep_to_edge = lambda *_args, **_kwargs: edges.pop(0)  # type: ignore[method-assign]
+
+    outcome = executor._execute_out_back_sweep(
+        target_out=1.07,
+        target_back=1.85,
+        direction=-1,
+        rate_psi_per_sec=0.1,
+        fail_on_rate_error=True,
+    )
+
+    assert outcome.result is None
+    assert outcome.missing_edge == 'second'
+
+
+def test_precision_return_sweep_passes_gate_past_activation() -> None:
+    executor = _build_executor(_FakePort([True]))
+    captured: dict[str, Any] = {}
+
+    def _edge(
+        _target: float,
+        _direction: int,
+        edge_type: str | None = None,
+        **kwargs: Any,
+    ) -> EdgeDetection:
+        if edge_type == 'deactivation':
+            captured.update(kwargs)
+            return EdgeDetection(pressure_psi=1.62, activated=True)
+        return EdgeDetection(pressure_psi=1.43, activated=False)
+
+    executor._cycle_activation_samples = [1.46]
+    executor._cycle_deactivation_samples = [1.56]
+    executor._sweep_to_edge = _edge  # type: ignore[method-assign]
+
+    outcome = executor._execute_out_back_sweep(
+        target_out=1.07,
+        target_back=1.85,
+        direction=-1,
+        rate_psi_per_sec=0.1,
+        fail_on_rate_error=True,
+    )
+
+    assert outcome.result is not None
+    assert outcome.result.activation_psi == pytest.approx(1.43)
+    assert outcome.result.deactivation_psi == pytest.approx(1.62)
+    assert captured.get('require_past_psi') == pytest.approx(1.43)
+    assert captured.get('past_margin_psi', 0) > 0
+    assert captured.get('seed_edge_time') is True
 
 
 def test_cycle_activation_rejects_decreasing_vacuum_edge_above_ptp_band() -> None:
@@ -1182,14 +1240,19 @@ def test_executor_waits_for_precision_slot_before_sweep() -> None:
     assert calls == []
 
 
-def test_precision_direct_handoff_skips_fast_approach_when_switch_is_reset() -> None:
+def test_precision_near_approach_settles_at_slow_rate_before_sweep() -> None:
     executor = _build_executor(_FakePort([True]))
-    called = {'fast_approach': False}
+    called = {'fast_approach': False, 'settle': False}
+    # PTP decreasing close-limit approach is max band (~600 Torr).
+    approach_psi = convert_pressure(600.0, 'Torr', 'PSI')
 
     executor._vacuum_switch_trips_on_no_open = lambda: True  # type: ignore[method-assign]
-    executor._read_pressure_and_switch_state = lambda: (2.0, True)  # type: ignore[method-assign]
+    executor._read_pressure_and_switch_state = lambda: (approach_psi, True)  # type: ignore[method-assign]
     executor._precision_phase_runner._run_precision_fast_approach = (  # type: ignore[method-assign]
         lambda _mode, _target: called.__setitem__('fast_approach', True)
+    )
+    executor._precision_phase_runner._settle_at_precision_approach = (  # type: ignore[method-assign]
+        lambda _target: called.__setitem__('settle', True)
     )
     executor._run_sweep_pass = lambda *_args: SweepPassOutcome(  # type: ignore[method-assign]
         result=SweepResult(activation_psi=1.5, deactivation_psi=1.8),
@@ -1200,6 +1263,20 @@ def test_precision_direct_handoff_skips_fast_approach_when_switch_is_reset() -> 
 
     assert result is not None
     assert called['fast_approach'] is False
+    assert called['settle'] is True
+
+
+def test_precision_direct_handoff_rejects_mid_band_below_decreasing_approach() -> None:
+    """Mid-band pressure must not skip the high-side fast approach."""
+    executor = _build_executor(_FakePort([True]))
+    executor._vacuum_switch_trips_on_no_open = lambda: True  # type: ignore[method-assign]
+    executor._read_pressure_and_switch_state = lambda: (1.75, True)  # type: ignore[method-assign]
+
+    assert not executor._precision_phase_runner._can_start_precision_from_current_reset_side(
+        skip_atmosphere_gate=True,
+        activation_direction=-1,
+        approach_target=2.80,
+    )
 
 
 def test_precision_reapproaches_after_reset_side_arming() -> None:
@@ -1238,6 +1315,25 @@ def test_precision_direct_handoff_requires_pressure_near_close_limit() -> None:
         activation_direction=-1,
         approach_target=1.7,
     )
+
+
+def test_ordered_cycle_estimates_nudge_equal_means_for_decreasing() -> None:
+    executor = _build_executor(_FakePort([True]))
+    executor._cycle_activation_samples = [1.5005, 1.5005, 1.5005]
+    executor._cycle_deactivation_samples = [1.5005, 1.5005, 1.5005]
+
+    activation, deactivation = executor._ordered_cycle_estimates()
+    assert activation is not None and deactivation is not None
+    assert activation < deactivation
+
+    approach, target_out, target_back, source = executor._resolve_precision_targets(
+        min_psi=1.412,
+        max_psi=2.8046,
+        activation_direction=-1,
+    )
+    assert source == 'cycle-estimate-offset-close-limit'
+    assert approach > target_out
+    assert target_back >= deactivation
 
 
 def test_precision_direct_handoff_disabled_for_nc_derived_vacuum_window() -> None:
@@ -1327,6 +1423,7 @@ def test_pressure_decreasing_activation_prep_resets_above_band() -> None:
 
 
 def test_pressure_decreasing_derive_nc_from_no_inverts_cycle_targets() -> None:
+    """Single-sense pressure parts: high-P reset reads activated=True."""
     port = _FakePort([True])
     port.daq = SimpleNamespace(switch_nc_derived_from_no=True)
     executor = _build_executor(port)

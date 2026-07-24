@@ -93,6 +93,17 @@ class Port:
             return bool(self._labjack_config.get('open_fitting'))
         return not self._transducer_installed
 
+    def _atmosphere_idle_band(self, barometric_psia: float) -> tuple[float, float]:
+        """Return (low, high) PSIA band treated as atmospheric idle.
+
+        Keep this tight (±1 psi). A wider high side falsely treats low gauge
+        setpoints (e.g. ~0.9 psig / 14.5 psia) as already vented, so Vent
+        becomes a no-op and the DUT stays pressurized.
+        """
+        low = barometric_psia - _IDLE_ATMOSPHERE_TOLERANCE_PSIA
+        high = barometric_psia + _IDLE_ATMOSPHERE_TOLERANCE_PSIA
+        return low, high
+
     def _configured_barometric_psia(self) -> float:
         """Site-local barometric default (e.g. ~13.5 PSIA in Idaho), else sea level."""
         raw = self._labjack_config.get('local_barometric_psi')
@@ -455,40 +466,28 @@ class Port:
         return 'HLD' in reading.raw_response.upper()
 
     def is_at_atmospheric_idle(self, barometric_psia: Optional[float] = None) -> bool:
-        """True when the DUT line is already at safe atmospheric idle.
+        """True when the DUT line is already in the vented/safe idle state.
 
-        Used on connect/disconnect to avoid disturbing ports that are already
-        sitting near barometric pressure with no exhaust bleed active.
+        Requires pressure near local baro. EXH alone is not enough — commanding
+        EXH while still pressurized leaves sealed DUTs high if the atmosphere
+        solenoid has isolated the Alicat from the part.
         """
-        if self._alicat_in_exhaust_mode():
-            return False
         if barometric_psia is None:
             barometric_psia = self._infer_barometric_psia()
         reading = self.read_all()
         current = self._alicat_abs_psia(reading, barometric_psia)
         if current is None:
             return False
-        # Held closed near local baro (common on open fittings at altitude).
+        low, high = self._atmosphere_idle_band(barometric_psia)
+        if not (low <= current <= high):
+            return False
+        if self._alicat_in_exhaust_mode():
+            return True
+        # Held closed near local baro (legacy idle without EXH).
         if self._alicat_in_hold_mode():
             from app.services.pressure_domain import is_plausible_barometric_psi
 
-            if is_plausible_barometric_psi(current):
-                hold_tolerance = (
-                    _IDLE_ATMOSPHERE_TOLERANCE_PSIA
-                    if self._open_fitting_line()
-                    else max(_IDLE_ATMOSPHERE_TOLERANCE_PSIA * 2.0, 1.5)
-                )
-                if abs(current - barometric_psia) <= hold_tolerance:
-                    return True
-            return False
-        low = barometric_psia - _IDLE_ATMOSPHERE_TOLERANCE_PSIA
-        high = (
-            barometric_psia + _IDLE_ATMOSPHERE_TOLERANCE_PSIA
-            if self._open_fitting_line()
-            else barometric_psia + 2.0
-        )
-        if current < low or current > high:
-            return False
+            return is_plausible_barometric_psi(current)
         return True
 
     def _exit_alicat_exhaust(self, target_psia: float = _ATMOSPHERE_PSI) -> None:
@@ -506,119 +505,80 @@ class Port:
                 attempt + 1,
             )
 
-    def _bleed_line_to_atmosphere(
+    def _equalize_line_to_atmosphere(
         self,
         *,
         barometric_psia: float,
         timeout_s: float = _IDLE_BLEED_TIMEOUT_S,
     ) -> bool:
-        """Bleed a vacuum-held line up through the Alicat atmosphere route."""
-        target_psia = barometric_psia
-        low_threshold = barometric_psia - _IDLE_ATMOSPHERE_TOLERANCE_PSIA
+        """Bring the DUT line to barometric pressure via closed-loop Alicat.
+
+        Above baro: keep the active test route so the Alicat can dump the sealed
+        DUT. Below baro: use the atmosphere solenoid route to bleed up.
+        """
         reading = self.read_all()
         current = self._alicat_abs_psia(reading, barometric_psia)
-        if current is not None and current >= low_threshold:
+        if current is None:
+            return False
+        low, high = self._atmosphere_idle_band(barometric_psia)
+        if low <= current <= high:
             return True
 
+        if current > high:
+            if not self.connect_test_route():
+                logger.warning(
+                    '%s: Failed to connect test route before dumping to atmosphere',
+                    self.port_id.value,
+                )
+                return False
+            route = 'test'
+        else:
+            if not self.daq.set_solenoid_safe():
+                logger.warning(
+                    '%s: Failed to engage atmosphere route before bleed-up',
+                    self.port_id.value,
+                )
+                return False
+            self.daq.reset_filter()
+            route = 'atmosphere'
+
         logger.info(
-            '%s: Bleeding DUT line from %.2f psia toward atmosphere (target %.2f psia)',
+            '%s: Equalizing DUT line from %.2f psia toward atmosphere '
+            '(target %.2f, route=%s)',
             self.port_id.value,
-            current if current is not None else float('nan'),
-            target_psia,
+            current,
+            barometric_psia,
+            route,
         )
-        # Recover from vacuum on the atmosphere solenoid route. The historical
-        # test-route bleed could not raise an installed DUT line from ~1.5 psia.
-        if not self.daq.set_solenoid_safe():
-            logger.warning('%s: Failed to engage atmosphere route for bleed', self.port_id.value)
-            return False
-        self.daq.reset_filter()
-        self._exit_alicat_exhaust(target_psia)
+        self._exit_alicat_exhaust(barometric_psia)
         self.alicat.cancel_hold()
-        self.alicat.set_ramp_rate(8.0)
-        if not self.alicat.set_pressure(target_psia):
-            logger.warning('%s: Failed to command atmosphere bleed setpoint', self.port_id.value)
+        if not self.alicat.set_ramp_rate(50.0):
+            self.alicat.set_ramp_rate(8.0)
+        if not self.alicat.set_pressure(barometric_psia):
+            logger.warning('%s: Failed to command atmosphere equalize setpoint', self.port_id.value)
             return False
 
         start = time.perf_counter()
         while time.perf_counter() - start <= timeout_s:
             reading = self.read_all()
             current = self._alicat_abs_psia(reading, barometric_psia)
-            if current is not None and current >= low_threshold:
+            if current is not None and low <= current <= high:
                 logger.info(
-                    '%s: DUT line reached %.2f psia after bleed',
+                    '%s: DUT line equalized at %.2f psia',
                     self.port_id.value,
                     current,
                 )
                 return True
-            time.sleep(0.5)
+            time.sleep(0.2)
 
         reading = self.read_all()
         current = self._alicat_abs_psia(reading, barometric_psia)
         logger.warning(
-            '%s: Timed out bleeding to atmosphere (still %.2f psia)',
+            '%s: Timed out equalizing to atmosphere (still %.2f psia)',
             self.port_id.value,
             current if current is not None else float('nan'),
         )
-        return current is not None and current >= low_threshold
-
-    def _lock_idle_at_atmosphere(
-        self,
-        barometric_psia: float,
-        *,
-        command_pressure: bool = True,
-    ) -> bool:
-        """Leave the DUT line at atmosphere without pulling vacuum.
-
-        Uses the atmosphere solenoid route and closed-loop pressure toward
-        local barometric PSI. Do **not** use Alicat EXH here — on this stand EXH
-        pulls the line toward vacuum even on the atmosphere route.
-        """
-        self.daq.set_solenoid_safe()
-        self.daq.reset_filter()
-
-        reading = self.read_all()
-        current = self._alicat_abs_psia(reading, barometric_psia)
-        low_threshold = barometric_psia - _IDLE_ATMOSPHERE_TOLERANCE_PSIA
-        in_band = current is not None and current >= low_threshold
-        in_exh = self._alicat_in_exhaust_mode()
-        if in_exh:
-            self._exit_alicat_exhaust(barometric_psia)
-
-        need_pressure_command = command_pressure and (in_exh or not in_band)
-        if need_pressure_command:
-            self.alicat.cancel_hold()
-            self.alicat.set_ramp_rate(8.0)
-            if not self.alicat.set_pressure(barometric_psia):
-                logger.warning(
-                    '%s: Failed to command atmosphere idle setpoint',
-                    self.port_id.value,
-                )
-                return False
-
-            start = time.perf_counter()
-            while time.perf_counter() - start <= 15.0:
-                reading = self.read_all()
-                current = self._alicat_abs_psia(reading, barometric_psia)
-                if current is not None and current >= low_threshold:
-                    break
-                time.sleep(0.5)
-
-        if self._alicat_in_hold_mode():
-            ok = True
-        else:
-            ok = self.alicat.hold_valve(closed=True)
-        try:
-            self.refresh_alicat()
-        except Exception:
-            pass
-        reading = self.read_all()
-        current = self._alicat_abs_psia(reading, barometric_psia)
-        logger.info(
-            '%s: Idle atmosphere (DIO=atmosphere, hold closed) P=%.2f psia',
-            self.port_id.value,
-            current if current is not None else float('nan'),
-        )
-        return ok
+        return current is not None and low <= current <= high
 
     def vent_to_atmosphere(
         self,
@@ -626,18 +586,14 @@ class Port:
         bleed_installed_dut: bool = True,
         timeout_s: float = _IDLE_BLEED_TIMEOUT_S,
     ) -> bool:
-        """Vent the port to atmosphere (safe idle state).
+        """Vent the port to atmosphere (safe idle = Alicat EXH near baro).
 
-        With a DUT installed the line can remain at vacuum while the exhaust
-        solenoid is already on atmosphere. Bleed through the Alicat test route
-        when needed, then lock the line near barometric pressure on the
-        atmosphere solenoid route. Do **not** use Alicat EXH here — EXH pulls
-        installed DUT lines back to vacuum on this stand.
-
-        When the line is already near barometric pressure (typical after a
-        clean shutdown), this is a no-op so operators do not see ports
-        pressurize or pull vacuum on application startup.
+        First equalizes the DUT line to local barometric pressure (dumping
+        positive pressure on the test route, bleeding vacuum on the atmosphere
+        route), then parks on the atmosphere solenoid with Alicat EXH.
         """
+        del bleed_installed_dut  # retained for call-site compatibility
+
         barometric_psia = _ATMOSPHERE_PSI
         try:
             barometric_psia = self._infer_barometric_psia()
@@ -645,43 +601,48 @@ class Port:
             pass
 
         if self.is_at_atmospheric_idle(barometric_psia):
+            self.daq.set_solenoid_safe()
+            if not self._alicat_in_exhaust_mode():
+                self.alicat.cancel_hold()
+                self.alicat.exhaust()
             reading = self.read_all()
             current = self._alicat_abs_psia(reading, barometric_psia)
             logger.info(
-                '%s: Already at atmospheric idle (%.2f psia) — no vent action',
+                '%s: Already at atmospheric idle (%.2f psia)',
                 self.port_id.value,
                 current if current is not None else float('nan'),
             )
             return True
 
+        try:
+            self._equalize_line_to_atmosphere(
+                barometric_psia=barometric_psia,
+                timeout_s=timeout_s,
+            )
+        except Exception as exc:
+            logger.warning(
+                '%s: Atmosphere equalize failed (continuing to EXH idle): %s',
+                self.port_id.value,
+                exc,
+            )
+
+        self.daq.set_solenoid_safe()
+        self.daq.reset_filter()
+        self.alicat.cancel_hold()
+        ok = self.alicat.exhaust()
+        try:
+            self.refresh_alicat()
+        except Exception:
+            pass
         reading = self.read_all()
         current = self._alicat_abs_psia(reading, barometric_psia)
-        low_threshold = barometric_psia - _IDLE_ATMOSPHERE_TOLERANCE_PSIA
-        if current is not None and current >= low_threshold:
-            logger.info(
-                '%s: Near atmosphere (%.2f psia) — gentle idle lock only',
-                self.port_id.value,
-                current,
-            )
-            return self._lock_idle_at_atmosphere(
-                barometric_psia,
-                command_pressure=False,
-            )
-
-        if bleed_installed_dut:
-            try:
-                self._bleed_line_to_atmosphere(
-                    barometric_psia=barometric_psia,
-                    timeout_s=timeout_s,
-                )
-            except Exception as exc:
-                logger.warning(
-                    '%s: Atmosphere bleed failed (continuing to idle lock): %s',
-                    self.port_id.value,
-                    exc,
-                )
-
-        return self._lock_idle_at_atmosphere(barometric_psia)
+        logger.info(
+            '%s: Vented (DIO=atmosphere, Alicat EXH) P=%.2f psia ok=%s',
+            self.port_id.value,
+            current if current is not None else float('nan'),
+            ok,
+        )
+        return bool(ok)
 
     def prepare_vacuum_route_for_test(self, barometric_psi: float = _ATMOSPHERE_PSI) -> bool:
         """Vent on atmosphere, then route to vacuum for test cycling (transducer-guarded)."""
@@ -753,6 +714,7 @@ class PortManager:
         self.ports: Dict[PortId, Port] = {}
         self._polling = False
         self._poll_thread: Optional[threading.Thread] = None
+        self._alicat_thread: Optional[threading.Thread] = None
         timing_cfg = config.get('timing', {})
         self._poll_interval_ms = timing_cfg.get('hardware_poll_interval_ms', 10)
         legacy_divisor = max(1, int(timing_cfg.get('alicat_poll_divisor', 10)))
@@ -772,6 +734,7 @@ class PortManager:
         self._alicat_refresh_countdown: Dict[PortId, int] = {}
         self._precision_owner: Optional[PortId] = None
         self._labjack_sibling_countdown: Dict[PortId, int] = {}
+        self._serial_busy_ports: set[PortId] = set()
         self._last_poll_readings: Dict[PortId, PortReading] = {}
         self._hardware_ready = False
 
@@ -1065,16 +1028,45 @@ class PortManager:
                 for port_id in self.ports.keys()
             }
     
+    def set_serial_busy(self, port_id: PortId | str, busy: bool) -> None:
+        """Mark a port's Alicat serial as owned by a worker (vent/pressurize/test).
+
+        Background Alicat refresh skips busy ports so the GUI never contends for
+        the COM lock and stays responsive.
+        """
+        normalized = self._normalize_port_id(port_id)
+        if normalized is None:
+            return
+        with self._poll_policy_lock:
+            if busy:
+                self._serial_busy_ports.add(normalized)
+            else:
+                self._serial_busy_ports.discard(normalized)
+
     def start_polling(self) -> bool:
-        """Enable hardware reads (polled on the Qt GUI thread via poll_once)."""
+        """Enable live hardware reads.
+
+        LabJack (switch + transducer) is polled on the Qt GUI thread via
+        ``poll_once(labjack_only=True)``. Alicat serial refresh runs on a
+        background thread so COM waits never freeze the UI.
+        """
         if not self.ports:
             logger.error("PortManager: No ports initialized, cannot start polling")
             return False
 
         self._seed_alicat_cache()
         self._hardware_ready = True
+        self._polling = True
+        if self._alicat_thread is None or not self._alicat_thread.is_alive():
+            self._alicat_thread = threading.Thread(
+                target=self._alicat_refresh_loop,
+                name='alicat-refresh',
+                daemon=True,
+            )
+            self._alicat_thread.start()
         logger.info(
-            "PortManager: Live hardware polling enabled (GUI thread, interval target=%sms)",
+            "PortManager: Live hardware polling enabled "
+            "(GUI LabJack interval target=%sms, Alicat on background thread)",
             self._poll_interval_ms,
         )
         return True
@@ -1082,11 +1074,15 @@ class PortManager:
     def stop_polling(self) -> None:
         """Disable hardware reads."""
         self._hardware_ready = False
-        if self._polling:
-            self._polling = False
-            if self._poll_thread:
-                self._poll_thread.join(timeout=1.0)
-                self._poll_thread = None
+        self._polling = False
+        if self._alicat_thread and self._alicat_thread.is_alive():
+            self._alicat_thread.join(timeout=1.5)
+        self._alicat_thread = None
+        if self._poll_thread:
+            self._poll_thread.join(timeout=1.0)
+            self._poll_thread = None
+        with self._poll_policy_lock:
+            self._serial_busy_ports.clear()
         logger.info("PortManager: Stopped polling")
 
     def _seed_alicat_cache(self) -> None:
@@ -1103,9 +1099,8 @@ class PortManager:
     def poll_once(self, *, labjack_only: bool = False) -> Dict[PortId, PortReading]:
         """Read all ports once. Must run on the Qt main thread for reliable UI updates.
 
-        When ``labjack_only`` is True, skip Alicat serial I/O (transducer + switch only).
-        Use this while a background test thread owns the Alicat lock so the UI
-        timer is not blocked for hundreds of milliseconds.
+        When ``labjack_only`` is True (preferred for GUI), skip Alicat serial I/O
+        and use the background-refreshed Alicat cache with a fresh LabJack read.
         """
         if not self._hardware_ready or not self.ports:
             return {}
@@ -1116,34 +1111,61 @@ class PortManager:
             return {}
 
     def _collect_poll_readings(self, *, labjack_only: bool = False) -> Dict[PortId, PortReading]:
-        """Single poll cycle: refresh Alicat when due, then read LabJack (+ cached Alicat)."""
+        """Single poll cycle: optional Alicat refresh, then LabJack (+ cached Alicat)."""
         if not labjack_only:
-            for port_id, port in self.ports.items():
-                should_refresh = False
-                with self._poll_policy_lock:
-                    remaining = int(self._alicat_refresh_countdown.get(port_id, 0))
-                    if remaining <= 0:
-                        should_refresh = True
-                        divisor = int(
-                            self._alicat_poll_divisors.get(port_id, self._alicat_poll_divisor_normal)
-                        )
-                        self._alicat_refresh_countdown[port_id] = max(0, divisor - 1)
-                    else:
-                        self._alicat_refresh_countdown[port_id] = remaining - 1
-                if should_refresh:
-                    try:
-                        port.refresh_alicat()
-                    except Exception as exc:
-                        logger.warning(
-                            "PortManager: Alicat refresh failed for %s: %s",
-                            port_id.value,
-                            exc,
-                        )
+            self._refresh_due_alicats(skip_busy=True)
 
         readings: Dict[PortId, PortReading] = {}
         for port_id, port in self.ports.items():
             readings[port_id] = self._poll_reading(port_id, port)
         return readings
+
+    def _refresh_due_alicats(self, *, skip_busy: bool) -> None:
+        """Refresh Alicat caches for ports whose poll divisor countdown expired."""
+        for port_id, port in self.ports.items():
+            should_refresh = False
+            with self._poll_policy_lock:
+                if skip_busy and port_id in self._serial_busy_ports:
+                    continue
+                remaining = int(self._alicat_refresh_countdown.get(port_id, 0))
+                if remaining <= 0:
+                    should_refresh = True
+                    divisor = int(
+                        self._alicat_poll_divisors.get(port_id, self._alicat_poll_divisor_normal)
+                    )
+                    self._alicat_refresh_countdown[port_id] = max(0, divisor - 1)
+                else:
+                    self._alicat_refresh_countdown[port_id] = remaining - 1
+            if should_refresh:
+                try:
+                    port.refresh_alicat()
+                except Exception as exc:
+                    logger.warning(
+                        "PortManager: Alicat refresh failed for %s: %s",
+                        port_id.value,
+                        exc,
+                    )
+
+    def _alicat_refresh_loop(self) -> None:
+        """Background Alicat serial refresh so the GUI thread never blocks on COM."""
+        while self._polling:
+            start_time = time.perf_counter()
+            with self._poll_policy_lock:
+                precision_active = self._precision_owner is not None
+            interval_ms = (
+                self._poll_interval_ms_precision
+                if precision_active and self._poll_interval_ms_precision > 0
+                else self._poll_interval_ms
+            )
+            interval_s = max(0.005, interval_ms / 1000.0)
+            try:
+                self._refresh_due_alicats(skip_busy=True)
+            except Exception as exc:
+                logger.error("PortManager: Alicat refresh loop error: %s", exc)
+            elapsed = time.perf_counter() - start_time
+            sleep_time = max(0.0, interval_s - elapsed)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
     
     def _poll_reading(self, port_id: PortId, port: Port) -> PortReading:
         """Read one port according to the active precision poll profile."""
