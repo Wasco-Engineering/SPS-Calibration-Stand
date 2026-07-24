@@ -104,6 +104,50 @@ def test_not_connected_nc_terminal_observes_no_and_derives_nc() -> None:
     assert any('NormallyClosedTerminal=0' in warning for warning in result.warnings)
 
 
+def test_same_no_nc_terminal_is_treated_as_single_throw() -> None:
+    result = resolve_ptp_switch_config(
+        ptp_params={
+            'NormallyOpenTerminal': '3',
+            'NormallyClosedTerminal': '3',
+            'CommonTerminal': '4',
+        },
+        port_id='port_a',
+        port_config={'switch_sensed_db9_pins': [3]},
+    )
+
+    assert result.is_valid
+    assert result.normally_open_terminal == 3
+    assert result.normally_closed_terminal is None
+    assert result.no_dio == 2
+    assert result.nc_dio == 2
+    assert result.derivation_mode == 'derive_nc_from_no'
+    assert result.derive_nc_from_no
+    assert any('share DB9 pin 3' in warning for warning in result.warnings)
+
+
+def test_same_no_nc_terminal_can_use_spst_fallback_when_not_predeclared_sensed() -> None:
+    result = resolve_ptp_switch_config(
+        ptp_params={
+            'NormallyOpenTerminal': '1',
+            'NormallyClosedTerminal': '1',
+            'CommonTerminal': '4',
+        },
+        port_id='port_a',
+        port_config={'switch_sensed_db9_pins': [3]},
+    )
+
+    assert result.is_valid
+    assert result.normally_open_terminal == 1
+    assert result.normally_closed_terminal is None
+    assert result.no_dio == 0
+    assert result.nc_dio == 0
+    assert result.drive_dio == 3
+    assert result.derivation_mode == 'derive_nc_from_no'
+    assert result.derive_nc_from_no
+    assert any('share DB9 pin 1' in warning for warning in result.warnings)
+    assert any('SPST PTP fallback' in warning for warning in result.warnings)
+
+
 def test_not_connected_no_terminal_can_read_common_and_drive_nc() -> None:
     result = resolve_ptp_switch_config(
         ptp_params={
@@ -146,6 +190,51 @@ def test_not_connected_nc_terminal_can_read_common_and_drive_no() -> None:
     assert result.derivation_mode == 'drive_no_read_common'
     assert result.observed_terminals == ('common_as_normally_open',)
     assert result.derive_nc_from_no
+
+
+def test_spst_ptp_fallback_reads_connected_no_throw() -> None:
+    result = resolve_ptp_switch_config(
+        ptp_params={
+            'NormallyOpenTerminal': '2',
+            'NormallyClosedTerminal': '0',
+            'CommonTerminal': '1',
+        },
+        port_id='port_a',
+        port_config={'switch_sensed_db9_pins': [3]},
+    )
+
+    assert result.is_valid
+    assert result.common_dio == 0
+    assert result.no_dio == 1
+    assert result.nc_dio == 1
+    assert result.drive_dio == 0
+    assert result.drive_role == 'common'
+    assert result.derivation_mode == 'derive_nc_from_no'
+    assert result.observed_terminals == ('normally_open_single_throw',)
+    assert result.derive_nc_from_no
+    assert any('SPST PTP fallback' in warning for warning in result.warnings)
+
+
+def test_spst_ptp_fallback_reads_connected_nc_throw() -> None:
+    result = resolve_ptp_switch_config(
+        ptp_params={
+            'NormallyOpenTerminal': '0',
+            'NormallyClosedTerminal': '2',
+            'CommonTerminal': '1',
+        },
+        port_id='port_b',
+        port_config={'switch_sensed_db9_pins': [3]},
+    )
+
+    assert result.is_valid
+    assert result.common_dio == 9
+    assert result.no_dio == 10
+    assert result.nc_dio == 10
+    assert result.drive_dio == 9
+    assert result.drive_role == 'common'
+    assert result.derivation_mode == 'derive_no_from_nc'
+    assert result.observed_terminals == ('normally_closed_single_throw',)
+    assert result.derive_no_from_nc
 
 
 def test_both_throw_terminals_not_connected_fails() -> None:
@@ -193,3 +282,62 @@ def test_unobservable_ptp_terminals_fail_without_configured_pin_fallback() -> No
     assert result.no_dio is None
     assert result.nc_dio is None
     assert any('not observable' in error for error in result.errors)
+
+
+def test_com5_dual_throw_seq600_uses_drive_nc_read_common() -> None:
+    result = resolve_ptp_switch_config(
+        ptp_params={
+            'NormallyOpenTerminal': '6',
+            'NormallyClosedTerminal': '4',
+            'CommonTerminal': '5',
+        },
+        port_id='port_a',
+        port_config={'switch_sensed_db9_pins': [3]},
+    )
+
+    assert result.is_valid
+    assert result.no_dio == 4
+    assert result.nc_dio == 4
+    assert result.drive_dio == 3
+    assert result.drive_role == 'normally_closed'
+    assert result.derivation_mode == 'drive_nc_read_common'
+    assert result.derive_no_from_nc
+    assert any('COM=5 bench' in warning for warning in result.warnings)
+
+
+def test_com5_dual_throw_seq300_uses_drive_no_read_common() -> None:
+    result = resolve_ptp_switch_config(
+        ptp_params={
+            'NormallyOpenTerminal': '4',
+            'NormallyClosedTerminal': '6',
+            'CommonTerminal': '5',
+        },
+        port_id='port_b',
+        port_config={'switch_sensed_db9_pins': [3]},
+    )
+
+    assert result.is_valid
+    assert result.no_dio == 13
+    assert result.nc_dio == 13
+    assert result.drive_dio == 12
+    assert result.drive_role == 'normally_open'
+    assert result.derivation_mode == 'drive_no_read_common'
+    assert result.derive_nc_from_no
+
+
+def test_com5_single_nc_throw_maps_sensed_pin3_to_nc() -> None:
+    result = resolve_ptp_switch_config(
+        ptp_params={
+            'NormallyOpenTerminal': '0',
+            'NormallyClosedTerminal': '4',
+            'CommonTerminal': '5',
+        },
+        port_id='port_a',
+        port_config={'switch_sensed_db9_pins': [3]},
+    )
+
+    assert result.is_valid
+    assert result.normally_open_terminal is None
+    assert result.drive_dio == 3
+    assert result.derivation_mode == 'drive_nc_read_common'
+    assert result.derive_no_from_nc

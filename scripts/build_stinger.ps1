@@ -31,6 +31,7 @@ if ($InstallPyInstaller) {
 
 if (-not $SkipTests) {
     & $pythonPath -m pytest -q tests/test_pressure_conversion.py tests/test_pressure_calibration.py
+    & $pythonPath scripts\certify_ptp_applications.py --matrix docs\application_verification_matrix.csv --output logs\application_certification_build.csv --fail-on-blocked
 }
 
 # Remove prior output so stale onedir files cannot be published with the onefile exe.

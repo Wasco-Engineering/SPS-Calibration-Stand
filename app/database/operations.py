@@ -1111,6 +1111,7 @@ def save_test_result(
     units_of_measure: str,
     operator_id: str,
     equipment_id: str,
+    master_equipment_id: Optional[str] = None,
     activation_id: int = 1,
     max_pressure_achieved: Optional[float] = None,
     gage_reference_diff: Optional[float] = None,
@@ -1133,7 +1134,8 @@ def save_test_result(
         temperature_c: Ambient test temperature in Celsius.
         units_of_measure: Units string for display.
         operator_id: Operator who performed the test.
-        equipment_id: Equipment identifier.
+        equipment_id: Detail-row equipment identifier.
+        master_equipment_id: Optional shared work-order master EquipmentID.
         activation_id: Attempt identifier (usually 1).
         
     Returns:
@@ -1145,6 +1147,7 @@ def save_test_result(
         part_id_clean = _clean_string(part_id)
         operator_id_clean = _clean_string(operator_id)
         equipment_id_clean = _clean_string(equipment_id)
+        master_equipment_id_clean = _clean_string(master_equipment_id) or equipment_id_clean
         units_clean = _clean_string(units_of_measure) or 'PSI'
         sequence_values = _sequence_id_lookup_values(sequence_id)
 
@@ -1214,7 +1217,7 @@ def save_test_result(
                 order_qty,
                 activation_target,
                 operator_id_clean,
-                equipment_id_clean,
+                master_equipment_id_clean,
                 temperature_c,
             )
             detail = _build_detail_payload(
@@ -1242,7 +1245,7 @@ def save_test_result(
                 'SequenceID': detail['SequenceID'],
                 'OrderQTY': order_qty,
                 'OperatorID': operator_id_clean,
-                'EquipmentID': equipment_id_clean,
+                'EquipmentID': master_equipment_id_clean,
                 'TemperatureC': temperature_c,
                 'ActivationTarget': activation_target,
             },
@@ -1274,6 +1277,7 @@ def save_test_result(
             units_of_measure=units_of_measure,
             operator_id=operator_id,
             equipment_id=equipment_id,
+            master_equipment_id=master_equipment_id,
             max_pressure_achieved=max_pressure_achieved,
             gage_reference_diff=gage_reference_diff,
             order_qty=order_qty,
@@ -1294,6 +1298,7 @@ def save_test_result(
             units_of_measure=units_of_measure,
             operator_id=operator_id,
             equipment_id=equipment_id,
+            master_equipment_id=master_equipment_id,
             max_pressure_achieved=max_pressure_achieved,
             gage_reference_diff=gage_reference_diff,
             order_qty=order_qty,
@@ -1315,6 +1320,7 @@ def _queue_local_test_result(
     units_of_measure: str,
     operator_id: str,
     equipment_id: str,
+    master_equipment_id: Optional[str],
     max_pressure_achieved: Optional[float],
     gage_reference_diff: Optional[float],
     order_qty: int,
@@ -1346,7 +1352,7 @@ def _queue_local_test_result(
                 'SequenceID': sequence_write,
                 'OrderQTY': order_qty,
                 'OperatorID': operator_id,
-                'EquipmentID': equipment_id,
+                'EquipmentID': _clean_string(master_equipment_id) or equipment_id,
                 'TemperatureC': temperature_c,
                 'ActivationTarget': activation_target,
             },
@@ -1531,7 +1537,7 @@ def sync_local_cache(max_rows: int = 100) -> Dict[str, int]:
                         _parse_order_qty(master.get('OrderQTY') or master.get('OrderQty') or 1),
                         master.get('ActivationTarget'),
                         detail.get('OperatorID') or master.get('OperatorID') or '',
-                        detail.get('EquipmentID') or master.get('EquipmentID') or '',
+                        master.get('EquipmentID') or detail.get('EquipmentID') or '',
                         _as_optional_float(detail.get('TemperatureC')),
                     )
                     detail['InspectionDate'] = _parse_datetime(detail.get('InspectionDate'))

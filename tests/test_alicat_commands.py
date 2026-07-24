@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 from app.hardware.alicat import AlicatController, AlicatReading
 from app.hardware.port import Port, PortId
 
@@ -119,6 +122,36 @@ def test_auto_tare_on_connect_skips_when_not_at_atmosphere() -> None:
     controller.tare = lambda: False  # type: ignore[method-assign]
     controller._maybe_auto_tare()
     assert sent == []
+
+
+def test_background_read_cannot_interleave_resume_and_setpoint() -> None:
+    controller = AlicatController({'address': 'A'})
+    read_entered = threading.Event()
+    release_read = threading.Event()
+    commands: list[str] = []
+
+    def send(command: str) -> str:
+        commands.append(command)
+        if command == '':
+            read_entered.set()
+            assert release_read.wait(timeout=1.0)
+            return 'A +014.70 +010.00 EXH'
+        return 'A'
+
+    controller._send_command = send  # type: ignore[method-assign]
+    reader = threading.Thread(target=controller.read_status)
+    setter = threading.Thread(target=lambda: controller.resume_and_set_pressure(7.5))
+
+    reader.start()
+    assert read_entered.wait(timeout=1.0)
+    setter.start()
+    time.sleep(0.02)
+    assert commands == ['']
+
+    release_read.set()
+    reader.join(timeout=1.0)
+    setter.join(timeout=1.0)
+    assert commands[:3] == ['', 'C', 'S 7.50']
 
 
 def test_port_configures_switch_pins_from_ptp() -> None:

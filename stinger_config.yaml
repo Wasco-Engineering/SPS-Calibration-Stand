@@ -72,7 +72,7 @@ hardware:
           intercept_error_psi: 0.03897909303252994
         pressure_axis: measured
   alicat:
-    baudrate: 19200
+    baudrate: 115200
     timeout_s: 0.2
     auto_tare_on_connect: true
     auto_tare_max_delta_psi: 0.5
@@ -160,12 +160,15 @@ control:
     stable_sample_count: 3
     min_edge_interval_ms: 50
 timing:
-  ui_refresh_interval_ms: 33
-  hardware_poll_interval_ms: 20
+  ui_refresh_interval_ms: 16
+  hardware_poll_interval_ms: 7
+  alicat_background_polling_enabled: true
+  # 140 Hz scheduler target yields ~120 Hz/controller on the shared FTDI link.
+  alicat_background_poll_hz: 140
   alicat_poll_divisor: 4
-  alicat_poll_divisor_normal: 4
+  alicat_poll_divisor_normal: 5
   alicat_poll_divisor_precision: 2
-  labjack_poll_divisor_sibling: 4
+  labjack_poll_divisor_sibling: 14
   hardware_poll_interval_ms_precision: 7
   button_lockout_ms: 300
   graceful_stop_timeout_sec: 5.0

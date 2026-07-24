@@ -78,6 +78,7 @@ def run_headless_executor(
     pm = PortManager(config)
     pm.initialize_ports()
     pm.connect_all()
+    pm.start_polling()
 
     port = pm.get_port(PortId(port_id))
     if port is None:
@@ -135,7 +136,10 @@ def run_headless_executor(
         last_alicat_s = 0.0
         while not stop.is_set():
             now = time.time()
-            if now - last_alicat_s >= alicat_interval_s:
+            if (
+                not pm.is_alicat_background_polling()
+                and now - last_alicat_s >= alicat_interval_s
+            ):
                 port.refresh_alicat()
                 last_alicat_s = now
             row = _row_from_reading(now, port_id, port.read_fast())
@@ -163,7 +167,14 @@ def run_headless_executor(
         get_barometric_psi=get_baro,
         on_cycling_complete=on_cycling_complete,
         on_substate_update=lambda s: add_event('substate', state=s),
-        on_edges_captured=lambda a, d: add_event('edges_captured', activation_psi=a, deactivation_psi=d),
+        on_edges_captured=lambda a, d: add_event(
+            'edges_captured',
+            activation_psi=a,
+            deactivation_psi=d,
+            pressure_source=(
+                executor_ref[0].last_pressure_source_used if executor_ref else None
+            ),
+        ),
         on_cycle_estimate=lambda a, d, c: add_event(
             'cycle_estimate', activation_psi=a, deactivation_psi=d, count=c
         ),

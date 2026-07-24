@@ -10,6 +10,7 @@ from app.services.pressure_domain import (
     infer_setpoint_reference,
     is_plausible_barometric_psi,
     resolve_alicat_setpoint_reference_for_test,
+    resolve_barometric_psi,
     to_alicat_setpoint_psi,
 )
 from app.services.ptp_service import build_pressure_visualization, convert_pressure, derive_test_setup
@@ -210,6 +211,39 @@ def test_torr_pressure_visualization_keeps_atmosphere_on_torr_scale() -> None:
     assert viz['max_psi'] < 1000.0
 
 
+def test_pressure_visualization_keeps_psig_atmosphere_on_gauge_scale() -> None:
+    setup = derive_test_setup(
+        '17123',
+        '399',
+        {
+            'ActivationTarget': '10.000000',
+            'IncreasingLowerLimit': '9.500000',
+            'IncreasingUpperLimit': '10.500000',
+            'DecreasingLowerLimit': '7.000000',
+            'DecreasingUpperLimit': '9.500000',
+            'ResetBandLowerLimit': '-Inf',
+            'ResetBandUpperLimit': 'Inf',
+            'TargetActivationDirection': 'Increasing',
+            'UnitsOfMeasure': '1',
+            'PressureReference': 'Gauge',
+            'CommonTerminal': '1',
+            'NormallyOpenTerminal': '2',
+            'NormallyClosedTerminal': '0',
+        },
+    )
+
+    viz = build_pressure_visualization(
+        setup,
+        {},
+        atmosphere_override=14.7,
+        display_units_override='PSIG',
+    )
+
+    assert viz['atmosphere_psi'] == pytest.approx(0.0, abs=1e-6)
+    assert viz['activation_band'] == pytest.approx((9.5, 10.5))
+    assert viz['deactivation_band'] == pytest.approx((7.0, 9.5))
+
+
 def test_barometric_plausibility_guard() -> None:
     assert is_plausible_barometric_psi(14.7)
     assert not is_plausible_barometric_psi(0.2635)
@@ -234,6 +268,18 @@ def test_infer_barometric_ignores_exh_with_stale_setpoint() -> None:
         raw_response='B +013.51 +008.00 EXH',
     )
     assert infer_barometric_pressure_from_alicat(reading) is None
+
+
+def test_resolve_barometric_holds_last_value_during_short_exh_status() -> None:
+    reading = build_port_reading(
+        alicat_pressure=13.83,
+        alicat_setpoint=9.4,
+    )
+    assert reading.alicat is not None
+    reading.alicat.barometric_pressure = None
+    reading.alicat.raw_response = 'A +0715.2 +0486.2 EXH'
+
+    assert resolve_barometric_psi(reading, last_value=14.61) == pytest.approx(14.61)
 
 
 def test_infer_barometric_ignores_transient_low_exh_pressure() -> None:

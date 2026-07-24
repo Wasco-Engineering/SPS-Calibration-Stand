@@ -163,6 +163,17 @@ def resolve_barometric_psi(
         if is_plausible_barometric_psi(direct):
             return float(direct)
 
+    # Short frames often omit barometer. EXH changes process pressure, so once a
+    # valid atmosphere value exists, do not reinterpret EXH readings as weather.
+    if (
+        reading is not None
+        and reading.alicat is not None
+        and reading.alicat.barometric_pressure is None
+        and 'EXH' in (reading.alicat.raw_response or '').upper()
+        and is_plausible_barometric_psi(last_value)
+    ):
+        return float(last_value)
+
     anchor = anchor_baro_psi if is_plausible_barometric_psi(anchor_baro_psi) else last_value
     inferred = infer_barometric_pressure(reading, anchor_baro_psi=anchor)
     if is_plausible_barometric_psi(inferred):

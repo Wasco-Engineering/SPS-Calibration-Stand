@@ -226,9 +226,26 @@ def validate_ptp_params(ptp_params: Dict[str, str]) -> Tuple[bool, List[str]]:
         ("NormallyOpenTerminal", _to_int(normalized.get("NormallyOpenTerminal"))),
         ("NormallyClosedTerminal", _to_int(normalized.get("NormallyClosedTerminal"))),
     )
+    terminal_values: Dict[str, Optional[int]] = {}
     for label, value in terminals:
+        terminal_values[label] = value
         if value is None:
             errors.append(f"{label} must be a number")
+    common_terminal = terminal_values.get("CommonTerminal")
+    no_terminal = terminal_values.get("NormallyOpenTerminal")
+    nc_terminal = terminal_values.get("NormallyClosedTerminal")
+    if common_terminal is not None and not 1 <= common_terminal <= 9:
+        errors.append("CommonTerminal must be a DB9 pin from 1 to 9")
+    for label, value in (
+        ("NormallyOpenTerminal", no_terminal),
+        ("NormallyClosedTerminal", nc_terminal),
+    ):
+        if value is not None and value != 0 and not 1 <= value <= 9:
+            errors.append(f"{label} must be 0 or a DB9 pin from 1 to 9")
+    if no_terminal == 0 and nc_terminal == 0:
+        errors.append("At least one of NormallyOpenTerminal or NormallyClosedTerminal must be connected")
+    if common_terminal is not None and common_terminal in {no_terminal, nc_terminal}:
+        errors.append("CommonTerminal must be different from NO and NC terminals")
 
     for label in (
         "ActivationTarget",
@@ -315,18 +332,10 @@ def build_pressure_visualization(
         if atmosphere_override is not None and math.isfinite(atmosphere_override)
         else 14.7
     )
-    band_candidates = [
-        v
-        for band in (activation_band, deactivation_band)
-        if band
-        for v in band
-        if math.isfinite(v)
-    ]
-    from app.services.sweep_utils import ptp_limit_is_absolute_psia_scale
+    from app.services.sweep_utils import ptp_limits_use_psia_scale
 
     psia_scale_limits = bool(
-        band_candidates
-        and ptp_limit_is_absolute_psia_scale(max(band_candidates), baro_guess)
+        ptp_limits_use_psia_scale(test_setup, {}, baro_guess)
         and _normalize_unit_label(units_label) in {'PSI', 'PSIA'}
     )
     if psia_scale_limits:
