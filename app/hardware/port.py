@@ -863,6 +863,7 @@ class PortManager:
         self._alicat_refresh_countdown: Dict[PortId, int] = {}
         self._precision_owner: Optional[PortId] = None
         self._labjack_sibling_countdown: Dict[PortId, int] = {}
+        self._serial_busy_ports: set[PortId] = set()
         self._last_poll_readings: Dict[PortId, PortReading] = {}
         self._hardware_ready = False
 
@@ -1156,6 +1157,21 @@ class PortManager:
                 port_id.value: int(self._alicat_poll_divisors.get(port_id, self._alicat_poll_divisor_normal))
                 for port_id in self.ports.keys()
             }
+
+    def set_serial_busy(self, port_id: PortId | str, busy: bool) -> None:
+        """Mark a port's Alicat serial as owned by a worker (vent/pressurize/test).
+
+        Background Alicat refresh skips busy ports so the GUI never contends for
+        the COM lock and stays responsive.
+        """
+        normalized = self._normalize_port_id(port_id)
+        if normalized is None:
+            return
+        with self._poll_policy_lock:
+            if busy:
+                self._serial_busy_ports.add(normalized)
+            else:
+                self._serial_busy_ports.discard(normalized)
     
     def start_polling(self) -> bool:
         """Enable hardware reads (polled on the Qt GUI thread via poll_once)."""
@@ -1181,6 +1197,8 @@ class PortManager:
             if self._poll_thread:
                 self._poll_thread.join(timeout=1.0)
                 self._poll_thread = None
+        with self._poll_policy_lock:
+            self._serial_busy_ports.clear()
         logger.info("PortManager: Stopped polling")
 
     def _start_alicat_background_polling(self) -> bool:
@@ -1230,6 +1248,9 @@ class PortManager:
             for port_id, port in list(self.ports.items()):
                 if self._alicat_background_stop.is_set():
                     break
+                with self._poll_policy_lock:
+                    if port_id in self._serial_busy_ports:
+                        continue
                 ok = False
                 try:
                     ok = bool(port.refresh_alicat())
@@ -1322,6 +1343,8 @@ class PortManager:
             for port_id, port in self.ports.items():
                 should_refresh = False
                 with self._poll_policy_lock:
+                    if port_id in self._serial_busy_ports:
+                        continue
                     remaining = int(self._alicat_refresh_countdown.get(port_id, 0))
                     if remaining <= 0:
                         should_refresh = True

@@ -46,7 +46,7 @@ hardware:
       switch_active_low: true
       solenoid_dio: 18
   alicat:
-    baudrate: 19200
+    baudrate: 115200
     timeout_s: 0.05
     auto_tare_on_connect: true
     auto_tare_max_delta_psi: 0.5
