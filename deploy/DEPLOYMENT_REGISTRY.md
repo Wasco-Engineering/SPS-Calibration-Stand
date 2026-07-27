@@ -29,13 +29,13 @@ Set env vars once per PC (`scripts/deploy_set_stand_env.ps1`).
 |-------|--------|
 | **Hostname** | `CA-MAN-SPS-02` |
 | **Stand ID** | `STINGER_01` |
-| **Equipment ID** | `STINGER_01` |
+| **Equipment ID** | `CA-SPS-02` (detail rows `CA-SPS-02-L` / `CA-SPS-02-R`) |
 | **Role** | Reference stand — transducers + Mensor on port_b tee |
-| **Local config dir** | `%LOCALAPPDATA%\Stinger\STINGER_01\` |
-| **Stinger config** | `%LOCALAPPDATA%\Stinger\STINGER_01\stinger_config.yaml` |
-| **Quality Cal config** | `%LOCALAPPDATA%\Stinger\STINGER_01\quality_cal_config.yaml` |
-| **Logs** | `%LOCALAPPDATA%\Stinger\STINGER_01\logs\` |
-| **Repo dev copy** | `C:\Stinger` |
+| **Local config dir** | `C:\Stinger` |
+| **Stinger config** | `C:\Stinger\stinger_config.yaml` |
+| **Quality Cal config** | `C:\Stinger\quality_cal_config.yaml` |
+| **Logs** | `C:\Stinger\logs\` |
+| **Repo / install** | `C:\Stinger` |
 | **Desktop EXEs (Engineer)** | `%USERPROFILE%\Desktop\Stinger\` |
 | **Desktop EXEs (CalibrationUser)** | `C:\Users\CalibrationUser\Desktop\Stinger\` (install via elevated `deploy_install_desktop.ps1`) |
 | **Z: release bin** | `Z:\Engineering\Program Builds\Python Builds\Stinger\bin\` |
@@ -50,13 +50,14 @@ Set env vars once per PC (`scripts/deploy_set_stand_env.ps1`).
 | Mensor | `COM4` @ 57600 (port_b tee) |
 | Transducers | **Installed** — Port A AIN2/3, Port B AIN0/1, 0–30 PSIA abs |
 | Solenoids | Port A **DIO19**, Port B **DIO18** |
-| Measurement | `auto`, `transducer_only_below_psi: 20`, Mensor-based `transducer_error_model` on both ports |
+| Measurement | `auto`, pivot at 5 psi; shared-line Alicat background poll 140 Hz |
+| Timing note | More aggressive than STINGER_03/04 (`alicat_poll_divisor_normal: 5` + background 140 Hz). Older stands use divisor 14 and often no background poller. |
 
-**Env (User):**
+**Env (User/Machine):**
 
 ```powershell
 STINGER_STAND_ID=STINGER_01
-STINGER_CONFIG_DIR=%LOCALAPPDATA%\Stinger\STINGER_01
+STINGER_CONFIG_DIR=C:\Stinger
 ```
 
 ---

@@ -6,7 +6,7 @@ shared_bin_dir: 'Z:\Engineering\Program Builds\Python Builds\Stinger\bin'
 computers:
   - hostname: CA-MAN-SPS-02
     stand_id: STINGER_01
-    equipment_id: STINGER_01
+    equipment_id: CA-SPS-02
     role: reference_stand
     local_config_dir: 'C:\Stinger'
     stinger_config: 'C:\Stinger\stinger_config.yaml'
@@ -31,11 +31,13 @@ computers:
       solenoids: { port_a_dio: 19, port_b_dio: 18 }
       measurement:
         preferred_source: auto
-        transducer_only_below_psi: 20.0
-        alicat_only_above_psi: 31.0
+        transducer_only_below_psi: 5.0
+        alicat_only_above_psi: 5.0
     notes: >
-      Fitted transducer_error_model on local stinger_config.yaml (Quality Cal).
-      Desktop EXEs installed via deploy_build_and_install.ps1.
+      DB EquipmentID base CA-SPS-02 (detail CA-SPS-02-L/R).
+      Shared-line Alicat background polling 140 Hz; fitted transducer/alicat
+      error models from 2026-07 shared-line correlation. Desktop EXEs via
+      deploy_build_and_install.ps1.
 
   - hostname: TBD_STAND2_PC
     stand_id: STINGER_02

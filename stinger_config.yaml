@@ -181,7 +181,7 @@ ui:
     show_acceptance_bands: true
     show_measured_points: true
 test_parameters:
-  equipment_id: CA-SPS-01
+  equipment_id: CA-SPS-02
   default_temperature_c: 25.0
   max_attempts: 3
 custom_work_orders:
