@@ -73,8 +73,13 @@ class MainWindow(QMainWindow):
     _TAB_DEBUG = 1
     _TAB_ADMIN = 2
 
-    def __init__(self, config: Dict[str, Any], ui_bridge: Optional['UIBridge'] = None):
-
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        ui_bridge: Optional['UIBridge'] = None,
+        *,
+        skip_login: bool = False,
+    ):
         """
         Initialize the main window.
         
@@ -123,7 +128,8 @@ class MainWindow(QMainWindow):
 
         if self._ui_bridge is not None:
             self._connect_ui_bridge()
-            QTimer.singleShot(0, self._show_login_dialog)
+            if not skip_login:
+                QTimer.singleShot(0, self._show_login_dialog)
 
 
         
@@ -1446,6 +1452,23 @@ class MainWindow(QMainWindow):
         super().resizeEvent(a0)
         if self._overlay_widget is not None and self._overlay_widget.isVisible():
             self._overlay_widget.setGeometry(self.rect())
+
+    def enter_dev_session(self) -> None:
+        """Skip the login dialog and load the built-in dev/test work order."""
+        custom = self.config.get('custom_work_orders', {})
+        dev_key = next(iter(custom), None) if custom else None
+        dev_wo = custom.get(dev_key, {}) if dev_key else {}
+        payload = {
+            'shop_order': dev_key or 'dev',
+            'part_id': dev_wo.get('part_id', 'SPS00000'),
+            'sequence_id': str(dev_wo.get('sequence_id', '300')),
+            'order_qty': dev_wo.get('order_qty', 1),
+            'operator_id': 'DEV',
+            'test_mode': True,
+            'TestMode': True,
+        }
+        logger.info('Entering dev session without login dialog: %s', payload)
+        self._on_login_successful(payload)
 
     def _on_login_successful(self, payload: Dict[str, Any]) -> None:
         if self._ui_bridge:
