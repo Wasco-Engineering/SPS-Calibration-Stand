@@ -499,21 +499,25 @@ class WorkOrderController(QObject):
         )
 
     def _initialize_hardware(self) -> None:
-        """Initialize hardware ports and start polling."""
+        """Initialize hardware ports and start polling.
+
+        Start polling before safe-idle vents so the UI is not stuck on
+        "Hardware Connecting..." while Alicats recover from vacuum/overpressure.
+        """
         init_start = time.perf_counter()
         ports_start = time.perf_counter()
         if not self._port_manager.initialize_ports():
             logger.error("Failed to initialize hardware ports")
             return
         logger.info('Hardware init: port objects initialized in %.3fs', time.perf_counter() - ports_start)
-        
+
         connect_start = time.perf_counter()
-        if not self._port_manager.connect_all():
+        if not self._port_manager.connect_all(safe_idle_on_connect=False):
             logger.warning("Some hardware connections failed, continuing anyway")
         logger.info('Hardware init: connect_all completed in %.3fs', time.perf_counter() - connect_start)
         self._sig_hw_status_refresh.emit()
-        
-        # Start polling loop
+
+        # Enable live polls before blocking safe-idle vents.
         poll_start = time.perf_counter()
         self._port_manager.start_polling()
         self._port_manager.set_alicat_poll_profile(None)
@@ -521,6 +525,13 @@ class WorkOrderController(QObject):
             'Hardware polling started in %.3fs (total hardware init %.3fs)',
             time.perf_counter() - poll_start,
             time.perf_counter() - init_start,
+        )
+
+        idle_start = time.perf_counter()
+        self._port_manager.safe_idle_connected_ports()
+        logger.info(
+            'Hardware init: safe idle completed in %.3fs',
+            time.perf_counter() - idle_start,
         )
 
     def _request_precision_slot(self, port_id: str) -> bool:
@@ -702,13 +713,19 @@ class WorkOrderController(QObject):
         if pressure_abs_psi is None or not math.isfinite(pressure_abs_psi):
             return
 
+        # Absolute PSI -> display units. Do NOT use _to_display_pressure here:
+        # that helper expects gauge PSI when reference is gauge and would add baro again.
         unit_label = self._ui_bridge.get_pressure_unit() if self._ui_bridge else setup.units_label or 'PSI'
-        pressure_display = self._to_display_pressure(
-            port_id,
-            float(pressure_abs_psi),
-            unit_label,
-            setup.pressure_reference,
+        baro = self._get_barometric_pressure(port_id)
+        pressure_display = to_display_pressure(
+            value_abs_psi=float(pressure_abs_psi),
+            unit_label=unit_label,
+            barometric_psi=baro,
+            pressure_reference=setup.pressure_reference,
         )
+        if pressure_display is None or not math.isfinite(float(pressure_display)):
+            return
+        pressure_display = float(pressure_display)
         current = self._max_test_pressure_display.get(port_id)
         if current is None or pressure_display > current:
             self._max_test_pressure_display[port_id] = pressure_display
@@ -820,24 +837,33 @@ class WorkOrderController(QObject):
         self._db_sync_worker = run_async(_sync, _on_done)
     
     def _on_logout_requested(self) -> None:
-        """Handle logout/end work order - reset all ports and clear work order data."""
+        """Handle logout/end work order - reset all ports and clear work order data.
+
+        When a test is still running, only cancel the executor and advance the
+        state machine. Do **not** call ``_vent_port`` on the GUI thread — that
+        blocks Qt for up to ~90s/port and races the executor's own safe vent
+        (Cancel already avoids this race).
+        """
         self._reset_precision_coordination()
-        # Cancel any running test executors and reset ports
         for port_id in ('port_a', 'port_b'):
-            # Cancel any running executor first
             executor = self._test_executors.get(port_id)
-            if executor and executor.is_running:
-                executor.request_cancel()
-            
-            # Vent the port hardware
-            self._vent_port(port_id)
-            
-            # Reset state machine to END state
             sm = self._state_machines.get(port_id)
+            if executor and executor.is_running:
+                logger.info(
+                    '%s: End work order — cancelling running test '
+                    '(executor will vent; skipping sync GUI vent)',
+                    port_id,
+                )
+                executor.request_cancel()
+                if sm:
+                    if not sm.trigger('end_work_order'):
+                        sm.trigger('cancel')
+                continue
+
+            self._vent_port(port_id)
             if sm:
-                # Trigger end_work_order which will vent and transition to END state
                 sm.trigger('end_work_order')
-        
+
         # Clear work order data
         self._current_test_setup = None
         self._base_viz = None
@@ -851,7 +877,7 @@ class WorkOrderController(QObject):
         self._ui_bridge.set_work_order({})
         self._ui_bridge.update_progress(0, 0, 0, 0)
         self._ui_bridge.update_ptp_details({})
-        
+
         # Release serial numbers
         self._ui_bridge.release_serial('port_a')
         self._ui_bridge.release_serial('port_b')
@@ -990,7 +1016,7 @@ class WorkOrderController(QObject):
             for port_id in [PortId.PORT_A, PortId.PORT_B]:
                 port = self._port_manager.get_port(port_id)
                 if port:
-                    ok = port.alicat.configure_units_from_ptp(units_code)
+                    ok = port.alicat.configure_units_from_ptp_prefer_psi(units_code)
                     if not ok:
                         logger.warning(
                             'Alicat units verify failed during login for %s (requested code=%s)',
@@ -1838,6 +1864,17 @@ class WorkOrderController(QObject):
             return target
         # Decreasing switches actuate while pressure falls, so manual
         # pressurize must first move above the reset/deactivation side.
+        if ptp_limits_use_psia_scale(setup, {}, atmosphere_psi):
+            # Deep vacuum PTP bands are absolute-scale (e.g. 75/145 mmHg).
+            # Staging at max+120 Torr (~265 mmHg) is far above a 75 switch
+            # working range; sit just above the high band toward atmosphere.
+            band_overshoot = min(
+                overshoot_psi,
+                convert_pressure(40.0, 'Torr', 'PSI'),
+            )
+            target = max_psi + band_overshoot
+            atmosphere_margin = convert_pressure(10.0, 'Torr', 'PSI')
+            return min(target, max(0.0, atmosphere_psi - atmosphere_margin))
         return max(activation_psi, max_psi) + overshoot_psi
 
     # ------------------------------------------------------------------
@@ -2906,9 +2943,10 @@ class WorkOrderController(QObject):
         self._reset_precision_coordination()
         self._port_manager.stop_polling()
         self._port_manager.disconnect_all()
-        connected = self._port_manager.connect_all()
+        connected = self._port_manager.connect_all(safe_idle_on_connect=False)
         self._port_manager.start_polling()
         self._port_manager.set_alicat_poll_profile(None)
+        self._port_manager.safe_idle_connected_ports()
         self._refresh_hardware_status()
         level = self._ui_bridge.show_info_message if connected else self._ui_bridge.show_error_message
         level('Admin', 'Hardware reconnect completed.' if connected else 'Hardware reconnect completed with failures.')

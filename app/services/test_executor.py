@@ -1279,15 +1279,23 @@ class TestExecutor:
         for edge in get_history()[port_edges_before:]:
             if not self._cycle_edge_switch_state_allowed(edge_type, bool(edge.activated)):
                 continue
-            pressure_test: Optional[float] = None
-            reading = self._get_latest_reading(self._port_id)
-            if reading is not None:
-                pressure_test = self._reading_pressure_test_psi(reading)
+            # Use the pressure stamped on the edge itself. Latest live pressure can
+            # already be deep into the band by the time we notice a high-P bounce,
+            # which would incorrectly pass the PTP window check.
+            pressure_test = self._absolute_to_test_reference(float(edge.pressure))
             if pressure_test is None or not math.isfinite(pressure_test):
-                pressure_test = self._absolute_to_test_reference(edge.pressure)
-            if not math.isfinite(pressure_test):
+                reading = self._get_latest_reading(self._port_id)
+                if reading is not None:
+                    pressure_test = self._reading_pressure_test_psi(reading)
+            if pressure_test is None or not math.isfinite(pressure_test):
                 continue
             if not self._cycle_edge_pressure_allowed(edge_type, pressure_test):
+                logger.debug(
+                    '%s: ignoring port %s edge at %.4f PSI (outside traverse window)',
+                    self._port_id,
+                    edge_type,
+                    pressure_test,
+                )
                 continue
             self._cycle_observed_edge_states[edge_type] = bool(edge.activated)
             samples_list.append(pressure_test)
@@ -1867,6 +1875,55 @@ class TestExecutor:
             self._seed_debounce_from_live_reading()
             self._cycle_prep_confirmed = True
             return
+
+        if edge_type == 'activation' and pressure is not None and math.isfinite(pressure):
+            starts_before_edge = (
+                (direction > 0 and pressure <= min_psi)
+                or (direction < 0 and pressure >= max_psi)
+            )
+            prep_state = not self._cycle_target_switch_state(edge_type)
+            # Decreasing vacuum already on the high-pressure/reset side must not
+            # nudge *down* toward the band just because the DI looks activated
+            # (open fittings / floating sense). Rely on the activation ramp edge.
+            if (
+                starts_before_edge
+                and direction < 0
+                and self._resolve_sweep_mode() == 'vacuum'
+            ):
+                reading = self._get_latest_reading(self._port_id)
+                if reading is not None and reading.switch is not None:
+                    self._cycle_debounce_state = self._spdt_debounce_from_switch(reading.switch)
+                else:
+                    self._cycle_debounce_state = SpdtDebounceState()
+                if switch_state != prep_state:
+                    logger.warning(
+                        '%s: Switch looks %s at %.4f PSI on vacuum reset side; '
+                        'skipping prep (will wait for activation edge while ramping)',
+                        self._port_id,
+                        'activated' if switch_state else 'deactivated',
+                        pressure,
+                    )
+                else:
+                    logger.info(
+                        '%s: Cycle prep skipped for %s leg; pressure %.4f PSI is already before edge band',
+                        self._port_id,
+                        edge_type,
+                        pressure,
+                    )
+                return
+            if starts_before_edge and switch_state == prep_state:
+                reading = self._get_latest_reading(self._port_id)
+                if reading is not None and reading.switch is not None:
+                    self._cycle_debounce_state = self._spdt_debounce_from_switch(reading.switch)
+                else:
+                    self._cycle_debounce_state = SpdtDebounceState()
+                logger.info(
+                    '%s: Cycle prep skipped for %s leg; pressure %.4f PSI is already before edge band',
+                    self._port_id,
+                    edge_type,
+                    pressure,
+                )
+                return
 
         if (
             edge_type == 'deactivation'
@@ -3101,26 +3158,28 @@ class TestExecutor:
 
     def _vacuum_switch_trips_on_no_open(self) -> bool:
         port_cfg = self._config.get('hardware', {}).get('labjack', {}).get(self._port_id, {})
-        # PTP resolution can change which physical contact the single sensed
-        # DB9 pin represents from part to part. Prefer the live resolved mode;
-        # the port-level knob is only a fallback/default when no PTP-derived
-        # single-sense mode has been applied yet.
         daq = getattr(self._port, 'daq', None)
-        if daq is not None:
-            derived_from_no = bool(getattr(daq, 'switch_nc_derived_from_no', False))
-            if derived_from_no:
-                return True
-            derived_from_nc = bool(getattr(daq, 'switch_no_derived_from_nc', False))
-            if derived_from_nc:
-                return False
+        # PTP single-wire mode encodes historical COM-LOW trip polarity:
+        #   derive_nc_from_no -> trip opens NO -> activated False (vacuum_no_open True)
+        #   derive_no_from_nc -> trip opens NC -> activated True  (vacuum_no_open False)
+        # Stand config is only a fallback when PTP did not select a derive mode.
+        if daq is not None and bool(getattr(daq, 'switch_nc_derived_from_no', False)):
+            base = True
+        elif daq is not None and bool(getattr(daq, 'switch_no_derived_from_nc', False)):
+            base = False
+        elif 'vacuum_switch_trips_on_no_open' in port_cfg:
+            base = _config_bool(port_cfg.get('vacuum_switch_trips_on_no_open'))
+        else:
+            # Single-wire fallback: derive NC from NO / trip opens NO.
+            base = _config_bool(port_cfg.get('switch_nc_derived_from_no'))
 
-        if 'vacuum_switch_trips_on_no_open' in port_cfg:
-            return _config_bool(port_cfg.get('vacuum_switch_trips_on_no_open'))
-
-        # Single-wire switch sensing derives NC from NO. On the current vacuum
-        # bench wiring, the trip opens NO; default that way when the more
-        # explicit knob is missing so activation/deactivation are not inverted.
-        return _config_bool(port_cfg.get('switch_nc_derived_from_no'))
+        # COM driven HIGH + active_low inverts open-contact -> activated mapping
+        # relative to those COM-LOW defaults (STINGER_03 bench wiring).
+        com_high = daq is not None and int(getattr(daq, 'switch_com_state', 0) or 0) == 1
+        active_low = daq is not None and bool(getattr(daq, 'switch_active_low', False))
+        if com_high and active_low:
+            return not base
+        return base
 
     def _cycle_target_switch_state(self, edge_type: str) -> bool:
         """``switch_activated`` value that means this cycle edge (vacuum bench may invert)."""
@@ -3511,12 +3570,17 @@ class TestExecutor:
             logger.error('%s: Failed to vent: %s', self._port_id, exc)
 
     def _ensure_alicat_units(self) -> None:
-        """Best-effort sync of Alicat display units with current test setup."""
+        """Best-effort sync of Alicat display units with current test setup.
+
+        Keep the Alicat in PSI for mmHg/Torr PTP codes. Driving the controller
+        in mmHg and converting every sample introduces avoidable round-trip
+        error; the UI still displays PTP units.
+        """
         units_code = self._test_setup.units_code if self._test_setup else None
         if not units_code:
             return
         try:
-            ok = self._port.alicat.configure_units_from_ptp(units_code)
+            ok = self._port.alicat.configure_units_from_ptp_prefer_psi(units_code)
             if not ok:
                 logger.warning(
                     '%s: Alicat units verify failed (requested code=%s); continuing with current controller units',

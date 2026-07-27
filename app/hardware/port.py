@@ -981,25 +981,29 @@ class PortManager:
         )
 
         if safe_idle_on_connect:
-            for port_id, port in self.ports.items():
-                try:
-                    port.refresh_alicat()
-                    if port.is_at_atmospheric_idle():
-                        logger.info(
-                            'PortManager: %s already at atmospheric idle on connect',
-                            port_id.value,
-                        )
-                        continue
-                    port.vent_to_atmosphere()
-                    logger.info('PortManager: %s safe idle (atmosphere hold)', port_id.value)
-                except Exception as exc:
-                    logger.warning(
-                        'PortManager: %s safe idle vent on connect failed: %s',
-                        port_id.value,
-                        exc,
-                    )
+            self.safe_idle_connected_ports()
 
         return success
+
+    def safe_idle_connected_ports(self) -> None:
+        """Vent connected ports to atmospheric idle after connect/polling is live."""
+        for port_id, port in self.ports.items():
+            try:
+                port.refresh_alicat()
+                if port.is_at_atmospheric_idle():
+                    logger.info(
+                        'PortManager: %s already at atmospheric idle on connect',
+                        port_id.value,
+                    )
+                    continue
+                port.vent_to_atmosphere()
+                logger.info('PortManager: %s safe idle (atmosphere hold)', port_id.value)
+            except Exception as exc:
+                logger.warning(
+                    'PortManager: %s safe idle vent on connect failed: %s',
+                    port_id.value,
+                    exc,
+                )
 
     def _discover_alicat_port(self, port: Port) -> Optional[str]:
         """Scan available serial ports for a responding Alicat at the expected address."""
