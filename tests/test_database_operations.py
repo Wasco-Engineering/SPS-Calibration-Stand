@@ -159,6 +159,64 @@ def test_validate_shop_order_uses_detail_sequence_when_exact_master_missing(monk
     assert result['SequenceID'] == '300'
 
 
+def test_prefer_sps_entry_sequence_overrides_600_when_300_ptp_exists(monkeypatch) -> None:
+    monkeypatch.setattr(
+        operations,
+        '_ptp_sequence_available',
+        lambda part_id, sequence_id: sequence_id == '300',
+    )
+    assert operations.prefer_sps_entry_sequence('SPS01438-02', '600') == '300'
+    assert operations.prefer_sps_entry_sequence('SPS01438-02', '650') == '300'
+    assert operations.prefer_sps_entry_sequence('SPS01438-02', '') == '300'
+
+
+def test_prefer_sps_entry_sequence_keeps_non_sps_and_keeps_300(monkeypatch) -> None:
+    monkeypatch.setattr(operations, '_ptp_sequence_available', lambda *_args: True)
+    assert operations.prefer_sps_entry_sequence('CERBERUS-575T-SEI', '600') == '600'
+    assert operations.prefer_sps_entry_sequence('SPS01438-02', '300') == '300'
+    assert operations.prefer_sps_entry_sequence('SPS01438-02', '399') == '399'
+
+
+def test_prefer_sps_entry_sequence_keeps_600_when_no_300_ptp(monkeypatch) -> None:
+    monkeypatch.setattr(operations, '_ptp_sequence_available', lambda *_args: False)
+    assert operations.prefer_sps_entry_sequence('SPS01438-02', '600') == '600'
+
+
+def test_validate_shop_order_prefers_300_over_master_600_for_sps(monkeypatch) -> None:
+    monkeypatch.setattr(
+        operations,
+        'lookup_shop_order',
+        lambda _shop_order: {
+            'ShopOrder': '51036214',
+            'PartID': 'SPS01438-02',
+            'SequenceID': '',
+            'OrderQTY': 10,
+            'OrderQty': 10,
+        },
+    )
+    monkeypatch.setattr(
+        operations,
+        'lookup_work_order_master',
+        lambda *_args, **_kwargs: {
+            'ShopOrder': '51036214',
+            'PartID': 'SPS01438-02',
+            'SequenceID': '600',
+            'LastSequenceCalibrated': '600',
+        },
+    )
+    monkeypatch.setattr(
+        operations,
+        '_ptp_sequence_available',
+        lambda part_id, sequence_id: sequence_id == '300',
+    )
+    monkeypatch.setattr(operations.local_cache, 'upsert_master', lambda *_args, **_kwargs: None)
+
+    result = operations.validate_shop_order('51036214')
+
+    assert result is not None
+    assert result['SequenceID'] == '300'
+
+
 def test_validate_shop_order_does_not_use_master_when_max_says_missing(monkeypatch) -> None:
     monkeypatch.setattr(operations, 'lookup_shop_order', lambda _shop_order: None)
 
