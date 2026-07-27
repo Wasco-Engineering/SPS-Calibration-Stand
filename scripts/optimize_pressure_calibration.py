@@ -113,7 +113,9 @@ def _load_samples(paths: Sequence[Path], port_id: str) -> List[CalibrationSample
                     mensor_abs_psia=_parse_mensor(row),
                 )
                 idx += 1
-                if sample.transducer_abs_psi is None or sample.alicat_abs_psi is None:
+                # Transducer is optional (open-fitting / SPS stands omit it).
+                # Keep rows that have Alicat data so Alicat-vs-Mensor fits still run.
+                if sample.alicat_abs_psi is None:
                     continue
                 samples.append(sample)
     if not samples:

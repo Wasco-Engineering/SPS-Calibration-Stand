@@ -8,6 +8,8 @@ hardware:
     connection_type: "USB"
     identifier: "ANY"
     resolution_index: 9
+    # Match stinger_config / site altitude (Idaho ~13.5 PSIA). Do not use sea-level 14.7.
+    local_barometric_psi: 13.49
     # EMA on transducer for stable UI/settle; sweep CSV still logs raw via pressure_raw.
     pressure_filter_alpha: 0.35
     # Druck UNIK 5000 PMP50D6-* sensors are amplified 0-10 V, 4-wire units.
@@ -46,7 +48,7 @@ hardware:
       switch_active_low: true
       solenoid_dio: 18
   alicat:
-    baudrate: 19200
+    baudrate: 115200
     timeout_s: 0.05
     auto_tare_on_connect: true
     auto_tare_max_delta_psi: 0.5
@@ -115,8 +117,8 @@ quality:
   hardware_discovery:
     enable_serial_auto_discovery: true
     preferred_serial_ports:
-      - "COM4"
       - "COM3"
+      - "COM4"
   pressure_schedule:
     start_psia: 0.0
     dense_up_to_psia: 20.0

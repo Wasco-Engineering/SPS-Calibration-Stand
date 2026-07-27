@@ -1,7 +1,7 @@
 ﻿{
-    "build_timestamp_utc":  "2026-07-23T15:25:22.6984252Z",
+    "build_timestamp_utc":  "2026-07-24T19:15:12.0043035Z",
     "hostname":  "ID-MAN-SPS-01",
-    "stand_id":  "STINGER_03",
+    "stand_id":  "ID-SPS-01",
     "install_root":  "C:\\Stinger",
     "config_dir":  "C:\\Stinger",
     "artifacts":  [

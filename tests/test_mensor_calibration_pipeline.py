@@ -68,6 +68,45 @@ def test_triplet_to_alignment_conversion() -> None:
         assert rows[0]['phase'] == 'static_10'
 
 
+def test_load_samples_allows_missing_transducer() -> None:
+    """Open-fitting / SPS stands omit transducer columns; Alicat+Mensor must still load."""
+    with tempfile.TemporaryDirectory() as tmp:
+        csv_path = Path(tmp) / 'alignment.csv'
+        with csv_path.open('w', newline='', encoding='utf-8') as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    'timestamp',
+                    'port_id',
+                    'phase',
+                    'target_abs_psi',
+                    'transducer_abs_psi',
+                    'transducer_raw_abs_psi',
+                    'alicat_abs_psi',
+                    'mensor_abs_psia',
+                ],
+            )
+            writer.writeheader()
+            for i in range(5):
+                writer.writerow(
+                    {
+                        'timestamp': str(i),
+                        'port_id': 'port_a',
+                        'phase': 'static_8',
+                        'target_abs_psi': '8.0',
+                        'transducer_abs_psi': '',
+                        'transducer_raw_abs_psi': '',
+                        'alicat_abs_psi': '7.97',
+                        'mensor_abs_psia': '8.00',
+                    }
+                )
+        samples = _load_samples([csv_path], 'port_a')
+        assert len(samples) == 5
+        assert all(s.transducer_abs_psi is None for s in samples)
+        assert all(s.alicat_abs_psi == pytest.approx(7.97) for s in samples)
+        assert all(s.mensor_abs_psia == pytest.approx(8.0) for s in samples)
+
+
 def test_mensor_optimizer_passes_1_torr_on_synthetic_data() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         csv_path = Path(tmp) / 'alignment.csv'

@@ -494,6 +494,11 @@ class Port:
         current = self._alicat_abs_psia(reading, barometric_psia)
         if current is None:
             return False
+        # Stale sea-level setpoints (14.7) with HLD trap the line off true site
+        # baro on open fittings — treat as not idle so vent re-locks to local baro.
+        setpoint = reading.alicat.setpoint if reading.alicat is not None else None
+        if setpoint is not None and abs(float(setpoint) - float(barometric_psia)) > 0.25:
+            return False
         # Held closed near local baro (common on open fittings at altitude).
         if self._alicat_in_hold_mode():
             from app.services.pressure_domain import is_plausible_barometric_psi
@@ -615,8 +620,18 @@ class Port:
         if in_exh:
             self._exit_alicat_exhaust(barometric_psia)
 
-        need_pressure_command = command_pressure and (in_exh or not in_band)
+        setpoint = reading.alicat.setpoint if reading.alicat is not None else None
+        setpoint_mismatch = (
+            setpoint is None
+            or abs(float(setpoint) - float(barometric_psia)) > 0.25
+        )
+        # Always re-command site baro when SP is stale (e.g. leftover 14.7), even
+        # if measured pressure already sits near local atmosphere.
+        need_pressure_command = command_pressure and (
+            in_exh or not in_band or setpoint_mismatch
+        )
         if need_pressure_command:
+            self.alicat.cancel_hold()
             self.alicat.set_ramp_rate(8.0)
             if not self.set_pressure(barometric_psia):
                 logger.warning(
@@ -668,11 +683,10 @@ class Port:
         clean shutdown), this is a no-op so operators do not see ports
         pressurize or pull vacuum on application startup.
         """
-        barometric_psia = _ATMOSPHERE_PSI
-        try:
-            barometric_psia = self._infer_barometric_psia()
-        except Exception:
-            pass
+        # Always target configured site baro (e.g. 13.49 Idaho). Inferring from
+        # Alicat P−gauge / short frames recreates sea-level ~14.7 and parks the
+        # HLD line above true atmosphere on open-fitting stands.
+        barometric_psia = self._configured_barometric_psia()
 
         if self.is_at_atmospheric_idle(barometric_psia):
             reading = self.read_all()
@@ -694,13 +708,16 @@ class Port:
         )
         if current is not None and low_threshold <= current <= high_threshold:
             logger.info(
-                '%s: Near atmosphere (%.2f psia) — gentle idle lock only',
+                '%s: Near atmosphere (%.2f psia) — idle lock to site baro %.2f',
                 self.port_id.value,
                 current,
+                barometric_psia,
             )
+            # command_pressure=True so a stale 14.7 setpoint is rewritten to
+            # local_barometric_psi even when P already looks near atm.
             return self._lock_idle_at_atmosphere(
                 barometric_psia,
-                command_pressure=False,
+                command_pressure=True,
             )
 
         if bleed_installed_dut:
@@ -724,43 +741,17 @@ class Port:
         bleed_installed_dut: bool = True,
         timeout_s: float = _IDLE_BLEED_TIMEOUT_S,
     ) -> bool:
-        """Vent with Alicat EXH and leave EXH active at atmospheric pressure."""
-        del bleed_installed_dut  # Retained for compatibility with existing callers.
-        barometric_psia = _ATMOSPHERE_PSI
-        try:
-            barometric_psia = self._infer_barometric_psia()
-        except Exception:
-            pass
+        """Vent the port to atmosphere (safe idle).
 
-        if self.is_at_atmospheric_idle(barometric_psia):
-            return True
-        if not self.daq.set_solenoid_safe():
-            logger.warning('%s: Failed to engage atmosphere route for EXH vent', self.port_id.value)
-            return False
-        self.daq.reset_filter()
-        if not self.alicat.exhaust():
-            logger.warning('%s: Failed to enable Alicat EXH', self.port_id.value)
-            return False
-
-        tolerance = _IDLE_ATMOSPHERE_TOLERANCE_PSIA if self._open_fitting_line() else 2.0
-        deadline = time.perf_counter() + max(0.5, timeout_s)
-        current: Optional[float] = None
-        while time.perf_counter() < deadline:
-            reading = self.read_all()
-            current = self._alicat_abs_psia(reading, barometric_psia)
-            if current is not None and abs(current - barometric_psia) <= tolerance:
-                logger.info('%s: EXH vent complete at %.2f psia', self.port_id.value, current)
-                return True
-            time.sleep(0.25)
-
-        logger.warning(
-            '%s: EXH vent timed out (P=%.2f psia, target=%.2f psia)',
-            self.port_id.value,
-            current if current is not None else float('nan'),
-            barometric_psia,
+        Prefer closed-loop setpoint recovery. On this Idaho stand Alicat EXH is
+        plumbed to vacuum and never equalizes to baro — using EXH as the primary
+        vent path hung QualityCal/connect for ~90s and left the controller at
+        ~0 PSIA. Setpoint bleed/lock recovers in a couple of seconds.
+        """
+        return self._vent_to_atmosphere_via_setpoint(
+            bleed_installed_dut=bleed_installed_dut,
+            timeout_s=timeout_s,
         )
-        # Leave EXH enabled on a timeout; closing the valve could trap pressure.
-        return False
 
     def prepare_vacuum_route_for_test(self, barometric_psi: float = _ATMOSPHERE_PSI) -> bool:
         """Vent on atmosphere, then route to vacuum for test cycling (transducer-guarded)."""

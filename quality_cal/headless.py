@@ -313,11 +313,17 @@ def main(argv: list[str] | None = None) -> int:
             if fit.overall_passed:
                 logger.info('Correction fit passed on attempt %s', attempt)
                 break
+            def _fit_status(sensor_fit) -> str:
+                if sensor_fit is None:
+                    return 'n/a'
+                return 'PASS' if sensor_fit.passed else 'FAIL'
+
             logger.warning(
-                'Correction fit did not pass on attempt %s (transducer=%s alicat=%s)',
+                'Correction fit did not pass on attempt %s (transducer=%s alicat=%s)%s',
                 attempt,
-                'PASS' if fit.transducer and fit.transducer.passed else 'FAIL',
-                'PASS' if fit.alicat and fit.alicat.passed else 'FAIL',
+                _fit_status(fit.transducer),
+                _fit_status(fit.alicat),
+                f' error={fit.error_message}' if fit.error_message else '',
             )
 
         if fit is None or sweep_path is None:
@@ -406,6 +412,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     finally:
         if session_hw is not None:
+            logger.info('Venting all ports to atmosphere before disconnect...')
+            for port_id in ('port_a', 'port_b'):
+                other = session_hw.get_port(port_id)
+                if other is not None:
+                    safe_shutdown_port(other)
             logger.info('Disconnecting hardware...')
             session_hw.cleanup()
 

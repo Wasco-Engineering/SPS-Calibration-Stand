@@ -638,6 +638,11 @@ class PrecisionPhaseRunner:
         Cycling / fast approach leave the Alicat at a high ramp rate. Starting
         the precision out-sweep immediately overshoots the trip and makes
         activation/deactivation look inconsistent run-to-run.
+
+        On vacuum routes the fast approach can keep pulling through the pause
+        (~40 Torr freefall) while the setpoint sits at approach. Recover to a
+        tight band at the slow rate, then briefly freeze the valve so the
+        handoff into the out-sweep cannot inherit that dump.
         """
         self._ctx._emit_substate('precision.approach_settle')
         approach_abs = self._ctx._to_absolute(approach_target)
@@ -647,25 +652,44 @@ class PrecisionPhaseRunner:
                 f'Failed to set precision settle ramp rate for {self._ctx._port_id}',
             )
         self._ctx._set_pressure_or_raise(approach_abs)
-        self._ctx._port.alicat.cancel_hold()
         settle_s = max(0.5, self._ctx._precision_approach_settle_s)
+        # Tighter than the general approach tol so a freefall through trip
+        # cannot count as a completed settle dwell.
+        settle_tol = min(self._ctx._precision_approach_tolerance_psi, 0.05)
         logger.info(
-            '%s: Precision approach settle target=%.4f PSI rate=%.4f psi/s hold=%.2fs',
+            '%s: Precision approach settle target=%.4f PSI rate=%.4f psi/s hold=%.2fs tol=%.4f',
             self._ctx._port_id,
             approach_target,
             self._ctx._slow_edge_rate_psi,
             settle_s,
+            settle_tol,
         )
-        if self._ctx._wait_until_near_target(
+        if not self._ctx._wait_until_near_target(
             target_psi=approach_target,
-            timeout_s=min(self._ctx._edge_timeout_s, 20.0),
-            tolerance_psi=self._ctx._precision_approach_tolerance_psi,
+            timeout_s=min(self._ctx._edge_timeout_s, 25.0),
+            tolerance_psi=settle_tol,
             settle_s=settle_s,
         ):
+            pressure, _switch = self._ctx._read_pressure_and_switch_state()
+            logger.warning(
+                '%s: Precision approach settle timed out (pressure=%s target=%.4f); continuing',
+                self._ctx._port_id,
+                f'{pressure:.4f} PSI' if pressure is not None else '--',
+                approach_target,
+            )
+
+        # Freeze valve position for a short beat so residual vacuum pull cannot
+        # dump the line between settle and out-sweep arming.
+        if not self._ctx._port.alicat.hold_valve(closed=False):
+            logger.warning(
+                '%s: Precision settle hold failed — continuing without valve freeze',
+                self._ctx._port_id,
+            )
             return
+        time.sleep(0.12)
         pressure, _switch = self._ctx._read_pressure_and_switch_state()
-        logger.warning(
-            '%s: Precision approach settle timed out (pressure=%s target=%.4f); continuing',
+        logger.info(
+            '%s: Precision approach locked for handoff pressure=%s target=%.4f',
             self._ctx._port_id,
             f'{pressure:.4f} PSI' if pressure is not None else '--',
             approach_target,
@@ -734,6 +758,29 @@ class PrecisionPhaseRunner:
             approach_target,
         )
         self._ctx._set_active_test_route(sweep_mode, 'precision fast approach')
+
+        # Brake band: slow down before the final approach so vacuum momentum
+        # cannot freefall ~40 Torr through the trip during the settle pause.
+        brake_tol = max(0.35, self._ctx._precision_approach_tolerance_psi * 2.5)
+        self._ctx._wait_until_near_target(
+            target_psi=approach_target,
+            timeout_s=min(self._ctx._edge_timeout_s, 30.0),
+            tolerance_psi=brake_tol,
+            settle_s=0.0,
+        )
+        if not self._ctx._port.alicat.set_ramp_rate(self._ctx._slow_edge_rate_psi):
+            self._ctx._fail(
+                TestFailureCode.RAMP_RATE_FAILURE,
+                f'Failed to brake precision approach ramp rate for {self._ctx._port_id}',
+            )
+        self._ctx._set_pressure_or_raise(approach_target_abs)
+        logger.info(
+            '%s: Precision approach brake rate=%.4f psi/s band=%.4f PSI',
+            self._ctx._port_id,
+            self._ctx._slow_edge_rate_psi,
+            brake_tol,
+        )
+
         arrived = self._ctx._wait_until_near_target(
             target_psi=approach_target,
             timeout_s=min(self._ctx._edge_timeout_s, 30.0),

@@ -23,6 +23,7 @@ from quality_cal.core.hardware_helpers import (
     alicat_abs_psia,
     command_target_pressure,
     infer_barometric_psia,
+    port_configured_barometric_psia,
     prepare_port_for_target,
     safe_shutdown_port,
     settle_timeout_for_target,
@@ -321,7 +322,7 @@ class CalibrationRunner(QObject):
     def run(self) -> None:
         results: list[CalibrationPointResult] = []
         points = self._settings.pressure_points_psia
-        last_barometric = 14.7
+        last_barometric = port_configured_barometric_psia(self._port)
         sweep: Optional[_SweepCsvWriter] = None
         sweep_path: Optional[Path] = None
 
@@ -476,7 +477,10 @@ class CalibrationRunner(QObject):
             self.failed.emit(f'Point index {point_index} out of range 1..{len(points)}')
             return
         target_psia = points[point_index - 1]
-        last_barometric = infer_barometric_psia(self._port.read_all()) or 14.7
+        last_barometric = infer_barometric_psia(
+            self._port.read_all(),
+            port_configured_barometric_psia(self._port),
+        )
         sweep: Optional[_SweepCsvWriter] = None
         try:
             self.progressChanged.emit(0, f'Retesting point {point_index}/{len(points)} at {target_psia:.1f} psia')

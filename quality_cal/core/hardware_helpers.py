@@ -20,6 +20,8 @@ VACUUM_PRIME_SETPOINT_PSIA = 0.2
 VACUUM_STALL_TIMEOUT_S = 45.0
 PRESSURE_STALL_TIMEOUT_S = 60.0
 HIGH_PRESSURE_MIN_TARGET_PSIA = 30.0
+# Last-resort sea-level default only. Prefer Port._configured_barometric_psia()
+# (quality_cal / stinger local_barometric_psi, e.g. 13.49 in Idaho).
 NOMINAL_BAROMETRIC_PSIA = 14.7
 
 
@@ -31,9 +33,33 @@ class StabilizedReading:
     barometric_psia: float
 
 
-def infer_barometric_psia(reading: Optional[PortReading]) -> float:
+def port_configured_barometric_psia(port: Optional[Port] = None) -> float:
+    """Site baro from port/labjack config; never invent sea-level when configured."""
+    if port is not None:
+        getter = getattr(port, '_configured_barometric_psia', None)
+        if callable(getter):
+            try:
+                return float(getter())
+            except (TypeError, ValueError):
+                pass
+        labjack_cfg = getattr(port, '_labjack_config', None) or {}
+        raw = labjack_cfg.get('local_barometric_psi')
+        if raw is not None:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                value = float('nan')
+            if value == value and value > 0.0:
+                return value
+    return NOMINAL_BAROMETRIC_PSIA
+
+
+def infer_barometric_psia(
+    reading: Optional[PortReading],
+    fallback_barometric_psia: float = NOMINAL_BAROMETRIC_PSIA,
+) -> float:
     if reading is None or reading.alicat is None:
-        return NOMINAL_BAROMETRIC_PSIA
+        return float(fallback_barometric_psia)
     if reading.alicat.barometric_pressure is not None:
         return float(reading.alicat.barometric_pressure)
     if reading.alicat.pressure is not None and reading.alicat.gauge_pressure is not None:
@@ -41,10 +67,13 @@ def infer_barometric_psia(reading: Optional[PortReading]) -> float:
         # gauge_pressure is often the setpoint index, not true gauge — ignore nonsense baro.
         if 12.5 <= inferred <= 16.5:
             return inferred
-    return NOMINAL_BAROMETRIC_PSIA
+    return float(fallback_barometric_psia)
 
 
-def alicat_abs_psia(reading: Optional[PortReading], fallback_barometric_psia: float = 14.7) -> Optional[float]:
+def alicat_abs_psia(
+    reading: Optional[PortReading],
+    fallback_barometric_psia: float = NOMINAL_BAROMETRIC_PSIA,
+) -> Optional[float]:
     if reading is None or reading.alicat is None:
         return None
     if reading.alicat.pressure is not None:
@@ -56,7 +85,7 @@ def alicat_abs_psia(reading: Optional[PortReading], fallback_barometric_psia: fl
 
 def transducer_abs_psia(
     reading: Optional[PortReading],
-    fallback_barometric_psia: float = 14.7,
+    fallback_barometric_psia: float = NOMINAL_BAROMETRIC_PSIA,
     *,
     use_raw: bool = False,
 ) -> Optional[float]:
@@ -351,8 +380,15 @@ def prepare_port_for_target(
     if cancel_event.is_set():
         return False, "cancelled", fallback_barometric_psia
 
+    site_baro = port_configured_barometric_psia(port)
+    if abs(float(fallback_barometric_psia) - NOMINAL_BAROMETRIC_PSIA) < 1e-6:
+        # Caller still on sea-level default — prefer stand local baro.
+        fallback_barometric_psia = site_baro
+    else:
+        fallback_barometric_psia = float(fallback_barometric_psia)
+
     latest = port.read_all()
-    barometric_psia = infer_barometric_psia(latest) or fallback_barometric_psia
+    barometric_psia = infer_barometric_psia(latest, fallback_barometric_psia)
     use_vacuum = target_psia < (barometric_psia - 0.3)
     if not use_vacuum:
         if alicat_in_exhaust_mode(port):
@@ -455,14 +491,14 @@ def wait_until_near_target(
     last_alicat: Optional[float] = None
     last_transducer: Optional[float] = None
     last_feedback: Optional[float] = None
-    barometric_psia = 14.7
+    barometric_psia = port_configured_barometric_psia(port)
 
     while time.perf_counter() - start <= timeout_s:
         if cancel_event.is_set():
             raise RuntimeError("Cancelled")
 
         reading = port.read_all()
-        barometric_psia = infer_barometric_psia(reading)
+        barometric_psia = infer_barometric_psia(reading, barometric_psia)
         last_alicat = alicat_abs_psia(reading, barometric_psia)
         last_transducer = transducer_abs_psia(reading, barometric_psia)
         feedback = feedback_pressure_psia(

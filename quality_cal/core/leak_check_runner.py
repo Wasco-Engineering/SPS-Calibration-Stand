@@ -13,6 +13,7 @@ from quality_cal.config import QualitySettings
 from quality_cal.core.hardware_helpers import (
     alicat_abs_psia,
     command_target_pressure,
+    port_configured_barometric_psia,
     prepare_port_for_target,
     safe_shutdown_port,
     transducer_abs_psia,
@@ -56,7 +57,7 @@ class LeakCheckRunner(QObject):
 
     @pyqtSlot()
     def run(self) -> None:
-        last_barometric = 14.7
+        last_barometric = port_configured_barometric_psia(self._port)
         try:
             self.progressChanged.emit(5, "Preparing leak-check route")
             route_ok, _route, last_barometric = prepare_port_for_target(

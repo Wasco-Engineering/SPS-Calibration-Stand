@@ -3,10 +3,6 @@ app:
   version: 1.0.0
 hardware:
   labjack:
-    # Peer-stand correlated gauge zero for Idaho SPS01438 gauge work.
-    # Open-fitting Alicat often sits ~13.53 PSIA; using that made this stand
-    # read ~2 mmHg low vs the Functional Stand (72.7 vs 74.7 on the same switch).
-    # 13.49 restores parity: abs_trip≈14.94 → gauge≈74.7 mmHg.
     local_barometric_psi: 13.49
     device_type: T7
     connection_type: USB
@@ -23,15 +19,9 @@ hardware:
       transducer_reference: absolute
       port_installed: true
       transducer_installed: false
-      # Left DB9: switch sense on pin 3 only (bench verified 2026-06); pin 1 unwired.
-      # PTP decides whether pin 3 is NO or NC for the active part/sequence.
       open_fitting: true
       switch_sensed_db9_pins:
       - 3
-      # Bench (STINGER_03): COM driven LOW. With active-low sense + LabJack
-      # pull-up behavior, closed contact reads 0 and open floats to 1 — clear
-      # trip edges. COM HIGH masks the open state (sense stays 1).
-      # Trip polarity follows PTP derive mode (no COM-high invert).
       switch_com_state: 0
       switch_active_low: true
       solenoid_dio: 19
@@ -54,7 +44,6 @@ hardware:
       transducer_reference: absolute
       switch_sensed_db9_pins:
       - 3
-      # Bench (STINGER_03): COM driven LOW — see port_a notes.
       switch_com_state: 0
       switch_active_low: true
       solenoid_dio: 18
@@ -91,43 +80,37 @@ hardware:
       alicat_error_model:
         type: piecewise_linear
         segments:
-        - max_psi: 0.22
-          slope_error_per_psi: 0.13293103448275845
-          intercept_error_psi: -0.03822241379310341
-        - max_psi: 0.23199999999999998
-          slope_error_per_psi: 0.9451428571428572
-          intercept_error_psi: -0.21640285714285715
-        - max_psi: 2.14
-          slope_error_per_psi: 0.03851162790697659
-          intercept_error_psi: -0.04628325581395343
-        - max_psi: 74.97
-          slope_error_per_psi: 0.0005401403381669902
-          intercept_error_psi: -0.0037305610466794453
+        - max_psi: 0.5
+          slope_error_per_psi: -0.01319047619047617
+          intercept_error_psi: -0.03406190476190476
+        - max_psi: 5.0
+          slope_error_per_psi: 0.004826815642458099
+          intercept_error_psi: -0.032833291010665316
+        - max_psi: 8.439999999999998
+          slope_error_per_psi: 0.007750517241379294
+          intercept_error_psi: -0.0771187931034481
+        - max_psi: 20.0
+          slope_error_per_psi: -0.0005593023255813151
+          intercept_error_psi: -0.015539534883721813
         - max_psi: null
-          slope_error_per_psi: -0.0008095956845992132
-          intercept_error_psi: 0.08268458304497521
-        pressure_axis: measured
+          slope_error_per_psi: 0.0012640909090908536
+          intercept_error_psi: -0.05684696969696882
+        pressure_axis: target
     port_b:
       com_port: COM3
       address: B
       alicat_error_model:
         type: piecewise_linear
         segments:
-        - max_psi: 0.2864
-          slope_error_per_psi: 0.09446879643387816
-          intercept_error_psi: -0.039285141158989595
-        - max_psi: 2.05
-          slope_error_per_psi: 0.04138179391883471
-          intercept_error_psi: -0.057395027562295794
-        - max_psi: 3.05
-          slope_error_per_psi: -0.0007575757575755617
-          intercept_error_psi: -0.012516969696970304
-        - max_psi: 74.9104
-          slope_error_per_psi: 0.0006337989702052781
-          intercept_error_psi: -0.007776082355529877
+        - max_psi: 9.112
+          slope_error_per_psi: 0.0030747747587860762
+          intercept_error_psi: -0.03627831457365983
+        - max_psi: 15.030000000000001
+          slope_error_per_psi: -0.001958447123461895
+          intercept_error_psi: 0.009242519138298377
         - max_psi: null
-          slope_error_per_psi: -0.0004304227457130831
-          intercept_error_psi: 0.06338015362996956
+          slope_error_per_psi: 0.001278274195709884
+          intercept_error_psi: -0.046456019562958216
         pressure_axis: measured
   solenoid:
     vacuum_state: 1
@@ -163,7 +146,6 @@ timing:
   ui_refresh_interval_ms: 16
   hardware_poll_interval_ms: 7
   alicat_background_polling_enabled: true
-  # 140 Hz scheduler target yields ~120 Hz/controller on the shared FTDI link.
   alicat_background_poll_hz: 140
   alicat_poll_divisor: 4
   alicat_poll_divisor_normal: 5
@@ -199,7 +181,7 @@ ui:
     show_acceptance_bands: true
     show_measured_points: true
 test_parameters:
-  equipment_id: STINGER_03
+  equipment_id: ID-SPS-01
   default_temperature_c: 25.0
   max_attempts: 3
 custom_work_orders:

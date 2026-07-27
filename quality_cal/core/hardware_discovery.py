@@ -200,8 +200,8 @@ def discover_alicat_assignments(config: dict[str, Any]) -> dict[str, str]:
         str(port).strip() for port in discovery_cfg.get("preferred_serial_ports", []) or []
     ]
     candidate_ports = build_candidate_ports(
-        preferred_ports,
         configured_ports,
+        preferred_ports,
         available_serial_ports(),
     )
 

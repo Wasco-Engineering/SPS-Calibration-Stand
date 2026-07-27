@@ -36,7 +36,16 @@ if (Test-Path $distPath) {
 }
 New-Item -ItemType Directory -Path $distPath -Force | Out-Null
 
+# PyInstaller writes INFO to stderr; with $ErrorActionPreference=Stop that becomes a
+# terminating NativeCommandError even when the build succeeds.
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 & $pythonPath -m PyInstaller --noconfirm --distpath "$distPath" --workpath "$workPath" "$specPath"
+$pyExit = $LASTEXITCODE
+$ErrorActionPreference = $prevEap
+if ($pyExit -ne 0) {
+    throw "PyInstaller failed with exit code $pyExit"
+}
 
 $exePath = Join-Path $distPath 'QualityCal.exe'
 if (-not (Test-Path $exePath)) {
