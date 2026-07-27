@@ -182,3 +182,80 @@ If you introduce these tools, document exact versions and configuration.
   - DB credentials might be referenced by `stinger_config.yaml` or environment.
 - Be careful editing `stinger_config.yaml`: it is treated as authoritative.
 - Keep changes minimal and localized; avoid large refactors unless requested.
+
+---
+
+## Multi-stand workflow (critical)
+
+Several physical stands share one GitHub repo (`Wasco-Engineering/SPS-Calibration-Stand`).
+Fixes land on `main` from whichever stand is working that day. **Fetch/pull often** —
+do not assume this PC is up to date.
+
+### This machine (CA reference stand)
+
+| Item | Value |
+|------|--------|
+| Hostname | `CA-MAN-SPS-02` |
+| Stand / `equipment_id` | **`CA-SPS-02`** (detail rows: `CA-SPS-02-L` / `CA-SPS-02-R`) |
+| Env (preferred) | `STINGER_STAND_ID=STINGER_01`, `STINGER_CONFIG_DIR=C:\Stinger` |
+| Config dir | `C:\Stinger` |
+| Typical peers | Idaho `ID-SPS-01` / `ID-SPS-02`; CA `CA-SPS-01` |
+
+Legacy labels `STINGER_01` may still appear in env on this PC. The DB equipment ID is
+**`CA-SPS-02`**; the env stand ID can remain `STINGER_01` as it only drives local paths.
+
+### What is shared vs stand-local
+
+**Take from `origin/main` (code):**
+- `app/**`, `tests/**`, scripts, docs, frozen `.exe` when rebuilding
+- Behavioral fixes: vent/equalize, shared-line Alicat serialization, background
+  Alicat polling, precision edge gating, cycle-prep, DB equipment-ID handling
+
+**Never overwrite blindly from another stand’s commit (config):**
+- `test_parameters.equipment_id` — must stay **`CA-SPS-02`** here
+- `hardware.alicat.baudrate` / COM addresses — must match *this* Alicat wiring
+- `open_fitting`, `transducer_installed`, switch COM polarity — bench-specific
+- Alicat / transducer `*_error_model` blocks — quality-cal for *this* hardware
+- `install_manifest.json` hostname / `stand_id`
+
+When merging `origin/main`, resolve conflicts by **keeping this stand’s site YAML
+identity** and **taking incoming application code**. After merge, re-check:
+
+```text
+equipment_id, baudrate, transducer_installed, COM ports
+timing.alicat_background_polling_enabled / alicat_background_poll_hz
+```
+
+### Git hygiene between stands
+
+1. **`git fetch origin` frequently** (start of session and before any merge).
+2. Before pull/merge: stash or commit local WIP (`stinger_config.yaml` often dirty).
+3. Prefer merging `origin/main` into the stand branch, not resetting
+   onto another stand’s config.
+4. Push stand fixes when they are intentional and tested so peers can pull them —
+   do not leave working calibration fixes only on the local disk.
+5. Binary `.exe` conflicts: take theirs or rebuild locally; source of truth is Python.
+
+### Cross-stand calibration comparison
+
+- Same **shop order** / part / sequence can be run on multiple stands; compare DB
+  `OrderCalibrationDetail` rows (e.g. `IncreasingActivation` =
+  increasing-pressure edge, `DecreasingDeactivation` = decreasing-pressure edge).
+- **Different serial numbers are different switches** — do not treat SN1 vs SN3 as
+  a stand bias unless the operator moved the same DUT.
+- Absolute Torr/mmHg parts: site baro is locked for the run but should not shift
+  absolute display conversion; small Torr deltas (~1–2) are often Alicat absolute
+  bias (~0.02–0.04 PSI), not missing YAML offsets.
+- Headless hardware check (right port example):
+
+```text
+python scripts/run_executor_headless.py --part 17025 --sequence 399 --port port_b --num-cycles 3
+python run.py
+```
+
+### Polling / shared Alicat line
+
+Both ports usually share one FTDI COM (addresses A/B). Current code serializes
+Alicat ops and can run background cache polling (`timing.alicat_background_*`).
+When bringing main onto this stand, keep those timing keys enabled if present on
+main, without importing another stand’s `equipment_id` or baro.

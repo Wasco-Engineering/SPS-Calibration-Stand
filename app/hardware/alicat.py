@@ -462,6 +462,9 @@ class AlicatController:
         )
         return False
 
+    # Torr/mmHg PTP codes — keep Alicat in PSI to avoid display round-trip error.
+    _PTP_CODES_KEEP_PSI = frozenset({'12', '13', '14', '19', '21'})
+
     @_serialized_operation
     def configure_units_from_ptp(self, units_code: str) -> bool:
         """Configure Alicat units based on PTP UnitsOfMeasure numeric code."""
@@ -484,6 +487,13 @@ class AlicatController:
             return True
 
         return self._ensure_pressure_units_value(unit_value)
+
+    def configure_units_from_ptp_prefer_psi(self, units_code: str) -> bool:
+        """Like configure_units_from_ptp, but keep PSI for Torr/mmHg PTP codes."""
+        normalized = str(units_code).strip()
+        if normalized in self._PTP_CODES_KEEP_PSI:
+            return self.configure_units_from_ptp('1')
+        return self.configure_units_from_ptp(units_code)
     
     def _verify_connection(self) -> bool:
         """Verify communication with the Alicat."""

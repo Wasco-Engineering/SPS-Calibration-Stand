@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).ProviderPath,
     [switch]$InstallPyInstaller,
     [switch]$SkipTests
@@ -42,7 +42,16 @@ if (Test-Path $distPath) {
 New-Item -ItemType Directory -Path $distPath -Force | Out-Null
 
 # Note: --clean omitted to avoid PermissionError on network/synced build dirs.
+# PyInstaller writes INFO to stderr; with $ErrorActionPreference=Stop that becomes a
+# terminating NativeCommandError even when the build succeeds.
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 & $pythonPath -m PyInstaller --noconfirm --distpath "$distPath" --workpath "$workPath" "$specPath"
+$pyExit = $LASTEXITCODE
+$ErrorActionPreference = $prevEap
+if ($pyExit -ne 0) {
+    throw "PyInstaller failed with exit code $pyExit"
+}
 
 $exePath = Join-Path $distPath $appExeName
 if (-not (Test-Path $exePath)) {

@@ -74,7 +74,12 @@ def ptp_limits_use_psia_scale(
     fallback_port_cfg: dict[str, object],
     barometric_psi: float,
 ) -> bool:
-    """True when PTP band limits are stored as sub-atmospheric PSIA (QAL16 vacuum)."""
+    """True when PTP band limits are stored as sub-atmospheric PSIA (QAL16 vacuum).
+
+    Only applies to PSI/PSIA unit labels. Torr/mmHg gauge PTPs (e.g. SPS01438-02/300
+    at 75 mmHg gauge) are true gauge: convert then add baro — do not treat the
+    raw mmHg numbers as absolute vacuum.
+    """
     if setup:
         unit_label = (setup.units_label or 'PSI').strip().upper()
         if unit_label not in {'PSI', 'PSIA'}:
