@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -74,7 +75,7 @@ def _make_save_controller(
         pressure_reference=None,
         activation_direction=activation_direction,
     )
-    controller._config = {'test_parameters': {'equipment_id': 'STINGER_01'}}
+    controller._config = {'test_parameters': {'equipment_id': 'CA-SPS-01'}}
     controller._db_connection_status = 'Connected'
     controller._db_last_write = '--'
     controller._db_queue = '0'
@@ -143,7 +144,7 @@ def test_progress_and_next_serial_include_legacy_sequence_format(monkeypatch) ->
                     UnitsOfMeasure='Torr',
                     InspectionDate=datetime.now(),
                     OperatorID='NB',
-                    EquipmentID='STINGER_01',
+                    EquipmentID='CA-SPS-01',
                 ),
                 OrderCalibrationDetail(
                     ShopOrder='51020234',
@@ -158,7 +159,37 @@ def test_progress_and_next_serial_include_legacy_sequence_format(monkeypatch) ->
                     UnitsOfMeasure='Torr',
                     InspectionDate=datetime.now(),
                     OperatorID='NB',
-                    EquipmentID='STINGER_01',
+                    EquipmentID='CA-SPS-01',
+                ),
+                OrderCalibrationDetail(
+                    ShopOrder='51020234',
+                    SequenceID='399',
+                    PartID='17021',
+                    SerialNumber=3,
+                    ActivationID=1,
+                    IncreasingActivation=1.4,
+                    DecreasingDeactivation=1.0,
+                    TemperatureC=22.0,
+                    InSpec=True,
+                    UnitsOfMeasure='Torr',
+                    InspectionDate=datetime.now(),
+                    OperatorID='NB',
+                    EquipmentID='CA-SPS-01',
+                ),
+                OrderCalibrationDetail(
+                    ShopOrder='51020234',
+                    SequenceID='399',
+                    PartID='17021',
+                    SerialNumber=3,
+                    ActivationID=2,
+                    IncreasingActivation=1.5,
+                    DecreasingDeactivation=1.1,
+                    TemperatureC=22.0,
+                    InSpec=False,
+                    UnitsOfMeasure='Torr',
+                    InspectionDate=datetime.now(),
+                    OperatorID='NB',
+                    EquipmentID='CA-SPS-01',
                 ),
             ]
         )
@@ -176,8 +207,8 @@ def test_progress_and_next_serial_include_legacy_sequence_format(monkeypatch) ->
 
     progress = operations.get_work_order_progress('51020234', '17021', '0399')
 
-    assert progress == {'completed': 2, 'passed': 1, 'failed': 1}
-    assert operations.get_next_serial_number('51020234', '17021', '0399') == 3
+    assert progress == {'completed': 3, 'passed': 2, 'failed': 1}
+    assert operations.get_next_serial_number('51020234', '17021', '0399') == 4
 
 
 def test_save_result_reports_saved_status(monkeypatch) -> None:
@@ -219,6 +250,7 @@ def test_detail_equipment_ids_are_port_specific() -> None:
 
 def test_save_result_maps_decreasing_direction_edges_to_database_fields(monkeypatch) -> None:
     controller = _make_save_controller(activation_direction='Decreasing')
+    controller._state_machines['port_a']._attempt_count = 2
     captured = {}
     monkeypatch.setattr(
         work_order_controller,
@@ -231,6 +263,7 @@ def test_save_result_maps_decreasing_direction_edges_to_database_fields(monkeypa
 
     assert captured['increasing_activation'] == 9.8
     assert captured['decreasing_deactivation'] == 12.3
+    assert captured['activation_id'] == 1
 
 
 def test_save_result_uses_zero_sentinel_for_no_switch_failure(monkeypatch) -> None:
@@ -353,7 +386,7 @@ def test_save_test_result_queues_locally_for_unexpected_error(monkeypatch, tmp_p
         temperature_c=25.0,
         units_of_measure='PSI',
         operator_id='OP-1',
-        equipment_id='STINGER_01',
+        equipment_id='CA-SPS-01',
         max_pressure_achieved=31.25,
         gage_reference_diff=14.61,
     )
@@ -390,7 +423,7 @@ def test_save_test_result_accepts_zero_no_switch_sentinel(monkeypatch, tmp_path)
         temperature_c=25.0,
         units_of_measure='PSI',
         operator_id='OP-1',
-        equipment_id='STINGER_01',
+        equipment_id='CA-SPS-01',
         max_pressure_achieved=0.0,
         gage_reference_diff=14.61,
     )
@@ -404,7 +437,111 @@ def test_save_test_result_accepts_zero_no_switch_sentinel(monkeypatch, tmp_path)
         assert saved.MaxPressureAchieved == 0.0
         assert float(saved.GageReferenceDiff) == 14.61
         assert saved.InSpec is False
-        assert master.CreatedBy == 'STINGER_01'
+        assert master.CreatedBy == 'CA-SPS-01'
+
+
+def test_detail_writer_refuses_cross_stand_overwrite() -> None:
+    engine = create_engine('sqlite:///:memory:')
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+
+    with Session() as session:
+        existing = OrderCalibrationDetail(
+            ShopOrder='WO-1',
+            SequenceID='1',
+            PartID='PART-1',
+            SerialNumber=1,
+            ActivationID=1,
+            IncreasingActivation=20.0,
+            DecreasingDeactivation=10.0,
+            TemperatureC=25.0,
+            MaxPressureAchieved=30.0,
+            InSpec=True,
+            UnitsOfMeasure='PSI',
+            EquipmentID='NCRS',
+            OperatorID='OP-2',
+        )
+        session.add(existing)
+        session.flush()
+
+        detail = operations._build_detail_payload(
+            shop_order='WO-1',
+            part_id='PART-1',
+            sequence_id='1',
+            serial_number=1,
+            activation_id=1,
+            increasing_activation=21.0,
+            decreasing_deactivation=11.0,
+            in_spec=False,
+            temperature_c=25.0,
+            units_of_measure='PSI',
+            operator_id='OP-1',
+            equipment_id='CA-SPS-01',
+            max_pressure_achieved=31.0,
+            gage_reference_diff=14.6,
+        )
+
+        with pytest.raises(operations.DetailWriteConflict):
+            operations._save_detail_payload_to_session(session, detail)
+
+        session.refresh(existing)
+        assert existing.EquipmentID == 'NCRS'
+        assert existing.IncreasingActivation == 20.0
+
+
+def test_save_test_result_normalizes_legacy_activation_ids_to_one(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv('STINGER_CONFIG_DIR', str(tmp_path))
+    engine = create_engine('sqlite:///:memory:')
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+
+    @contextmanager
+    def _session_scope():
+        session = Session()
+        try:
+            yield session
+            session.commit()
+        finally:
+            session.close()
+
+    monkeypatch.setattr(operations, 'session_scope', _session_scope)
+
+    assert operations.save_test_result(
+        shop_order='WO-1',
+        part_id='PART-1',
+        sequence_id='1',
+        serial_number=1,
+        increasing_activation=12.3,
+        decreasing_deactivation=9.8,
+        in_spec=True,
+        temperature_c=25.0,
+        units_of_measure='PSI',
+        operator_id='OP-1',
+        equipment_id='CA-SPS-01',
+        activation_id=4,
+    ) is True
+
+    assert operations.save_test_result(
+        shop_order='WO-1',
+        part_id='PART-1',
+        sequence_id='1',
+        serial_number=1,
+        increasing_activation=13.4,
+        decreasing_deactivation=10.2,
+        in_spec=False,
+        temperature_c=26.0,
+        units_of_measure='PSI',
+        operator_id='OP-2',
+        equipment_id='CA-SPS-01',
+        activation_id=2,
+    ) is True
+
+    with Session() as session:
+        rows = session.query(OrderCalibrationDetail).all()
+        assert len(rows) == 1
+        assert rows[0].ActivationID == 1
+        assert float(rows[0].IncreasingActivation) == pytest.approx(13.4)
+        assert float(rows[0].DecreasingDeactivation) == pytest.approx(10.2)
 
 
 def test_save_result_keeps_shared_master_equipment_id(monkeypatch, tmp_path) -> None:
@@ -462,12 +599,12 @@ def test_ensure_work_order_master_uses_composite_key_without_rewriting_other_par
                 LastSequenceCalibrated='300',
                 OrderQTY=40,
                 OperatorID='CP-01',
-                EquipmentID='STINGER_01',
+                EquipmentID='CA-SPS-01',
                 CalibrationDate=datetime.now(),
                 ModificationDate=datetime.now(),
-                CreatedBy='STINGER_01',
+                CreatedBy='CA-SPS-01',
                 CreationDate=datetime.now(),
-                ModifiedBy='STINGER_01',
+                ModifiedBy='CA-SPS-01',
             )
         )
         session.commit()
@@ -489,7 +626,7 @@ def test_ensure_work_order_master_uses_composite_key_without_rewriting_other_par
         sequence_id='300',
         order_qty=40,
         operator_id='CP-01',
-        equipment_id='STINGER_01',
+        equipment_id='CA-SPS-01',
     )
 
     with Session() as session:
@@ -531,7 +668,7 @@ def test_save_test_result_accepts_null_measurements(monkeypatch) -> None:
         temperature_c=25.0,
         units_of_measure='PSI',
         operator_id='OP-1',
-        equipment_id='STINGER_01',
+        equipment_id='CA-SPS-01',
     )
 
     assert result is True
@@ -554,7 +691,7 @@ def test_save_test_result_rejects_overlength_fixed_width_fields(caplog) -> None:
         temperature_c=25.0,
         units_of_measure='PSI',
         operator_id='TOO-LONG',
-        equipment_id='STINGER_01',
+        equipment_id='CA-SPS-01',
     )
 
     assert result is False

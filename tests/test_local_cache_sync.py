@@ -38,7 +38,7 @@ def _detail(**overrides):
         'ActivationID': 1,
         'InspectionDate': datetime.now(),
         'TemperatureC': 25.0,
-        'EquipmentID': 'STINGER_01',
+        'EquipmentID': 'CA-SPS-01',
         'OperatorID': 'OP-1',
         'IncreasingActivation': 12.3,
         'DecreasingDeactivation': 9.8,
@@ -66,7 +66,7 @@ def test_sync_local_cache_uploads_queued_detail(monkeypatch, tmp_path) -> None:
             'SequenceID': '399',
             'OrderQTY': 1,
             'OperatorID': 'OP-1',
-            'EquipmentID': 'STINGER_01',
+            'EquipmentID': 'CA-SPS-01',
         },
         source='queued',
     )

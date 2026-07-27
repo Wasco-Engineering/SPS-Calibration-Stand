@@ -1,11 +1,11 @@
 # Initialize per-PC Stinger config under the install root (default C:\Stinger).
 #
 # Usage:
-#   .\scripts\deploy_init_stand.ps1 -StandId STINGER_01 -EquipmentId STINGER_01
+#   .\scripts\deploy_init_stand.ps1 -StandId CA-SPS-01 -EquipmentId CA-SPS-01
 #   .\scripts\deploy_init_stand.ps1 -InstallRoot C:\Stinger -Force
 #
 param(
-    [string] $StandId = 'STINGER_01',
+    [string] $StandId = 'CA-SPS-01',
 
     [string] $EquipmentId = '',
     [string] $InstallRoot = 'C:\Stinger',

@@ -88,8 +88,12 @@ class LoginDialog(QDialog):
         self._set_shop_order_validity(None)
         self._update_login_button_state()
 
-        # Automatically focus on operator ID field when dialog is shown
-        self.operator_id_input.setFocus()
+        # Automatically focus on badge scan when Nexus is enabled, else operator ID
+        nexus_enabled = bool((self.config.get("nexus") or {}).get("enabled", False))
+        if nexus_enabled:
+            self.badge_token_input.setFocus()
+        else:
+            self.operator_id_input.setFocus()
 
     def showEvent(self, a0) -> None:
         """Center the dialog on the parent window or screen when shown."""
@@ -170,7 +174,7 @@ class LoginDialog(QDialog):
         layout.addWidget(title_label)
         
         # Subtitle
-        subtitle_label = QLabel("Scan or enter your credentials to begin")
+        subtitle_label = QLabel("Scan badge or enter credentials to begin")
         subtitle_font = QFont("Segoe UI, Inter, Arial", 13)
         subtitle_label.setFont(subtitle_font)
         subtitle_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -193,6 +197,9 @@ class LoginDialog(QDialog):
         input_font.setPointSize(14)
 
         # Create input fields
+        self.badge_token_input = self._create_input_field("Scan badge (Nexus)", input_font)
+        form_layout.addRow("Badge Scan:", self.badge_token_input)
+
         self.operator_id_input = self._create_input_field("Scan or Enter Operator ID", input_font)
         form_layout.addRow("Operator ID:", self.operator_id_input)
 
@@ -284,6 +291,7 @@ class LoginDialog(QDialog):
         self.login_button.clicked.connect(self.attempt_login)
 
         # Update login button state when Operator ID changes
+        self.badge_token_input.textChanged.connect(self._on_badge_changed)
         self.operator_id_input.textChanged.connect(self._update_login_button_state)
         self.part_id_input.textChanged.connect(self._update_login_button_state)
         self.sequence_input.textChanged.connect(self._update_login_button_state)
@@ -296,6 +304,7 @@ class LoginDialog(QDialog):
         self.operator_id_input.textEdited.connect(self._force_uppercase)
 
         # Handle Enter key presses
+        self.badge_token_input.returnPressed.connect(self._on_badge_enter)
         self.operator_id_input.returnPressed.connect(self._on_operator_id_enter)
         self.shop_order_input.returnPressed.connect(self._on_shop_order_enter)
         self.part_id_input.returnPressed.connect(self._on_part_id_enter)
@@ -305,29 +314,53 @@ class LoginDialog(QDialog):
 
     def _update_login_button_state(self) -> None:
         """Enable login button based on mode: test, manual-entry, or validated WO."""
-        operator_id_ok = bool(self.operator_id_input.text().strip())
+        has_badge = bool(self.badge_token_input.text().strip())
+        operator_id_ok = has_badge or bool(self.operator_id_input.text().strip())
         part_ok = bool(self.part_id_input.text().strip())
         sequence_ok = bool(self.sequence_input.text().strip())
         shop_order_validated = self.work_order_details is not None
         shop_order_entered = bool(self.shop_order_input.text().strip())
         if self._test_mode_enabled:
-            # In test mode, only require operator ID (other fields will use defaults)
+            # In test mode, only require operator ID / badge (other fields will use defaults)
             can_login = operator_id_ok
         elif self._manual_entry_mode:
-            # Manual entry: need operator, WO text, and manually-entered Part ID + Sequence
+            # Manual entry: need operator/badge, WO text, and manually-entered Part ID + Sequence
             can_login = operator_id_ok and shop_order_entered and part_ok and sequence_ok
         else:
             can_login = operator_id_ok and shop_order_validated and part_ok and sequence_ok
         self.login_button.setEnabled(can_login)
         logger.debug(
-            "Login button state updated: Operator OK=%s, WO Validated=%s, "
+            "Login button state updated: Operator OK=%s, Badge=%s, WO Validated=%s, "
             "Manual Entry=%s, Test Mode=%s -> Enabled=%s",
             operator_id_ok,
+            has_badge,
             shop_order_validated,
             self._manual_entry_mode,
             self._test_mode_enabled,
             can_login,
         )
+
+    @pyqtSlot(str)
+    def _on_badge_changed(self, text: str) -> None:
+        """When a badge is present, operator ID is filled by Nexus on submit."""
+        has_badge = bool(text.strip())
+        self.operator_id_input.setEnabled(not has_badge)
+        if has_badge:
+            self.operator_id_input.setPlaceholderText("Filled by badge login")
+        else:
+            self.operator_id_input.setPlaceholderText("Scan or Enter Operator ID")
+        self._update_login_button_state()
+
+    @pyqtSlot()
+    def _on_badge_enter(self) -> None:
+        """Handle Enter in Badge field — move to Work Order or login."""
+        if not self.badge_token_input.text().strip():
+            self.operator_id_input.setFocus()
+            return
+        if self.shop_order_input.text().strip() or self._test_mode_enabled:
+            self.attempt_login()
+            return
+        self.shop_order_input.setFocus()
 
     @pyqtSlot()
     def _schedule_validation(self) -> None:
@@ -522,9 +555,35 @@ class LoginDialog(QDialog):
         self.status_label.setStyleSheet("color: #4b5563;")
 
         def _run_validation() -> tuple[Optional[Dict[str, Any]], bool, bool]:
-            validation_result = validate_shop_order(shop_order)
+            validation_result = None
+            nexus_cfg = self.config.get("nexus") or {}
+            if bool(nexus_cfg.get("enabled", False)):
+                try:
+                    from app.services.nexus_service import (
+                        build_nexus_client,
+                        resolve_work_order_via_nexus,
+                    )
+
+                    client = build_nexus_client(self.config)
+                    if client is not None:
+                        try:
+                            validation_result = resolve_work_order_via_nexus(client, shop_order)
+                            if not validation_result.get("PartID"):
+                                validation_result = None
+                        finally:
+                            try:
+                                client.close()
+                            except Exception:
+                                pass
+                except Exception as exc:
+                    logger.warning("Nexus WO resolve failed during login validate: %s", exc)
+            if validation_result is None:
+                validation_result = validate_shop_order(shop_order)
             wasco_ok = is_calibration_database_available()
             max_ok = is_shop_order_database_available()
+            # Nexus success counts as online enough to skip offline-manual path.
+            if validation_result and validation_result.get("PartID"):
+                wasco_ok = True
             return validation_result, wasco_ok, max_ok
 
         def _on_validation_done(result: Any, error: Optional[Exception]) -> None:
@@ -600,15 +659,19 @@ class LoginDialog(QDialog):
     @pyqtSlot()
     def attempt_login(self) -> None:
         """Handle the login button click (validation should already be done)."""
+        badge_token = self.badge_token_input.text().strip()
         operator_id = self.operator_id_input.text().strip()
         part_id = self.part_id_input.text().strip()
         sequence_id = self.sequence_input.text().strip()
         shop_order = self.shop_order_input.text().strip()
 
-        if not operator_id:
-            self._show_warning_dialog("Input Missing", "Please enter an Operator ID.")
+        if not badge_token and not operator_id:
+            self._show_warning_dialog(
+                "Input Missing",
+                "Please scan a badge or enter an Operator ID.",
+            )
             return
-        if len(operator_id) > OPERATOR_ID_MAX_LEN:
+        if not badge_token and len(operator_id) > OPERATOR_ID_MAX_LEN:
             self._show_warning_dialog(
                 "Operator ID Too Long",
                 f"Operator ID must be {OPERATOR_ID_MAX_LEN} characters or fewer "
@@ -678,9 +741,10 @@ class LoginDialog(QDialog):
             else shop_order or "N/A"
         )
         logger.info(
-            "Login attempt successful for Operator: %s, WO: %s",
-            operator_id,
+            "Login attempt successful for Operator: %s, WO: %s (badge=%s)",
+            operator_id or "(badge)",
             shop_order_for_log,
+            bool(badge_token),
         )
 
         full_wo_details = (self.work_order_details or {}).copy()
@@ -693,6 +757,8 @@ class LoginDialog(QDialog):
         full_wo_details["TestMode"] = self._test_mode_enabled
         full_wo_details["ManualEntry"] = self._manual_entry_mode
         full_wo_details["WOValidated"] = self.work_order_details is not None
+        if badge_token:
+            full_wo_details["BadgeToken"] = badge_token
 
         self.loginSuccessful.emit(full_wo_details)
         self.accept()

@@ -1,14 +1,14 @@
 # Install built Stinger apps and per-PC config under C:\Stinger (standard stand layout).
 #
 # Usage (from repo, after build or with -Build):
-#   .\scripts\deploy_install_to_c_stinger.ps1 -StandId STINGER_01 -SetMachineEnv
+#   .\scripts\deploy_install_to_c_stinger.ps1 -StandId CA-SPS-01 -SetMachineEnv
 #   .\scripts\deploy_install_to_c_stinger.ps1 -Build -InstallPyInstaller -SetMachineEnv
 #
 # Run -SetMachineEnv in an elevated shell so CalibrationUser picks up STINGER_CONFIG_DIR.
 param(
     [string]$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).ProviderPath,
     [string]$InstallRoot = 'C:\Stinger',
-    [string]$StandId = 'STINGER_01',
+    [string]$StandId = 'CA-SPS-01',
     [string]$EquipmentId = '',
     [string]$TargetUser = 'CalibrationUser',
     [switch]$Build,

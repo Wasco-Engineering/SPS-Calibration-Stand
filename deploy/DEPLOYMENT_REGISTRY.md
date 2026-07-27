@@ -28,7 +28,7 @@ Set env vars once per PC (`scripts/deploy_set_stand_env.ps1`).
 | Field | Value |
 |-------|--------|
 | **Hostname** | `CA-MAN-SPS-02` |
-| **Stand ID** | `STINGER_01` |
+| **Stand ID** | `CA-SPS-02` |
 | **Equipment ID** | `CA-SPS-02` (detail rows `CA-SPS-02-L` / `CA-SPS-02-R`) |
 | **Role** | Reference stand — transducers + Mensor on port_b tee |
 | **Local config dir** | `C:\Stinger` |
@@ -56,21 +56,21 @@ Set env vars once per PC (`scripts/deploy_set_stand_env.ps1`).
 **Env (User/Machine):**
 
 ```powershell
-STINGER_STAND_ID=STINGER_01
+STINGER_STAND_ID=CA-SPS-02
 STINGER_CONFIG_DIR=C:\Stinger
 ```
 
 ---
 
-### Stand 2 — (second bench; fill in hostname when known)
+### CA-MAN-SPS-01 — Stand 2 (second bench)
 
 | Field | Value |
 |-------|--------|
-| **Hostname** | `_TBD_` (e.g. second shop PC name) |
-| **Stand ID** | `STINGER_02` |
-| **Equipment ID** | `STINGER_02` |
+| **Hostname** | `CA-MAN-SPS-01` |
+| **Stand ID** | `CA-SPS-01` |
+| **Equipment ID** | `CA-SPS-01` |
 | **Role** | Identical plumbing; **transducers not installed** (capped) until sensors arrive |
-| **Local config dir** | `%LOCALAPPDATA%\Stinger\STINGER_02\` |
+| **Local config dir** | `%LOCALAPPDATA%\Stinger\CA-SPS-01\` |
 | **Desktop EXEs** | `%USERPROFILE%\Desktop\Stinger\` |
 | **Z: release bin** | Same shared `bin\` folder (EXE is shared; config is not) |
 
@@ -84,8 +84,8 @@ STINGER_CONFIG_DIR=C:\Stinger
 **Env (User):**
 
 ```powershell
-STINGER_STAND_ID=STINGER_02
-STINGER_CONFIG_DIR=%LOCALAPPDATA%\Stinger\STINGER_02
+STINGER_STAND_ID=CA-SPS-01
+STINGER_CONFIG_DIR=%LOCALAPPDATA%\Stinger\CA-SPS-01
 ```
 
 ---
@@ -95,8 +95,8 @@ STINGER_CONFIG_DIR=%LOCALAPPDATA%\Stinger\STINGER_02
 | Field | Value |
 |-------|--------|
 | **Hostname** | `ID-MAN-SPS-01` |
-| **Stand ID** | `STINGER_03` |
-| **Equipment ID** | `STINGER_03` |
+| **Stand ID** | `ID-SPS-01` |
+| **Equipment ID** | `ID-SPS-01` |
 | **Role** | Production stand — Alicat + Mensor; transducers not installed |
 | **Local config dir** | `C:\Stinger\` |
 | **Stinger config** | `C:\Stinger\stinger_config.yaml` |
@@ -121,11 +121,11 @@ STINGER_CONFIG_DIR=%LOCALAPPDATA%\Stinger\STINGER_02
 **Env (Machine):**
 
 ```powershell
-STINGER_STAND_ID=STINGER_03
+STINGER_STAND_ID=ID-SPS-01
 STINGER_CONFIG_DIR=C:\Stinger
 ```
 
-Set via `.\scripts\deploy_set_machine_env.ps1 -StandId STINGER_03 -ConfigDir C:\Stinger` (Administrator).
+Set via `.\scripts\deploy_set_machine_env.ps1 -StandId ID-SPS-01 -ConfigDir C:\Stinger` (Administrator).
 
 ---
 
@@ -134,8 +134,8 @@ Set via `.\scripts\deploy_set_machine_env.ps1 -StandId STINGER_03 -ConfigDir C:\
 | Field | Value |
 |-------|--------|
 | **Hostname** | `ID-MAN-CR3-01` |
-| **Stand ID** | `STINGER_04` |
-| **Equipment ID** | `STINGER_04` |
+| **Stand ID** | `ID-SPS-02` |
+| **Equipment ID** | `ID-SPS-02` |
 | **Role** | SPA stand |
 | **Local config dir** | `C:\Stinger` |
 | **Stinger config** | `C:\Stinger\stinger_config.yaml` |
@@ -158,7 +158,7 @@ Set via `.\scripts\deploy_set_machine_env.ps1 -StandId STINGER_03 -ConfigDir C:\
 **Env (User set; Machine env requires elevated PowerShell):**
 
 ```powershell
-STINGER_STAND_ID=STINGER_04
+STINGER_STAND_ID=ID-SPS-02
 STINGER_CONFIG_DIR=C:\Stinger
 ```
 

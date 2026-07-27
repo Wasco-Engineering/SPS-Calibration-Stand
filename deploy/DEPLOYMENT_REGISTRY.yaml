@@ -3,9 +3,20 @@ schema_version: 1
 shared_release_root: 'Z:\Engineering\Program Builds\Python Builds\Stinger'
 shared_bin_dir: 'Z:\Engineering\Program Builds\Python Builds\Stinger\bin'
 
+# Stand id rename (database / Nexus EquipmentID):
+#   STINGER_01 -> CA-SPS-01
+#   STINGER_02 -> CA-SPS-02
+#   STINGER_03 -> ID-SPS-01
+#   STINGER_04 -> ID-SPS-02
+stand_keys:
+  CA-SPS-01: wsk_a12NoQgKjVsu4TRX59P91_5kJv6wPwcXf7DY4sNMyY8
+  CA-SPS-02: wsk_zwOGJ4jsyprRc3DSX4DLYZ8rbKwJO4cWwkuhb0uUMT4
+  ID-SPS-01: wsk_hGsNOhl4UCkf1TfHP26E7R_6M6qVbhZcdyXNjYoOi6I
+  ID-SPS-02: wsk_uHjPgBNlaPCbggAs6moST5jr8HQQKAkkMb_iZercP58
+
 computers:
   - hostname: CA-MAN-SPS-02
-    stand_id: STINGER_01
+    stand_id: CA-SPS-02
     equipment_id: CA-SPS-02
     role: reference_stand
     local_config_dir: 'C:\Stinger'
@@ -19,7 +30,7 @@ computers:
       - SPS Calibration Stand.exe
       - QualityCal.exe
     env:
-      STINGER_STAND_ID: STINGER_01
+      STINGER_STAND_ID: CA-SPS-02
       STINGER_CONFIG_DIR: 'C:\Stinger'
     hardware:
       labjack: { device: T7, connection: USB, identifier: ANY }
@@ -34,35 +45,35 @@ computers:
         transducer_only_below_psi: 5.0
         alicat_only_above_psi: 5.0
     notes: >
-      DB EquipmentID base CA-SPS-02 (detail CA-SPS-02-L/R).
-      Shared-line Alicat background polling 140 Hz; fitted transducer/alicat
-      error models from 2026-07 shared-line correlation. Desktop EXEs via
-      deploy_build_and_install.ps1.
+      Former STINGER_01. Hostname CA-MAN-SPS-02; EquipmentID CA-SPS-02 for DB/Nexus
+      (detail CA-SPS-02-L/R). Shared-line Alicat background polling 140 Hz; fitted
+      transducer/alicat error models from 2026-07 shared-line correlation. Desktop EXEs
+      via deploy_build_and_install.ps1.
 
-  - hostname: TBD_STAND2_PC
-    stand_id: STINGER_02
-    equipment_id: STINGER_02
+  - hostname: CA-MAN-SPS-01
+    stand_id: CA-SPS-01
+    equipment_id: CA-SPS-01
     role: second_stand
-    local_config_dir: '%LOCALAPPDATA%\Stinger\STINGER_02'
-    stinger_config: '%LOCALAPPDATA%\Stinger\STINGER_02\stinger_config.yaml'
-    quality_cal_config: '%LOCALAPPDATA%\Stinger\STINGER_02\quality_cal_config.yaml'
-    logs_dir: '%LOCALAPPDATA%\Stinger\STINGER_02\logs'
+    local_config_dir: '%LOCALAPPDATA%\Stinger\CA-SPS-01'
+    stinger_config: '%LOCALAPPDATA%\Stinger\CA-SPS-01\stinger_config.yaml'
+    quality_cal_config: '%LOCALAPPDATA%\Stinger\CA-SPS-01\quality_cal_config.yaml'
+    logs_dir: '%LOCALAPPDATA%\Stinger\CA-SPS-01\logs'
     repo_path: TBD
     desktop_deploy_dir: '%USERPROFILE%\Desktop\Stinger'
     env:
-      STINGER_STAND_ID: STINGER_02
-      STINGER_CONFIG_DIR: '%LOCALAPPDATA%\Stinger\STINGER_02'
+      STINGER_STAND_ID: CA-SPS-01
+      STINGER_CONFIG_DIR: '%LOCALAPPDATA%\Stinger\CA-SPS-01'
     hardware:
       transducers:
         port_a: { installed: false }
         port_b: { installed: false }
       measurement:
         preferred_source: alicat
-    notes: Transducers capped until installed; run deploy_init_stand.ps1 -StandId STINGER_02 on that PC.
+    notes: Former STINGER_02. Transducers capped until installed; run deploy_init_stand.ps1 -StandId CA-SPS-01.
 
   - hostname: ID-MAN-SPS-01
-    stand_id: STINGER_03
-    equipment_id: STINGER_03
+    stand_id: ID-SPS-01
+    equipment_id: ID-SPS-01
     role: production_stand
     local_config_dir: 'C:\Stinger'
     stinger_config: 'C:\Stinger\stinger_config.yaml'
@@ -74,7 +85,7 @@ computers:
       - SPS Calibration Stand.exe
       - QualityCal.exe
     env:
-      STINGER_STAND_ID: STINGER_03
+      STINGER_STAND_ID: ID-SPS-01
       STINGER_CONFIG_DIR: 'C:\Stinger'
     hardware:
       labjack: { device: T7, connection: USB, identifier: ANY, serial: '470042010' }
@@ -89,12 +100,12 @@ computers:
         transducer_only_below_psi: 20.0
         alicat_only_above_psi: 5.0
     notes: >
-      Alicat-only until transducers installed. Quality Cal fitted alicat_error_model 0-115 PSIA.
-      vacuum_switch_trips_on_no_open false on both ports. Self-updated from Z: / local rebuild Jun 2026.
+      Former STINGER_03. Alicat-only until transducers installed.
+      Quality Cal fitted alicat_error_model 0-115 PSIA.
 
   - hostname: ID-MAN-CR3-01
-    stand_id: STINGER_04
-    equipment_id: STINGER_04
+    stand_id: ID-SPS-02
+    equipment_id: ID-SPS-02
     role: spa_stand
     local_config_dir: 'C:\Stinger'
     stinger_config: 'C:\Stinger\stinger_config.yaml'
@@ -103,7 +114,7 @@ computers:
     repo_path: 'C:\Stinger'
     desktop_deploy_dir: 'C:\Stinger'
     env:
-      STINGER_STAND_ID: STINGER_04
+      STINGER_STAND_ID: ID-SPS-02
       STINGER_CONFIG_DIR: 'C:\Stinger'
     hardware:
       labjack: { device: T7, connection: USB, identifier: ANY }
@@ -116,6 +127,5 @@ computers:
       measurement:
         preferred_source: alicat
     notes: >
-      Configured as STINGER_04 on 2026-06-24. Alicat controllers verified;
-      transducers are not installed. Only COM3 was detected, so Mensor on
-      configured COM4 was not available during setup.
+      Former STINGER_04 on ID-MAN-CR3-01. Alicat controllers verified;
+      transducers are not installed.

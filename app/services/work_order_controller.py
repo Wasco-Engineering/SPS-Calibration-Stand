@@ -27,6 +27,7 @@ from app.database.session import close_database, get_engine, initialize_database
 from app.services import run_async
 from app.core.config import is_transducer_installed, save_config
 from app.services.ptp_service import (
+    configure_ptp_repository,
     load_ptp_from_db,
     load_ptp_from_dump,
     derive_test_setup,
@@ -34,6 +35,14 @@ from app.services.ptp_service import (
     build_pressure_visualization,
     convert_pressure,
     TestSetup,
+)
+from app.services.nexus_service import (
+    DEFAULT_EQUIPMENT_ID,
+    badge_login,
+    build_nexus_client,
+    build_ptp_repository,
+    normalize_equipment_id,
+    resolve_work_order_via_nexus,
 )
 from app.services.control_config import parse_control_config
 from app.services.state.port_state_machine import PortStateMachine, PortState, PortSubstate
@@ -115,6 +124,9 @@ class WorkOrderController(QObject):
         self._ui_bridge = ui_bridge
         self._config = config
         self._current_test_setup: Optional[TestSetup] = None
+        self._nexus_client = build_nexus_client(config)
+        self._ptp_repository = build_ptp_repository(config)
+        configure_ptp_repository(self._ptp_repository)
         
         # Initialize hardware
         self._port_manager = PortManager(config)
@@ -335,6 +347,31 @@ class WorkOrderController(QObject):
         total = int(payload.get("OrderQTY") or payload.get("OrderQty") or 0)
         test_mode = bool(payload.get("TestMode"))
         wo_validated = bool(payload.get("WOValidated"))
+        badge_token = str(payload.get("BadgeToken", "")).strip()
+
+        if badge_token and self._nexus_client is not None:
+            try:
+                badge = badge_login(self._nexus_client, badge_token)
+                resolved_operator = str(badge.get("operator_id") or "").strip()
+                if resolved_operator:
+                    operator_id = resolved_operator
+                if badge.get("from_cache"):
+                    logger.info(
+                        "Offline badge admit for %s",
+                        badge.get("operator_name") or operator_id,
+                    )
+                open_runs = badge.get("open_runs") or []
+                if not shop_order and open_runs:
+                    shop_order = str(open_runs[0].get("work_order_number") or "").strip()
+                    if not sequence_id:
+                        sequence_id = str(open_runs[0].get("operation_sequence") or "").strip()
+            except Exception as exc:
+                logger.exception("Nexus badge login failed")
+                self._ui_bridge.show_error_message(
+                    "Badge Login",
+                    f"Badge login failed: {exc}",
+                )
+                return
 
         # In test mode, use defaults if fields are empty
         if test_mode:
@@ -368,7 +405,25 @@ class WorkOrderController(QObject):
             failed = progress.get("failed", 0)
         else:
             if not (wo_validated and part_id and sequence_id):
-                details = validate_shop_order(shop_order)
+                details = None
+                if self._nexus_client is not None and shop_order:
+                    try:
+                        details = resolve_work_order_via_nexus(
+                            self._nexus_client,
+                            shop_order,
+                            sequence=sequence_id or None,
+                        )
+                        logger.info(
+                            "Nexus WO resolve %s -> part=%s qty=%s seq=%s",
+                            shop_order,
+                            details.get("PartID"),
+                            details.get("OrderQTY"),
+                            details.get("SequenceID"),
+                        )
+                    except Exception as exc:
+                        logger.warning("Nexus request_ptp failed for %s: %s", shop_order, exc)
+                if not details or not details.get("PartID"):
+                    details = validate_shop_order(shop_order)
                 if not details:
                     self._ui_bridge.show_error_message(
                         "Work Order",
@@ -428,7 +483,10 @@ class WorkOrderController(QObject):
         config_for_master = self.__dict__.get('_config')
         if not test_mode and self._current_test_setup is not None and isinstance(config_for_master, dict):
             test_params = config_for_master.get('test_parameters', {})
-            equipment_id = test_params.get('equipment_id', 'STINGER_01')
+            equipment_id = normalize_equipment_id(
+                test_params.get('equipment_id'),
+                DEFAULT_EQUIPMENT_ID,
+            )
             activation_target = (
                 self._current_test_setup.activation_target
                 if self._current_test_setup is not None
@@ -1729,6 +1787,9 @@ class WorkOrderController(QObject):
         sm = self._state_machines.get(port_id)
         if not sm:
             return
+        if sm._attempt_count >= sm._max_attempts - 1:
+            logger.warning('%s: Retest blocked after %s attempts', port_id, sm._max_attempts)
+            return
         if self._is_low_pressure_transducer_locked_out(port_id):
             self._show_low_pressure_transducer_lockout(port_id)
             return
@@ -2740,7 +2801,10 @@ class WorkOrderController(QObject):
         sequence_id = wo.get('sequence_id', '')
         operator_id = wo.get('operator_id', '')
         test_params = self._config.get('test_parameters', {})
-        master_equipment_id = test_params.get('equipment_id', 'STINGER_01')
+        master_equipment_id = normalize_equipment_id(
+            test_params.get('equipment_id'),
+            DEFAULT_EQUIPMENT_ID,
+        )
         equipment_id = _detail_equipment_id(master_equipment_id, port_id)
         try:
             temperature_c = float(test_params.get('default_temperature_c', 25.0))
@@ -2753,7 +2817,10 @@ class WorkOrderController(QObject):
             )
 
         serial = self._ui_bridge._port_serials.get(port_id, 1)
-        activation_id = sm._attempt_count + 1
+        # ActivationID is a legacy column in the shared detail table.  Stinger
+        # keeps one current result per serial and overwrites it on each save;
+        # the state machine attempt count is not persisted as a row key.
+        activation_id = 1
 
         units_str = setup.units_label if setup else 'PSI'
 
@@ -2907,7 +2974,21 @@ class WorkOrderController(QObject):
         if self._port_manager:
             self._port_manager.stop_polling()
             self._port_manager.disconnect_all()
-
+        if self._nexus_client is not None:
+            try:
+                self._nexus_client.close()
+            except Exception:
+                logger.debug("Nexus client close failed", exc_info=True)
+            self._nexus_client = None
+        if self._ptp_repository is not None:
+            try:
+                close = getattr(self._ptp_repository, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                logger.debug("PTP repository close failed", exc_info=True)
+            self._ptp_repository = None
+            configure_ptp_repository(None)
     def _handle_debug_action(self, port_id: str, action: str, payload: Dict[str, Any]) -> None:
         """Handle debug actions from the debug panel."""
         try:

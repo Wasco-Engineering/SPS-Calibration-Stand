@@ -288,7 +288,7 @@ def print_report(report: dict[str, list[dict[str, Any]]]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description='Inspect/repair STINGER report visibility rows.')
-    parser.add_argument('--equipment-id', default='STINGER_01')
+    parser.add_argument('--equipment-id', default='CA-SPS-01')
     parser.add_argument('--shop-order')
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
