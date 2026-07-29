@@ -10,6 +10,7 @@ from app.services.pressure_calibration import (
     SENSOR_TRANSDUCER,
     CalibrationSample,
     filter_samples_pressure_band,
+    fit_interpolating_piecewise_error_model,
     fit_quadratic_error_model,
 )
 from quality_cal.session import CalibrationPointResult
@@ -42,7 +43,11 @@ def provisional_error_models(
     alicat_fit_max_psia: float | None = None,
     min_points: int = 3,
 ) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
-    """Fit quadratic error models from completed points for live UI (not final cert fit)."""
+    """Fit live UI models from completed points (not final cert fit).
+
+    Transducer: interpolating piecewise when enough distinct targets exist.
+    Alicat: quadratic (smoother over wider provisional spans).
+    """
     samples = _points_to_samples(points)
     alicat_max = alicat_fit_max_psia if alicat_fit_max_psia is not None else fit_max_psia
     transducer_banded = filter_samples_pressure_band(
@@ -64,13 +69,21 @@ def provisional_error_models(
     alicat_model: Optional[dict[str, Any]] = None
     if len(transducer_banded) >= min_points:
         try:
-            transducer_model = fit_quadratic_error_model(
+            transducer_model = fit_interpolating_piecewise_error_model(
                 transducer_banded,
                 sensor=SENSOR_TRANSDUCER,
                 reference=REFERENCE_MENSOR,
+                min_samples_per_knot=1,
             )
         except ValueError:
-            transducer_model = None
+            try:
+                transducer_model = fit_quadratic_error_model(
+                    transducer_banded,
+                    sensor=SENSOR_TRANSDUCER,
+                    reference=REFERENCE_MENSOR,
+                )
+            except ValueError:
+                transducer_model = None
     if len(alicat_banded) >= min_points:
         try:
             alicat_model = fit_quadratic_error_model(
@@ -89,7 +102,7 @@ def apply_provisional_corrections(
     fit_max_psia: float = 30.0,
     alicat_fit_max_psia: float | None = None,
 ) -> tuple[list[CalibrationPointResult], Optional[dict[str, Any]], Optional[dict[str, Any]]]:
-    """Rescore completed points with in-run quadratic models (for table + chart)."""
+    """Rescore completed points with in-run models (for table + chart)."""
     from quality_cal.core.port_calibrator import rescore_points_with_models
 
     transducer_model, alicat_model = provisional_error_models(

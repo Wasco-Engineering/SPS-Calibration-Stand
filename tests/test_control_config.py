@@ -17,8 +17,9 @@ def test_parse_control_config_defaults() -> None:
     assert parsed.ramps.pre_approach_rate_multiplier == 3.0
     assert parsed.cycling.num_cycles == 3
     assert parsed.edge_detection.precision_post_target_grace_sec == 0.35
-    assert parsed.edge_detection.precision_return_overshoot_torr == 30.0
-    assert parsed.edge_detection.precision_approach_settle_sec == 0.75
+    assert parsed.edge_detection.precision_return_overshoot_torr == 15.0
+    assert parsed.edge_detection.precision_approach_settle_sec == 0.2
+    assert parsed.edge_detection.precision_close_limit_offset_torr == 25.0
     assert parsed.debounce.stable_sample_count == 3
 
 

@@ -1,10 +1,13 @@
-# Install built Stinger apps and per-PC config under C:\Stinger (standard stand layout).
+# Install built Stinger apps under C:\Stinger (standard stand layout).
+#
+# Per-computer YAML lives in repo configs/<hostname>/ and is auto-selected at runtime.
 #
 # Usage (from repo, after build or with -Build):
-#   .\scripts\deploy_install_to_c_stinger.ps1 -StandId CA-SPS-01 -SetMachineEnv
+#   .\scripts\deploy_install_to_c_stinger.ps1 -StandId CA-SPS-02 -SetMachineEnv
 #   .\scripts\deploy_install_to_c_stinger.ps1 -Build -InstallPyInstaller -SetMachineEnv
 #
-# Run -SetMachineEnv in an elevated shell so CalibrationUser picks up STINGER_CONFIG_DIR.
+# Run -SetMachineEnv in an elevated shell so CalibrationUser picks up STINGER_STAND_ID
+# (do not set STINGER_CONFIG_DIR — hostname config selection needs it cleared).
 param(
     [string]$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).ProviderPath,
     [string]$InstallRoot = 'C:\Stinger',
@@ -37,6 +40,21 @@ $sameRoot = (
 if ((Test-Path $templatesSrc) -and -not $sameRoot) {
     New-Item -ItemType Directory -Path $templatesDest -Force | Out-Null
     Copy-Item (Join-Path $templatesSrc '*') $templatesDest -Recurse -Force
+}
+
+$configsSrc = Join-Path $projectPath 'configs'
+$configsDest = Join-Path $installPath 'configs'
+if ((Test-Path $configsSrc) -and -not $sameRoot) {
+    New-Item -ItemType Directory -Path $configsDest -Force | Out-Null
+    Copy-Item (Join-Path $configsSrc '*') $configsDest -Recurse -Force
+    Write-Host "Copied configs/ -> $configsDest"
+}
+
+$registrySrc = Join-Path $projectPath 'deploy\DEPLOYMENT_REGISTRY.yaml'
+$registryDestDir = Join-Path $installPath 'deploy'
+if ((Test-Path $registrySrc) -and -not $sameRoot) {
+    New-Item -ItemType Directory -Path $registryDestDir -Force | Out-Null
+    Copy-Item $registrySrc $registryDestDir -Force
 }
 
 $initArgs = @{

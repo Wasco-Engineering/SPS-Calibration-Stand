@@ -618,10 +618,20 @@ def test_port_manager_runtime_poll_profile_switch(monkeypatch: Any) -> None:
     assert divisors['port_a'] == 5
     assert divisors['port_b'] == 5
 
-    # Precision profile: one owner gets precision divisor, others normal.
+    # Precision profile: owner gets precision divisor; siblings stay normal until added.
     manager._alicat_poll_divisor_normal = 14
     manager._alicat_poll_divisor_precision = 2
     manager.set_alicat_poll_profile('port_b')
+    divisors = manager.get_alicat_poll_divisors()
+    assert divisors['port_a'] == 14
+    assert divisors['port_b'] == 2
+
+    # Concurrent precision: both ports can be in the precision set.
+    manager.set_alicat_poll_profile('port_a')
+    divisors = manager.get_alicat_poll_divisors()
+    assert divisors['port_a'] == 2
+    assert divisors['port_b'] == 2
+    manager.remove_precision_port('port_a')
     divisors = manager.get_alicat_poll_divisors()
     assert divisors['port_a'] == 14
     assert divisors['port_b'] == 2

@@ -16,7 +16,6 @@ from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 from app.hardware.port import Port
 from quality_cal.config import (
     QualitySettings,
-    get_default_config_path,
     point_timing_for_target,
 )
 from quality_cal.core.hardware_helpers import (
@@ -31,6 +30,10 @@ from quality_cal.core.hardware_helpers import (
     wait_until_near_target,
 )
 from quality_cal.core.mensor_reader import MensorReader
+from quality_cal.core.raw_reference_store import (
+    get_quality_cal_logs_dir,
+    publish_latest_raw_reference,
+)
 from quality_cal.session import CalibrationPointResult
 
 logger = logging.getLogger(__name__)
@@ -126,8 +129,7 @@ def _enable_raw_capture(port: Port) -> None:
 
 
 def _sweep_csv_path(port_id: str) -> Path:
-    log_dir = get_default_config_path().parent / 'logs'
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = get_quality_cal_logs_dir()
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     return log_dir / f'quality_cal_sweep_{port_id}_{stamp}.csv'
 
@@ -222,7 +224,7 @@ class CalibrationRunner(QObject):
         if target_psia > self._settings.mensor_max_psia + 1e-6:
             return None
         try:
-            return self._mensor.read_pressure().pressure_psia
+            return self._mensor.read_pressure(port_id=self._port_id).pressure_psia
         except Exception:
             return None
 
@@ -456,7 +458,23 @@ class CalibrationRunner(QObject):
                 )
 
             safe_shutdown_port(self._port)
+            if sweep is not None:
+                sweep.close()
+                sweep = None
             if sweep_path is not None:
+                try:
+                    publish_latest_raw_reference(
+                        sweep_path,
+                        port_id=self._port_id,
+                        profile_id=getattr(self._settings, 'profile_id', None),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        '%s: failed to publish raw reference from %s: %s',
+                        self._port_id,
+                        sweep_path,
+                        exc,
+                    )
                 self.sweepCsvReady.emit(str(sweep_path))
             self.finished.emit(results)
         except Exception as exc:

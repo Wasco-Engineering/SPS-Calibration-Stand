@@ -40,9 +40,23 @@ class _FakeAlicat:
         return True
 
 
+class _FakeDaq:
+    def __init__(self) -> None:
+        self.safe_calls = 0
+        self.reset_filter_calls = 0
+
+    def set_solenoid_safe(self) -> bool:
+        self.safe_calls += 1
+        return True
+
+    def reset_filter(self) -> None:
+        self.reset_filter_calls += 1
+
+
 class _FakePort:
     def __init__(self, outcomes: list[bool]) -> None:
         self.alicat = _FakeAlicat()
+        self.daq = _FakeDaq()
         self._outcomes = outcomes
         self.vent_calls = 0
         self.set_pressure_calls: list[float] = []
@@ -1262,14 +1276,10 @@ def test_executor_precision_targets_auto_reorder_swapped_cycle_estimates() -> No
     )
     assert source == 'cycle-estimate-offset-close-limit'
     # After reorder: activation_est=24.5 (higher), deactivation_est=23.0 (lower)
-    offset = 20.0 * (14.7 / 760.0)  # precision_close_limit_offset_torr in PSI
-    margin = 15.0 * (14.7 / 760.0)  # precision_deactivation_margin_torr in PSI
-    expected_approach = max(22.0, min(24.5 - offset, 24.0 - offset * 0.25))
-    assert approach == pytest.approx(expected_approach, rel=1e-3)
-    # target_out is widened to cover the activation band upper limit (26.0)
-    # plus a 25% offset buffer to guarantee the sweep passes through
-    assert target_out == pytest.approx(26.0 + offset * 0.25, rel=1e-3)
-    assert target_back == pytest.approx(max(22.0, 23.0 - margin), rel=1e-3)
+    pad = convert_pressure(8.0, 'Torr', 'PSI')
+    assert approach == pytest.approx(24.5 - pad, abs=1e-4)
+    assert target_out == pytest.approx(24.5 + pad, abs=1e-4)
+    assert target_back == pytest.approx(23.0 - pad, abs=1e-4)
 
 
 def test_executor_run_precision_skips_atmosphere_gate_after_cycling() -> None:
@@ -1319,15 +1329,19 @@ def test_precision_near_approach_settles_at_slow_rate_before_sweep() -> None:
     # PTP decreasing close-limit approach is max band (~600 Torr).
     approach_psi = convert_pressure(600.0, 'Torr', 'PSI')
 
-    executor._vacuum_switch_trips_on_no_open = lambda: True  # type: ignore[method-assign]
-    executor._read_pressure_and_switch_state = lambda: (approach_psi, True)  # type: ignore[method-assign]
+    executor._precision_phase_runner._can_start_precision_from_current_reset_side = (  # type: ignore[method-assign]
+        lambda *_args: True
+    )
     executor._precision_phase_runner._run_precision_fast_approach = (  # type: ignore[method-assign]
         lambda _mode, _target: called.__setitem__('fast_approach', True)
     )
     executor._precision_phase_runner._settle_at_precision_approach = (  # type: ignore[method-assign]
         lambda _target: called.__setitem__('settle', True)
     )
-    executor._run_sweep_pass = lambda *_args: SweepPassOutcome(  # type: ignore[method-assign]
+    executor._precision_phase_runner._ensure_precision_starts_from_reset_side = (  # type: ignore[method-assign]
+        lambda *_args: False
+    )
+    executor._run_sweep_pass = lambda *_args, **_kwargs: SweepPassOutcome(  # type: ignore[method-assign]
         result=SweepResult(activation_psi=1.5, deactivation_psi=1.8),
         missing_edge=None,
     )
@@ -1337,6 +1351,40 @@ def test_precision_near_approach_settles_at_slow_rate_before_sweep() -> None:
     assert result is not None
     assert called['fast_approach'] is False
     assert called['settle'] is True
+
+
+def test_precision_deactivates_then_fast_approaches_to_act_close_limit() -> None:
+    """Decreasing precision must deactivate past deact, then approach above act."""
+    executor = _build_executor(_FakePort([True]))
+    calls: list[tuple[str, float]] = []
+
+    executor._resolve_precision_targets = (  # type: ignore[method-assign]
+        lambda *_args: (7.76, 7.45, 8.99, 'cycle-estimate-offset-close-limit')
+    )
+    executor._precision_phase_runner._can_start_precision_from_current_reset_side = (  # type: ignore[method-assign]
+        lambda *_args: False
+    )
+
+    def _stage(_mode: str, _direction: int, reset_target: float) -> None:
+        calls.append(('deactivate', reset_target))
+
+    def _fast(_mode: str, target: float) -> None:
+        calls.append(('approach', target))
+
+    executor._precision_phase_runner._stage_precision_deactivated = _stage  # type: ignore[method-assign]
+    executor._precision_phase_runner._run_precision_fast_approach = _fast  # type: ignore[method-assign]
+    executor._precision_phase_runner._ensure_precision_starts_from_reset_side = (  # type: ignore[method-assign]
+        lambda *_args: False
+    )
+    executor._run_sweep_pass = lambda *_args, **_kwargs: SweepPassOutcome(  # type: ignore[method-assign]
+        result=SweepResult(activation_psi=7.6, deactivation_psi=8.8),
+        missing_edge=None,
+    )
+
+    result = executor._run_precision_sweep('vacuum', (7.5, 9.5), skip_atmosphere_gate=True)
+
+    assert result is not None
+    assert calls == [('deactivate', 8.99), ('approach', 7.76)]
 
 
 def test_precision_direct_handoff_rejects_mid_band_below_decreasing_approach() -> None:
@@ -1360,13 +1408,16 @@ def test_precision_starts_slow_sweep_from_reset_side_after_arming() -> None:
     executor._precision_phase_runner._can_start_precision_from_current_reset_side = (  # type: ignore[method-assign]
         lambda *_args: False
     )
+    executor._precision_phase_runner._stage_precision_deactivated = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: None
+    )
     executor._precision_phase_runner._run_precision_fast_approach = (  # type: ignore[method-assign]
         lambda mode, target: fast_targets.append((mode, target))
     )
     executor._precision_phase_runner._ensure_precision_starts_from_reset_side = (  # type: ignore[method-assign]
         lambda *_args: True
     )
-    executor._run_sweep_pass = lambda *_args: SweepPassOutcome(  # type: ignore[method-assign]
+    executor._run_sweep_pass = lambda *_args, **_kwargs: SweepPassOutcome(  # type: ignore[method-assign]
         result=SweepResult(activation_psi=1.1, deactivation_psi=1.7),
         missing_edge=None,
     )
@@ -1406,6 +1457,7 @@ def test_ordered_cycle_estimates_nudge_equal_means_for_decreasing() -> None:
     )
     assert source == 'cycle-estimate-offset-close-limit'
     assert approach > target_out
+    assert approach >= 2.8046  # sit at/above PTP high — not clamped onto the band edge
     assert target_back >= deactivation
 
 
@@ -1464,7 +1516,7 @@ def test_precision_arming_uses_reset_target_when_already_activated_decreasing() 
         max_psi=9.48,
     )
 
-    assert commanded == [pytest.approx(23.66)]
+    assert commanded == [pytest.approx(8.96 + 14.7)]
     assert port.solenoid_calls == [True]
 
 
@@ -1557,7 +1609,8 @@ def test_vacuum_increasing_pre_approach_starts_on_low_reset_side() -> None:
     assert wait_timeouts[0] < executor._edge_timeout_s
 
 
-def test_vacuum_decreasing_pre_approach_skips_vent_and_atmosphere_staging() -> None:
+def test_vacuum_decreasing_pre_approach_approaches_baro_on_atmosphere_then_vacuum() -> None:
+    """Decreasing vacuum must reach baro on atmosphere before engaging the vacuum route."""
     setup = TestSetup(
         part_id='UC8A',
         sequence_id='399',
@@ -1591,9 +1644,14 @@ def test_vacuum_decreasing_pre_approach_skips_vent_and_atmosphere_staging() -> N
         get_barometric_psi=lambda _pid: 13.43,
     )
     staged: list[bool] = []
+    commanded: list[float] = []
+    waits: list[float] = []
     executor._stage_atmosphere_setpoint_before_route = lambda: staged.append(True)  # type: ignore[method-assign]
-    executor._set_pressure_or_raise = lambda _pressure: None  # type: ignore[method-assign]
-    executor._wait_until_near_target = lambda **_kwargs: True  # type: ignore[method-assign]
+    executor._set_pressure_or_raise = lambda pressure: commanded.append(pressure)  # type: ignore[method-assign]
+    executor._wait_until_near_target = (  # type: ignore[method-assign]
+        lambda **kwargs: waits.append(float(kwargs['target_psi'])) or True
+    )
+    executor._read_pressure_and_switch_state = lambda: (13.43, True)  # type: ignore[method-assign]
 
     bounds = (
         convert_pressure(73.0, 'Torr', 'PSI'),
@@ -1603,6 +1661,11 @@ def test_vacuum_decreasing_pre_approach_skips_vent_and_atmosphere_staging() -> N
 
     assert port.vent_calls == 0
     assert staged == []
+    assert port.daq.safe_calls == 1
+    assert port.daq.reset_filter_calls == 1
+    assert waits == [pytest.approx(13.43)]
+    assert commanded == [pytest.approx(13.43)]
+    # Vacuum route is engaged only after baro pre-approach completes.
     assert port.solenoid_calls == [True]
 
 
@@ -1654,7 +1717,7 @@ def test_pressure_decreasing_pre_approach_resets_above_deactivation_side() -> No
 
     min_psi = convert_pressure(390.0, 'mmHg @ 0 C', 'PSI')
     max_psi = convert_pressure(500.0, 'mmHg @ 0 C', 'PSI')
-    overshoot = 0.5
+    overshoot = executor._cycle_overshoot_psi(min_psi, max_psi)
     executor._cycle_phase_runner.run_pre_approach('pressure', (min_psi, max_psi))
 
     assert waits == [pytest.approx(max_psi + overshoot)]
@@ -1920,35 +1983,128 @@ def test_pressure_increasing_pre_approach_resets_below_deactivation_side() -> No
 
     executor._cycle_phase_runner.run_pre_approach('pressure', (8.0, 10.5))
 
-    assert waits == [pytest.approx(7.5)]
+    overshoot = executor._cycle_overshoot_psi(8.0, 10.5)
+    expected = 8.0 - overshoot
+    assert waits == [pytest.approx(expected)]
     assert commanded == [
         pytest.approx(14.7),
-        pytest.approx(22.2),
+        pytest.approx(14.7 + expected),
     ]
+
+
+def test_decreasing_vacuum_precision_brackets_cycle_estimates() -> None:
+    """Absolute-Torr decreasing parts must approach/return near deact estimate."""
+    setup = TestSetup(
+        part_id='17025',
+        sequence_id='399',
+        units_code='21',
+        units_label='Torr',
+        activation_direction='Decreasing',
+        activation_target=400.0,
+        pressure_reference='absolute',
+        terminals={},
+        bands={
+            'increasing': {'lower': 390.0, 'upper': 490.0},
+            'decreasing': {'lower': 390.0, 'upper': 410.0},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    executor = _TestExecutor(
+        port_id='port_a',
+        port=cast(Any, _FakePort([True])),
+        test_setup=setup,
+        config={
+            'control': {
+                'cycling': {},
+                'ramps': {},
+                'edge_detection': {
+                    'precision_close_limit_offset_torr': 25.0,
+                    'precision_deactivation_margin_torr': 15.0,
+                },
+                'debounce': {},
+            },
+        },
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.58,
+    )
+    executor._cycle_activation_samples = [7.63]
+    executor._cycle_deactivation_samples = [9.23]
+    min_psi, max_psi = 7.5434, 9.4776
+    pad = convert_pressure(8.0, 'Torr', 'PSI')
+
+    approach, target_out, target_back, source = executor._resolve_precision_targets(
+        min_psi=min_psi,
+        max_psi=max_psi,
+        activation_direction=-1,
+    )
+
+    assert source == 'cycle-estimate-offset-close-limit'
+    # Close-limit sits above activation, not up at deactivation.
+    assert approach == pytest.approx(7.63 + pad, abs=1e-4)
+    assert target_out == pytest.approx(7.63 - pad, abs=1e-4)
+    assert target_back == pytest.approx(9.23 + pad, abs=1e-4)
+    assert approach < 9.23
+
+
+def test_wait_for_cycle_edge_accepts_edges_recorded_during_prep() -> None:
+    """Deep-vacuum prep can trip activation before wait starts; those edges must count."""
+    from app.hardware.port import EdgeEvent
+
+    port = _FakePort([True])
+    edges = [EdgeEvent(pressure=0.32, timestamp=0.0, direction='decreasing', activated=True)]
+    port.get_edge_history = lambda: list(edges)  # type: ignore[attr-defined]
+    executor = _build_executor(port)
+    executor._resolve_sweep_mode = lambda: 'vacuum'  # type: ignore[method-assign]
+    executor._resolve_activation_sweep_direction = lambda: -1  # type: ignore[method-assign]
+    executor._resolve_sweep_bounds = lambda: (0.24, 0.58)  # type: ignore[method-assign]
+    executor._vacuum_switch_trips_on_no_open = lambda: True  # type: ignore[method-assign]
+    executor._absolute_to_test_reference = lambda value: value  # type: ignore[method-assign]
+    executor._read_pressure_and_switch_state = lambda: (0.32, True)  # type: ignore[method-assign]
+    executor._get_latest_reading = lambda _pid: None  # type: ignore[method-assign]
+    executor._hold_after_cycle_edge = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+
+    detected, diagnostic = executor._wait_for_cycle_edge(
+        target_psi=0.087,
+        direction=-1,
+        edge_type='activation',
+        samples_before=0,
+        timeout_s=0.5,
+        port_edges_before=0,
+    )
+
+    assert detected is True
+    assert diagnostic is None
+    assert executor._cycle_activation_samples == [pytest.approx(0.32)]
 
 
 def test_adaptive_cycle_target_shortens_later_vacuum_cycles() -> None:
     executor = _build_executor(_FakePort([True]))
     executor._cycle_activation_samples = [9.6]
     executor._cycle_deactivation_samples = [10.7]
+    bounds = (9.2, 12.5)
+    margin = max(executor._cycle_overshoot_psi(*bounds), (bounds[1] - bounds[0]) * 0.10)
 
     activation = executor._adaptive_cycle_target(
         'activation',
         full_target=3.5,
         direction=-1,
-        bounds=(9.2, 12.5),
+        bounds=bounds,
         hw_bounds=(0.0, 115.0),
     )
     deactivation = executor._adaptive_cycle_target(
         'deactivation',
         full_target=13.0,
         direction=-1,
-        bounds=(9.2, 12.5),
+        bounds=bounds,
         hw_bounds=(0.0, 115.0),
     )
 
-    assert activation == pytest.approx(8.6)
-    assert deactivation == pytest.approx(11.7)
+    assert activation == pytest.approx(9.6 - margin)
+    assert deactivation == pytest.approx(10.7 + margin)
+    # Must actually shorten versus the full band endpoints.
+    assert activation > 3.5
+    assert deactivation < 13.0
 
 
 def test_cycle_edge_wait_falls_back_to_full_target_when_adaptive_misses() -> None:

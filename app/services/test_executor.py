@@ -97,7 +97,7 @@ class CyclePhaseRunner:
                 pre_approach_abs = baro_psi
         else:
             hw_min_psi, hw_max_psi = self._ctx._resolve_hardware_limits_test_reference()
-            overshoot = max((max_psi - min_psi) * (self._ctx._overshoot_pct / 100.0), 0.5)
+            overshoot = self._ctx._cycle_overshoot_psi(min_psi, max_psi)
             _activation_target, pre_approach_target = self._ctx._resolve_cycle_targets(
                 sweep_mode,
                 min_psi,
@@ -118,18 +118,36 @@ class CyclePhaseRunner:
         )
 
         if sweep_mode == 'vacuum':
-            # Decreasing vacuum tests start from local baro on the vacuum route
-            # prepared earlier; venting here bleeds toward sea-level default and
-            # drops the test route back to atmosphere idle.
+            # Increasing vacuum: vent then deep-vacuum pre-approach on vacuum route.
+            # Decreasing vacuum: do NOT vent-to-EXH here; approach baro on atmosphere.
             if activation_direction > 0 and not self._ctx._port.vent_to_atmosphere():
                 self._ctx._fail(
                     TestFailureCode.ROUTE_FAILURE,
                     f'Failed to vent for pre-approach on {self._ctx._port_id}',
                 )
 
-        if not (sweep_mode == 'vacuum' and activation_direction < 0):
+        decreasing_vacuum = sweep_mode == 'vacuum' and activation_direction < 0
+        if decreasing_vacuum:
+            # Atmosphere route + leave EXH, then command baro. Switching vacuum
+            # first made baro unreachable and left Alicat unable to raise P on
+            # the deactivation climb (setpoint ramps, pressure stuck).
+            if not self._ctx._port.daq.set_solenoid_safe():
+                self._ctx._fail(
+                    TestFailureCode.ROUTE_FAILURE,
+                    f'Failed to engage atmosphere route for decreasing-vacuum pre-approach on {self._ctx._port_id}',
+                )
+            self._ctx._port.daq.reset_filter()
+            exit_exh = getattr(self._ctx._port, '_exit_alicat_exhaust', None)
+            if callable(exit_exh):
+                exit_exh(baro_psi)
+            if getattr(self._ctx._port, '_alicat_in_exhaust_mode', lambda: False)():
+                self._ctx._fail(
+                    TestFailureCode.ROUTE_FAILURE,
+                    f'Alicat still in EXH before decreasing-vacuum pre-approach on {self._ctx._port_id}',
+                )
+        else:
             self._ctx._stage_atmosphere_setpoint_before_route()
-        self._ctx._set_active_test_route(sweep_mode, 'pre-approach')
+            self._ctx._set_active_test_route(sweep_mode, 'pre-approach')
 
         if not self._ctx._port.alicat.set_ramp_rate(pre_approach_rate):
             self._ctx._fail(
@@ -141,7 +159,7 @@ class CyclePhaseRunner:
         # Wait until close to the pre-approach target (generous tolerance)
         if sweep_mode == 'vacuum':
             tolerance = max(1.5, (max_psi - min_psi) * 0.15)
-            timeout_cap_s = 3.0
+            timeout_cap_s = 3.0 if not decreasing_vacuum else 8.0
         else:
             tolerance = max(0.15, min(0.35, (max_psi - min_psi) * 0.08))
             timeout_cap_s = self._ctx._edge_timeout_s
@@ -168,13 +186,21 @@ class CyclePhaseRunner:
                 pre_approach_timeout_s,
             )
 
+        if decreasing_vacuum:
+            # Now that we are at/near baro on atmosphere, engage vacuum for cycling.
+            self._ctx._set_active_test_route('vacuum', 'pre-approach to cycling')
+            logger.info(
+                '%s: Decreasing-vacuum pre-approach complete — vacuum route engaged for cycling',
+                self._ctx._port_id,
+            )
+
     def run_single_cycle(self, sweep_mode: str, bounds: tuple[float, float]) -> None:
         """Run a single cycle: ramp fast until activation detected, then reverse until deactivation detected."""
         min_psi, max_psi = bounds
         direction = self._ctx._resolve_activation_sweep_direction()
         hw_min_psi, hw_max_psi = self._ctx._resolve_hardware_limits_test_reference()
 
-        overshoot = max((max_psi - min_psi) * (self._ctx._overshoot_pct / 100.0), 0.5)
+        overshoot = self._ctx._cycle_overshoot_psi(min_psi, max_psi)
         full_activation, full_deactivation = self._ctx._resolve_cycle_targets(
             sweep_mode,
             min_psi,
@@ -190,16 +216,13 @@ class CyclePhaseRunner:
             bounds,
             (hw_min_psi, hw_max_psi),
         )
-        if sweep_mode == 'vacuum':
-            target_deactivation = full_deactivation
-        else:
-            target_deactivation = self._ctx._adaptive_cycle_target(
-                'deactivation',
-                full_deactivation,
-                direction,
-                bounds,
-                (hw_min_psi, hw_max_psi),
-            )
+        target_deactivation = self._ctx._adaptive_cycle_target(
+            'deactivation',
+            full_deactivation,
+            direction,
+            bounds,
+            (hw_min_psi, hw_max_psi),
+        )
         activation_fallback = full_activation if not math.isclose(target_activation, full_activation, abs_tol=0.05) else None
         deactivation_fallback = full_deactivation if not math.isclose(target_deactivation, full_deactivation, abs_tol=0.05) else None
         deactivation_direction = 1 if target_deactivation > target_activation else -1
@@ -217,6 +240,11 @@ class CyclePhaseRunner:
         self._ctx._cycle_debounce_state = SpdtDebounceState()
         if hasattr(self._ctx._port, 'clear_edge_history'):
             self._ctx._port.clear_edge_history()
+        get_history = getattr(self._ctx._port, 'get_edge_history', None)
+        # Snapshot after clear so edges that fire during activation prep (common on
+        # deep-vacuum Torr parts that overshoot the prep setpoint) are still
+        # accepted when the activation wait starts.
+        activation_port_edges_before = len(get_history()) if callable(get_history) else 0
 
         self._ctx._set_active_test_route(sweep_mode, 'cycle start')
 
@@ -273,6 +301,7 @@ class CyclePhaseRunner:
             samples_before=activation_samples_before,
             timeout_s=self._ctx._edge_timeout_s,
             fallback_target_psi=full_activation if act_target != full_activation else None,
+            port_edges_before=activation_port_edges_before,
         )
 
         if self._ctx._cancel_event.is_set():
@@ -298,10 +327,49 @@ class CyclePhaseRunner:
                     error_msg,
                 )
 
+        # Freeze at the measured activation sample (not the overshot live
+        # pressure), then retarget deactivation from the latest estimates so
+        # later cycles reverse toward each other instead of the full band ends.
+        edge_sample = (
+            self._ctx._cycle_activation_samples[-1]
+            if self._ctx._cycle_activation_samples
+            else None
+        )
+        edge_pressure, _edge_switch = self._ctx._read_pressure_and_switch_state()
+        freeze_psi = edge_sample if edge_sample is not None else edge_pressure
+        if freeze_psi is not None and math.isfinite(freeze_psi):
+            if not self._ctx._port.alicat.set_ramp_rate(0.0):
+                logger.warning(
+                    '%s: Failed to zero ramp rate for activation freeze; continuing',
+                    self._ctx._port_id,
+                )
+            else:
+                self._ctx._set_pressure_or_raise(self._ctx._to_absolute(freeze_psi))
+                self._ctx._port.alicat.cancel_hold()
+                logger.info(
+                    '%s: Frozen at activation edge %.4f PSI before deactivation climb',
+                    self._ctx._port_id,
+                    freeze_psi,
+                )
+
+        target_deactivation = self._ctx._adaptive_cycle_target(
+            'deactivation',
+            full_deactivation,
+            direction,
+            bounds,
+            (hw_min_psi, hw_max_psi),
+        )
+        deactivation_fallback = (
+            full_deactivation
+            if not math.isclose(target_deactivation, full_deactivation, abs_tol=0.05)
+            else None
+        )
+        deactivation_direction = 1 if target_deactivation > target_activation else -1
         logger.info(
-            '%s: Activation edge recorded — reversing toward deactivation target %.4f PSI',
+            '%s: Activation edge recorded — reversing toward deactivation target %.4f PSI%s',
             self._ctx._port_id,
             target_deactivation,
+            f' (fallback={full_deactivation:.4f})' if deactivation_fallback is not None else '',
         )
 
         # ---- Phase 2: Immediately reverse direction and ramp toward deactivation until deactivation edge detected ----
@@ -322,6 +390,9 @@ class CyclePhaseRunner:
 
         deact_target = full_deactivation if not self._ctx._cycle_prep_confirmed else target_deactivation
         target_deactivation_abs = self._ctx._to_absolute(deact_target)
+        # Direction reverse: clear any residual EXH/hold and re-assert ramp so the
+        # Alicat can raise pressure on the vacuum route after the activation pull-down.
+        self._ctx._port.alicat.cancel_hold()
         if not self._ctx._port.alicat.set_ramp_rate(self._ctx._fast_rate_psi):
             self._ctx._fail(
                 TestFailureCode.RAMP_RATE_FAILURE,
@@ -330,9 +401,10 @@ class CyclePhaseRunner:
         self._ctx._set_pressure_or_raise(target_deactivation_abs)
 
         logger.info(
-            '%s: Cycle fast ramp to deactivation target %.4f PSI, waiting for reset edge%s',
+            '%s: Cycle fast ramp to deactivation target %.4f PSI%s, waiting for reset edge%s',
             self._ctx._port_id,
             deact_target,
+            f' (fallback={full_deactivation:.4f})' if deactivation_fallback is not None else '',
             ' (full-range fallback: prep unconfirmed)' if not self._ctx._cycle_prep_confirmed else '',
         )
 
@@ -540,6 +612,16 @@ class PrecisionPhaseRunner:
             )
             self._settle_at_precision_approach(approach_target)
         else:
+            # Decreasing close-limit: deactivate past deact estimate first, then
+            # fast-approach down to just above activation. Jumping straight to
+            # act+pad while still activated made the slow sweep start mid-band.
+            self._stage_precision_deactivated(
+                sweep_mode,
+                activation_direction,
+                reset_target=target_back,
+            )
+            if self._ctx._cancel_event.is_set():
+                return None
             self._run_precision_fast_approach(sweep_mode, approach_target)
 
         armed_from_reset_side = self._ensure_precision_starts_from_reset_side(
@@ -579,6 +661,7 @@ class PrecisionPhaseRunner:
             target_back,
             activation_direction,
             self._ctx._slow_edge_rate_psi,
+            apply_return_overshoot=target_source != 'cycle-estimate-offset-close-limit',
         )
         result = outcome.result
         self._ctx._last_precision_missing_edge = outcome.missing_edge
@@ -630,12 +713,118 @@ class PrecisionPhaseRunner:
             )
         return ready
 
+    def _stage_precision_deactivated(
+        self,
+        sweep_mode: str,
+        activation_direction: int,
+        reset_target: float,
+    ) -> None:
+        """Ensure the switch is deactivated on the reset side before close-limit approach.
+
+        For decreasing parts this means climbing to/above the deactivation
+        estimate first; only then may we fast-approach down to just above
+        activation for the short slow sweep.
+        """
+        activation_state = self._ctx._target_switch_state_for_edge('activation')
+        pressure, switch_state = self._ctx._read_pressure_and_switch_state()
+        tol = self._ctx._precision_approach_tolerance_psi
+        on_reset_side = (
+            pressure is not None
+            and math.isfinite(pressure)
+            and (
+                (activation_direction < 0 and pressure >= reset_target - tol)
+                or (activation_direction > 0 and pressure <= reset_target + tol)
+            )
+        )
+        if switch_state is not None and switch_state != activation_state and on_reset_side:
+            logger.info(
+                '%s: Precision already deactivated near reset staging %.4f PSI (pressure=%.4f)',
+                self._ctx._port_id,
+                reset_target,
+                pressure if pressure is not None else float('nan'),
+            )
+            return
+
+        self._ctx._emit_substate('precision.prep_reset')
+        logger.info(
+            '%s: Precision deactivate staging to %.4f PSI before close-limit approach '
+            '(switch_activated=%s pressure=%s)',
+            self._ctx._port_id,
+            reset_target,
+            switch_state,
+            f'{pressure:.4f}' if pressure is not None else '--',
+        )
+        if not self._ctx._port.alicat.set_ramp_rate(self._ctx._fast_rate_psi):
+            self._ctx._fail(
+                TestFailureCode.RAMP_RATE_FAILURE,
+                f'Failed to set precision deactivate ramp rate for {self._ctx._port_id}',
+            )
+        self._ctx._set_active_test_route(sweep_mode, 'precision deactivate staging')
+        self._ctx._set_pressure_or_raise(self._ctx._to_absolute(reset_target))
+
+        start = time.perf_counter()
+        near_since: Optional[float] = None
+        timeout_s = min(self._ctx._edge_timeout_s, 20.0)
+        while time.perf_counter() - start < timeout_s:
+            if self._ctx._cancel_event.is_set():
+                return
+            pressure_now, state_now = self._ctx._read_pressure_and_switch_state()
+            deactivated = state_now is not None and state_now != activation_state
+            near_reset = (
+                pressure_now is not None
+                and math.isfinite(pressure_now)
+                and abs(pressure_now - reset_target) <= tol
+            )
+            on_reset_side_now = pressure_now is not None and math.isfinite(pressure_now) and (
+                (activation_direction < 0 and pressure_now >= reset_target - tol)
+                or (activation_direction > 0 and pressure_now <= reset_target + tol)
+            )
+            if deactivated and on_reset_side_now:
+                logger.info(
+                    '%s: Precision deactivate staging complete at %.4f PSI',
+                    self._ctx._port_id,
+                    pressure_now if pressure_now is not None else float('nan'),
+                )
+                return
+            if near_reset:
+                now = time.perf_counter()
+                if near_since is None:
+                    near_since = now
+                elif now - near_since >= max(0.1, self._ctx._precision_approach_settle_s):
+                    if deactivated:
+                        logger.info(
+                            '%s: Precision deactivate staging near target %.4f PSI (deactivated)',
+                            self._ctx._port_id,
+                            reset_target,
+                        )
+                        return
+                    logger.warning(
+                        '%s: Precision deactivate staging reached %.4f PSI but switch still '
+                        'activated; continuing to close-limit approach',
+                        self._ctx._port_id,
+                        reset_target,
+                    )
+                    return
+            else:
+                near_since = None
+            time.sleep(0.02)
+
+        pressure_final, state_final = self._ctx._read_pressure_and_switch_state()
+        logger.warning(
+            '%s: Precision deactivate staging timed out (pressure=%s switch_activated=%s '
+            'target=%.4f); continuing to close-limit approach',
+            self._ctx._port_id,
+            f'{pressure_final:.4f}' if pressure_final is not None else '--',
+            state_final,
+            reset_target,
+        )
+
     def _settle_at_precision_approach(self, approach_target: float) -> None:
-        """Downshift to the slow edge rate and dwell at the approach setpoint.
+        """Downshift to the slow edge rate and briefly hold at the approach setpoint.
 
         Cycling / fast approach leave the Alicat at a high ramp rate. Starting
-        the precision out-sweep immediately overshoots the trip and makes
-        activation/deactivation look inconsistent run-to-run.
+        the precision out-sweep immediately overshoots the trip. A short hold is
+        enough to kill momentum — long dwells just burned cycle time.
         """
         self._ctx._emit_substate('precision.approach_settle')
         approach_abs = self._ctx._to_absolute(approach_target)
@@ -646,17 +835,27 @@ class PrecisionPhaseRunner:
             )
         self._ctx._set_pressure_or_raise(approach_abs)
         self._ctx._port.alicat.cancel_hold()
-        settle_s = max(0.5, self._ctx._precision_approach_settle_s)
+        pressure_now, _switch = self._ctx._read_pressure_and_switch_state()
+        already_near = (
+            pressure_now is not None
+            and math.isfinite(pressure_now)
+            and abs(pressure_now - approach_target) <= self._ctx._precision_approach_tolerance_psi
+        )
+        # Config settle, but never force a long stall when already on target.
+        settle_s = max(0.12, float(self._ctx._precision_approach_settle_s))
+        if already_near:
+            settle_s = min(settle_s, 0.18)
         logger.info(
-            '%s: Precision approach settle target=%.4f PSI rate=%.4f psi/s hold=%.2fs',
+            '%s: Precision approach settle target=%.4f PSI rate=%.4f psi/s hold=%.2fs near=%s',
             self._ctx._port_id,
             approach_target,
             self._ctx._slow_edge_rate_psi,
             settle_s,
+            already_near,
         )
         if self._ctx._wait_until_near_target(
             target_psi=approach_target,
-            timeout_s=min(self._ctx._edge_timeout_s, 20.0),
+            timeout_s=min(self._ctx._edge_timeout_s, 12.0),
             tolerance_psi=self._ctx._precision_approach_tolerance_psi,
             settle_s=settle_s,
         ):
@@ -788,7 +987,20 @@ class PrecisionPhaseRunner:
             return False
 
         hw_min_psi, hw_max_psi = self._ctx._resolve_hardware_limits_test_reference()
-        arm_target = min(hw_max_psi, max(hw_min_psi, reset_target))
+        # When approach already tripped the switch, re-arm all the way to the
+        # reset/deactivation staging target — not just one close-limit offset
+        # past approach (that left vacuum parts still activated mid-hysteresis).
+        offset = self._ctx._precision_close_limit_offset_psi
+        if activation_direction < 0:
+            arm_target = reset_target if reset_target > approach_target else min(
+                hw_max_psi, approach_target + offset
+            )
+            arm_target = min(hw_max_psi, max(arm_target, approach_target + offset * 0.25))
+        else:
+            arm_target = reset_target if reset_target < approach_target else max(
+                hw_min_psi, approach_target - offset
+            )
+            arm_target = max(hw_min_psi, min(arm_target, approach_target - offset * 0.25))
         if abs(arm_target - approach_target) < 0.02:
             logger.warning(
                 '%s: Pre-pass switch already activated at pressure=%s; no room to arm from reset side',
@@ -798,10 +1010,13 @@ class PrecisionPhaseRunner:
             return False
 
         logger.warning(
-            '%s: Pre-pass switch already activated at pressure=%s; arming from reset side at %.4f PSI',
+            '%s: Pre-pass switch already activated at pressure=%s; arming from reset side at %.4f PSI '
+            '(approach=%.4f reset_cap=%.4f)',
             self._ctx._port_id,
             f'{pressure:.4f} PSI' if pressure is not None else '--',
             arm_target,
+            approach_target,
+            reset_target,
         )
         self._ctx._set_active_test_route(sweep_mode, 'precision arming')
         if not self._ctx._port.alicat.set_ramp_rate(self._ctx._fast_rate_psi):
@@ -1122,7 +1337,10 @@ class TestExecutor:
                 self._vacuum_switch_trips_on_no_open(),
             )
 
-            if sweep_mode == 'vacuum':
+            # Vacuum increasing needs the vacuum route before deep-vacuum pre-approach.
+            # Decreasing vacuum must pre-approach on atmosphere first (baro is unreachable
+            # on the vacuum route and fighting the pump kills later upward control).
+            if sweep_mode == 'vacuum' and self._resolve_activation_sweep_direction() > 0:
                 self._ensure_vacuum_solenoid_route()
 
             # ---- Pre-approach: fast ramp to near edge of test range ----
@@ -1206,6 +1424,17 @@ class TestExecutor:
     def _run_single_cycle(self, sweep_mode: str, bounds: tuple[float, float]) -> None:
         self._cycle_phase_runner.run_single_cycle(sweep_mode, bounds)
 
+    def _cycle_overshoot_psi(self, min_psi: float, max_psi: float) -> float:
+        """Past-band travel for fast cycling.
+
+        A hard 0.5 PSI floor (~26 Torr) made narrow absolute-Torr bands overshoot
+        badly. Floor at ~8 Torr instead; percent-of-band still applies when larger.
+        """
+        band = max(0.0, max_psi - min_psi)
+        from_percent = band * (self._overshoot_pct / 100.0)
+        floor_psi = convert_pressure(8.0, 'Torr', 'PSI')
+        return max(from_percent, floor_psi)
+
     def _resolve_cycle_targets(
         self,
         sweep_mode: str,
@@ -1246,7 +1475,12 @@ class TestExecutor:
         bounds: tuple[float, float],
         hw_bounds: tuple[float, float],
     ) -> float:
-        """Use prior cycle edges to shorten later cycle traverses, with full-target fallback."""
+        """Use prior cycle edges to shorten later cycle traverses, with full-target fallback.
+
+        Past-estimate travel matches cycle overshoot (~8 Torr floor), not a hard 1 PSI
+        floor — that wiped out shortening on absolute-Torr vacuum parts where the
+        measured edges already sit well inside the full band targets.
+        """
         samples = (
             self._cycle_activation_samples
             if edge_type == 'activation'
@@ -1258,7 +1492,8 @@ class TestExecutor:
 
         min_psi, max_psi = bounds
         hw_min, hw_max = hw_bounds
-        margin = max(1.0, (max_psi - min_psi) * 0.25)
+        band = max(0.0, max_psi - min_psi)
+        margin = max(self._cycle_overshoot_psi(min_psi, max_psi), band * 0.10)
         if (edge_type == 'activation') == (direction > 0):
             target = min(hw_max, estimate + margin)
             return min(full_target, target)
@@ -2144,6 +2379,7 @@ class TestExecutor:
         target_back: float,
         direction: int,
         rate_psi_per_sec: float,
+        apply_return_overshoot: bool = True,
     ) -> SweepPassOutcome:
         """Single sweep pass: out to edge, then back to edge."""
 
@@ -2161,6 +2397,7 @@ class TestExecutor:
             direction=direction,
             rate_psi_per_sec=rate_psi_per_sec,
             fail_on_rate_error=True,
+            apply_return_overshoot=apply_return_overshoot,
         )
 
     def _run_window_precision_pass(
@@ -2386,6 +2623,7 @@ class TestExecutor:
         direction: int,
         rate_psi_per_sec: float,
         fail_on_rate_error: bool,
+        apply_return_overshoot: bool = True,
     ) -> SweepPassOutcome:
         if not self._port.alicat.set_ramp_rate(rate_psi_per_sec):
             if fail_on_rate_error:
@@ -2412,7 +2650,12 @@ class TestExecutor:
         # Ignore turnaround bounce: require pressure to cross past the activation
         # point in the return direction before accepting deactivation.
         hw_min_psi, hw_max_psi = self._resolve_hardware_limits_test_reference()
-        return_target = target_back + (self._precision_return_overshoot_psi * (-direction))
+        if apply_return_overshoot:
+            return_target = target_back + (self._precision_return_overshoot_psi * (-direction))
+        else:
+            # Cycle estimates already place target_back past the deactivation
+            # edge; extra Torr overshoot just wasted travel on vacuum parts.
+            return_target = target_back
         return_target = min(hw_max_psi, max(hw_min_psi, return_target))
         if not math.isclose(return_target, target_back, abs_tol=1e-6):
             logger.debug(
@@ -2824,8 +3067,11 @@ class TestExecutor:
         activation_estimate, deactivation_estimate = self._ordered_cycle_estimates()
 
         if activation_estimate is not None and deactivation_estimate is not None:
+            # PTP fallback still uses the larger close-limit offset/margin. Once we
+            # have measured cycle edges, bracket tightly past those estimates so the
+            # slow precision sweep does not re-traverse a 15–25 Torr pad on each side.
             offset = self._precision_close_limit_offset_psi
-            margin = self._precision_deactivation_margin_psi
+            pad = convert_pressure(8.0, 'Torr', 'PSI')
             # Get hardware limits as absolute bounds (allow going slightly outside PTP bounds if needed)
             hw_min, hw_max = self._resolve_hardware_limits_test_reference()
 
@@ -2835,39 +3081,24 @@ class TestExecutor:
             act_band = self._resolve_activation_band_psi(activation_direction, min_psi, max_psi)
 
             if activation_direction < 0:
-                # Decreasing activation: activation at lower pressure,
-                # deactivation at higher pressure.
-                # Approach from above, just above the activation point.
-                approach_target = min(max_psi, activation_estimate + offset)
-                # Slow sweep down past activation to find the activation edge.
-                target_out = max(hw_min, activation_estimate - offset)
-                # Widen to cover the activation band if the estimate is off
-                if act_band:
-                    approach_target = max(approach_target, act_band[1] + offset * 0.25)
-                    target_out = min(target_out, act_band[0] - offset * 0.25)
-                    approach_target = min(hw_max, approach_target)
-                    target_out = max(hw_min, target_out)
-                # Reverse sweep up past deactivation to find the deactivation edge.
-                target_back = min(hw_max, deactivation_estimate + margin)
-                if self._resolve_sweep_mode() == 'vacuum':
-                    target_back = min(hw_max, max(target_back, max_psi + offset))
+                # Decreasing close-limit: sit just ABOVE activation (not up at
+                # deactivation), slow-sweep down through act, then return up
+                # past deactivation.
+                approach_target = min(hw_max, activation_estimate + pad)
+                target_out = max(hw_min, activation_estimate - pad)
+                target_back = min(hw_max, deactivation_estimate + pad)
             else:
-                # Increasing activation: activation at higher pressure,
-                # deactivation at lower pressure.
-                # Approach from below, just below the activation point.
-                approach_target = max(min_psi, activation_estimate - offset)
-                # Slow sweep up past activation to find the activation edge.
-                target_out = min(hw_max, activation_estimate + offset)
-                # Widen to cover the activation band if the estimate is off
-                if act_band:
-                    approach_target = min(approach_target, act_band[0] - offset * 0.25)
-                    target_out = max(target_out, act_band[1] + offset * 0.25)
-                    approach_target = max(hw_min, approach_target)
-                    target_out = min(hw_max, target_out)
-                # Reverse sweep down past deactivation to find the deactivation edge.
-                target_back = max(hw_min, deactivation_estimate - margin)
+                # Increasing close-limit: sit just BELOW activation, sweep up
+                # through act, then return down past deactivation.
+                approach_target = max(hw_min, activation_estimate - pad)
+                target_out = min(hw_max, activation_estimate + pad)
+                target_back = max(hw_min, deactivation_estimate - pad)
                 if self._uses_nc_derived_vacuum_window():
+                    # NC-derived vacuum still needs a little room below the band
+                    # before the upward activation sweep.
                     approach_target = max(hw_min, min(approach_target, min_psi - offset * 0.25))
+                    if act_band:
+                        target_out = max(target_out, min(hw_max, act_band[1] + pad * 0.25))
             validation_error = self._validate_cycle_estimate_targets(
                 activation_direction=activation_direction,
                 approach_target=approach_target,
@@ -2891,15 +3122,14 @@ class TestExecutor:
                 out_of_bounds_note = f' ({"; ".join(oob_parts)})' if oob_parts else ''
                 logger.info(
                     '%s: Precision targets from cycle estimates: approach=%.4f out=%.4f back=%.4f '
-                    '(act_est=%.4f deact_est=%.4f offset=%.4f margin=%.4f)%s',
+                    '(act_est=%.4f deact_est=%.4f pad=%.4f)%s',
                     self._port_id,
                     approach_target,
                     target_out,
                     target_back,
                     activation_estimate,
                     deactivation_estimate,
-                    offset,
-                    margin,
+                    pad,
                     out_of_bounds_note,
                 )
                 return (approach_target, target_out, target_back, 'cycle-estimate-offset-close-limit')

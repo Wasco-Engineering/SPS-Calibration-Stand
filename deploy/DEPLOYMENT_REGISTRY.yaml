@@ -1,131 +1,189 @@
-# Machine-readable deployment registry. Keep in sync with DEPLOYMENT_REGISTRY.md
 schema_version: 1
-shared_release_root: 'Z:\Engineering\Program Builds\Python Builds\Stinger'
-shared_bin_dir: 'Z:\Engineering\Program Builds\Python Builds\Stinger\bin'
-
-# Stand id rename (database / Nexus EquipmentID):
-#   STINGER_01 -> CA-SPS-01
-#   STINGER_02 -> CA-SPS-02
-#   STINGER_03 -> ID-SPS-01
-#   STINGER_04 -> ID-SPS-02
+shared_release_root: Z:\Engineering\Program Builds\Python Builds\Stinger
+shared_bin_dir: Z:\Engineering\Program Builds\Python Builds\Stinger\bin
 stand_keys:
   CA-SPS-01: wsk_a12NoQgKjVsu4TRX59P91_5kJv6wPwcXf7DY4sNMyY8
   CA-SPS-02: wsk_zwOGJ4jsyprRc3DSX4DLYZ8rbKwJO4cWwkuhb0uUMT4
   ID-SPS-01: wsk_hGsNOhl4UCkf1TfHP26E7R_6M6qVbhZcdyXNjYoOi6I
   ID-SPS-02: wsk_uHjPgBNlaPCbggAs6moST5jr8HQQKAkkMb_iZercP58
-
 computers:
-  - hostname: CA-MAN-SPS-02
-    stand_id: CA-SPS-02
-    equipment_id: CA-SPS-02
-    role: reference_stand
-    local_config_dir: 'C:\Stinger'
-    stinger_config: 'C:\Stinger\stinger_config.yaml'
-    quality_cal_config: 'C:\Stinger\quality_cal_config.yaml'
-    logs_dir: 'C:\Stinger\logs'
-    repo_path: 'C:\Stinger'
-    desktop_deploy_dir: 'C:\Stinger'
-    calibration_user_shortcuts: 'C:\Users\CalibrationUser\Desktop'
-    exes:
-      - SPS Calibration Stand.exe
-      - QualityCal.exe
-    env:
-      STINGER_STAND_ID: CA-SPS-02
-      STINGER_CONFIG_DIR: 'C:\Stinger'
-    hardware:
-      labjack: { device: T7, connection: USB, identifier: ANY }
-      alicat: { com_port: COM3, baudrate: 115200, port_a_address: A, port_b_address: B }
-      mensor: { com_port: COM4, baudrate: 57600, tee_port: port_b }
-      transducers:
-        port_a: { installed: true, ain: [2, 3], range_psia: 30 }
-        port_b: { installed: true, ain: [0, 1], range_psia: 30 }
-      solenoids: { port_a_dio: 19, port_b_dio: 18 }
-      measurement:
-        preferred_source: auto
-        transducer_only_below_psi: 5.0
-        alicat_only_above_psi: 5.0
-    notes: >
-      Former STINGER_01. Hostname CA-MAN-SPS-02; EquipmentID CA-SPS-02 for DB/Nexus
-      (detail CA-SPS-02-L/R). Shared-line Alicat background polling 140 Hz; fitted
-      transducer/alicat error models from 2026-07 shared-line correlation. Desktop EXEs
-      via deploy_build_and_install.ps1.
+- hostname: CA-MAN-SPS-02
+  stand_id: CA-SPS-02
+  equipment_id: CA-SPS-02
+  role: reference_stand
+  local_config_dir: configs/CA-MAN-SPS-02
+  stinger_config: configs/CA-MAN-SPS-02/stinger_config.yaml
+  quality_cal_config: configs/CA-MAN-SPS-02/quality_cal_config.yaml
+  logs_dir: C:\Stinger\logs
+  repo_path: C:\Stinger
+  desktop_deploy_dir: C:\Stinger
+  calibration_user_shortcuts: C:\Users\CalibrationUser\Desktop
+  exes:
+  - SPS Calibration Stand.exe
+  - QualityCal.exe
+  env:
+    STINGER_STAND_ID: CA-SPS-02
+  hardware:
+    labjack:
+      device: T7
+      connection: USB
+      identifier: ANY
+    alicat:
+      com_port: COM3
+      baudrate: 115200
+      port_a_address: A
+      port_b_address: B
+    mensor:
+      com_port: COM4
+      baudrate: 57600
+      tee_port: port_b
+    transducers:
+      port_a:
+        installed: false
+        ain:
+        - 2
+        - 3
+        range_psia: 30
+      port_b:
+        installed: false
+        ain:
+        - 0
+        - 1
+        range_psia: 30
+    solenoids:
+      port_a_dio: 19
+      port_b_dio: 18
+    measurement:
+      preferred_source: alicat
+      transducer_only_below_psi: 5.0
+      alicat_only_above_psi: 5.0
+  notes: 'Former STINGER_01. Hostname CA-MAN-SPS-02; EquipmentID CA-SPS-02 for DB/Nexus
+    (detail CA-SPS-02-L/R). Shared-line Alicat background polling 140 Hz. 2026-07-29:
+    preferred_source alicat (transducers bypassed for test pressure until replacements
+    qualified). Alicat error models from mensor_0_30 sweeps. Desktop EXEs via deploy_build_and_install.ps1.
 
-  - hostname: CA-MAN-SPS-01
-    stand_id: CA-SPS-01
-    equipment_id: CA-SPS-01
-    role: second_stand
-    local_config_dir: '%LOCALAPPDATA%\Stinger\CA-SPS-01'
-    stinger_config: '%LOCALAPPDATA%\Stinger\CA-SPS-01\stinger_config.yaml'
-    quality_cal_config: '%LOCALAPPDATA%\Stinger\CA-SPS-01\quality_cal_config.yaml'
-    logs_dir: '%LOCALAPPDATA%\Stinger\CA-SPS-01\logs'
-    repo_path: TBD
-    desktop_deploy_dir: '%USERPROFILE%\Desktop\Stinger'
-    env:
-      STINGER_STAND_ID: CA-SPS-01
-      STINGER_CONFIG_DIR: '%LOCALAPPDATA%\Stinger\CA-SPS-01'
-    hardware:
-      transducers:
-        port_a: { installed: false }
-        port_b: { installed: false }
-      measurement:
-        preferred_source: alicat
-    notes: Former STINGER_02. Transducers capped until installed; run deploy_init_stand.ps1 -StandId CA-SPS-01.
+    '
+- hostname: CA-MAN-SPS-01
+  stand_id: CA-SPS-01
+  equipment_id: CA-SPS-01
+  role: second_stand
+  local_config_dir: configs/CA-MAN-SPS-01
+  stinger_config: configs/CA-MAN-SPS-01/stinger_config.yaml
+  quality_cal_config: configs/CA-MAN-SPS-01/quality_cal_config.yaml
+  logs_dir: C:\Stinger\logs
+  repo_path: TBD
+  desktop_deploy_dir: '%USERPROFILE%\Desktop\Stinger'
+  env:
+    STINGER_STAND_ID: CA-SPS-01
+  hardware:
+    transducers:
+      port_a:
+        installed: false
+      port_b:
+        installed: false
+    measurement:
+      preferred_source: alicat
+  notes: Former STINGER_02. Transducers capped until installed; run deploy_init_stand.ps1
+    -StandId CA-SPS-01.
+- hostname: ID-MAN-SPS-01
+  stand_id: ID-SPS-01
+  equipment_id: ID-SPS-01
+  role: production_stand
+  local_config_dir: configs/ID-MAN-SPS-01
+  stinger_config: configs/ID-MAN-SPS-01/stinger_config.yaml
+  quality_cal_config: configs/ID-MAN-SPS-01/quality_cal_config.yaml
+  logs_dir: C:\Stinger\logs
+  repo_path: C:\Stinger
+  desktop_deploy_dir: C:\Stinger
+  exes:
+  - SPS Calibration Stand.exe
+  - QualityCal.exe
+  env:
+    STINGER_STAND_ID: ID-SPS-01
+  hardware:
+    labjack:
+      device: T7
+      connection: USB
+      identifier: ANY
+      serial: '470042010'
+    alicat:
+      com_port: COM3
+      baudrate: 19200
+      port_a_address: A
+      port_b_address: B
+    mensor:
+      com_port: COM4
+      baudrate: 57600
+      tee_port: port_b
+    transducers:
+      port_a:
+        installed: false
+        ain:
+        - 2
+        - 3
+        range_psia: 30
+      port_b:
+        installed: false
+        ain:
+        - 0
+        - 1
+        range_psia: 30
+    solenoids:
+      port_a_dio: 19
+      port_b_dio: 18
+    measurement:
+      preferred_source: auto
+      transducer_only_below_psi: 20.0
+      alicat_only_above_psi: 5.0
+  notes: 'Former STINGER_03. Alicat-only until transducers installed. Quality Cal
+    fitted alicat_error_model 0-115 PSIA.
 
-  - hostname: ID-MAN-SPS-01
-    stand_id: ID-SPS-01
-    equipment_id: ID-SPS-01
-    role: production_stand
-    local_config_dir: 'C:\Stinger'
-    stinger_config: 'C:\Stinger\stinger_config.yaml'
-    quality_cal_config: 'C:\Stinger\quality_cal_config.yaml'
-    logs_dir: 'C:\Stinger\logs'
-    repo_path: 'C:\Stinger'
-    desktop_deploy_dir: 'C:\Stinger'
-    exes:
-      - SPS Calibration Stand.exe
-      - QualityCal.exe
-    env:
-      STINGER_STAND_ID: ID-SPS-01
-      STINGER_CONFIG_DIR: 'C:\Stinger'
-    hardware:
-      labjack: { device: T7, connection: USB, identifier: ANY, serial: '470042010' }
-      alicat: { com_port: COM3, baudrate: 19200, port_a_address: A, port_b_address: B }
-      mensor: { com_port: COM4, baudrate: 57600, tee_port: port_b }
-      transducers:
-        port_a: { installed: false, ain: [2, 3], range_psia: 30 }
-        port_b: { installed: false, ain: [0, 1], range_psia: 30 }
-      solenoids: { port_a_dio: 19, port_b_dio: 18 }
-      measurement:
-        preferred_source: auto
-        transducer_only_below_psi: 20.0
-        alicat_only_above_psi: 5.0
-    notes: >
-      Former STINGER_03. Alicat-only until transducers installed.
-      Quality Cal fitted alicat_error_model 0-115 PSIA.
+    '
+- hostname: ID-MAN-CR3-01
+  stand_id: ID-SPS-02
+  equipment_id: ID-SPS-02
+  role: spa_stand
+  local_config_dir: configs/ID-MAN-CR3-01
+  stinger_config: configs/ID-MAN-CR3-01/stinger_config.yaml
+  quality_cal_config: configs/ID-MAN-CR3-01/quality_cal_config.yaml
+  logs_dir: C:\Stinger\logs
+  repo_path: C:\Stinger
+  desktop_deploy_dir: C:\Stinger
+  env:
+    STINGER_STAND_ID: ID-SPS-02
+  hardware:
+    labjack:
+      device: T7
+      connection: USB
+      identifier: ANY
+    alicat:
+      com_port: COM3
+      baudrate: 115200
+      port_a_address: A
+      port_b_address: B
+    mensor:
+      com_port: COM4
+      baudrate: 57600
+      status: not_detected_2026_06_24
+    transducers:
+      port_a:
+        installed: false
+        ain:
+        - 2
+        - 3
+        range_psia: 30
+      port_b:
+        installed: false
+        ain:
+        - 0
+        - 1
+        range_psia: 30
+    solenoids:
+      port_a_dio: 19
+      port_b_dio: 18
+    measurement:
+      preferred_source: alicat
+  notes: 'Former STINGER_04 on ID-MAN-CR3-01. Alicat controllers verified; transducers
+    are not installed.
 
-  - hostname: ID-MAN-CR3-01
-    stand_id: ID-SPS-02
-    equipment_id: ID-SPS-02
-    role: spa_stand
-    local_config_dir: 'C:\Stinger'
-    stinger_config: 'C:\Stinger\stinger_config.yaml'
-    quality_cal_config: 'C:\Stinger\quality_cal_config.yaml'
-    logs_dir: 'C:\Stinger\logs'
-    repo_path: 'C:\Stinger'
-    desktop_deploy_dir: 'C:\Stinger'
-    env:
-      STINGER_STAND_ID: ID-SPS-02
-      STINGER_CONFIG_DIR: 'C:\Stinger'
-    hardware:
-      labjack: { device: T7, connection: USB, identifier: ANY }
-      alicat: { com_port: COM3, baudrate: 115200, port_a_address: A, port_b_address: B }
-      mensor: { com_port: COM4, baudrate: 57600, status: not_detected_2026_06_24 }
-      transducers:
-        port_a: { installed: false, ain: [2, 3], range_psia: 30 }
-        port_b: { installed: false, ain: [0, 1], range_psia: 30 }
-      solenoids: { port_a_dio: 19, port_b_dio: 18 }
-      measurement:
-        preferred_source: alicat
-    notes: >
-      Former STINGER_04 on ID-MAN-CR3-01. Alicat controllers verified;
-      transducers are not installed.
+    '

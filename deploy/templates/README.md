@@ -1,15 +1,25 @@
 # Config templates
 
-Copy to machine-local stand directory via:
+Per-computer configs are tracked in git under:
 
-```powershell
-.\scripts\deploy_init_stand.ps1 -StandId CA-SPS-02
+```text
+configs/<hostname>/stinger_config.yaml
+configs/<hostname>/quality_cal_config.yaml
 ```
 
-Source files for the copy are repo-root `stinger_config.yaml` and `quality_cal_config.yaml` at init time. Edit the **local** copies under `%LOCALAPPDATA%\Stinger\<STAND_ID>\` (or `C:\Stinger\` on deploy PCs).
+Runtime selection is automatic from the machine hostname (`app.core.paths`).
+Hostnames are listed in `deploy/DEPLOYMENT_REGISTRY.yaml`.
 
-The repo `stinger_config.yaml` is a template: no fitted `transducer_error_model` blocks and no DB password. Apply calibration via Quality Cal on the stand PC.
+To seed a **new** PC folder:
 
-Do not store production DB passwords in Z: shared folders.
+```powershell
+.\scripts\deploy_init_stand.ps1 -StandId CA-SPS-01 -EquipmentId CA-SPS-01
+```
 
-Script capture CSVs and optimizer output belong under `scripts/data/` (gitignored), not in this templates tree.
+Quality Cal Apply writes error models into the active host’s
+`configs/<hostname>/stinger_config.yaml`.
+
+Repo-root `stinger_config.yaml` / `quality_cal_config.yaml` are deprecated
+fallbacks only — do not put production offsets there.
+
+Do not store rotating logs under `configs/`; logs go to `C:\Stinger\logs`.

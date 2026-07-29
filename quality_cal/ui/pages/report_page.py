@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QWizardPage,
 )
 
+from app.core.paths import get_stinger_config_path
 from quality_cal.core.calibration_export import export_recommended_calibration_yaml
 from quality_cal.core.report_generator import (
     build_report_html,
@@ -30,10 +31,7 @@ from quality_cal.core.report_generator import (
     export_report_csv,
     export_report_pdf,
 )
-
 from quality_cal.ui.styles import COLORS, STYLES, TYPOGRAPHY
-
-_STINGER_CONFIG_PATH = Path(__file__).resolve().parents[3] / 'stinger_config.yaml'
 
 
 class ReportPage(QWizardPage):
@@ -218,7 +216,7 @@ class ReportPage(QWizardPage):
         merge = QMessageBox.question(
             self,
             'Merge into stinger_config.yaml?',
-            f'Also merge models into {_STINGER_CONFIG_PATH}?',
+            f'Also merge models into {get_stinger_config_path()}?',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -226,7 +224,11 @@ class ReportPage(QWizardPage):
             out_path = export_recommended_calibration_yaml(
                 wizard.session,
                 Path(path),
-                merge_stinger_path=_STINGER_CONFIG_PATH if merge == QMessageBox.StandardButton.Yes else None,
+                merge_stinger_path=(
+                    get_stinger_config_path()
+                    if merge == QMessageBox.StandardButton.Yes
+                    else None
+                ),
             )
             self.saved_label.setText(f'Calibration exported:\n{out_path}')
             self.saved_label.setVisible(True)

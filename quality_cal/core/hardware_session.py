@@ -157,9 +157,19 @@ def connect_hardware_session(config: dict[str, Any]) -> HardwareSession:
         mensor_detail = 'Simulated Mensor — install pyserial and connect hardware'
     elif mensor_reader.status == 'Connected':
         try:
-            reading = mensor_reader.read_pressure()
+            both = mensor_reader.read_channels(('A', 'B'))
             mensor_ok = True
-            mensor_detail = f'Connected | Pressure={reading.pressure_psia:.3f} psia'
+            parts = [
+                f'{ch}={both[ch].pressure_psia:.3f}'
+                for ch in ('A', 'B')
+                if ch in both
+            ]
+            default = mensor_reader.read_pressure()
+            ch_label = default.channel or 'active'
+            mensor_detail = (
+                f'Connected | default[{ch_label}]={default.pressure_psia:.3f} psia'
+                + (f' ({", ".join(parts)})' if parts else '')
+            )
         except Exception as exc:
             mensor_detail = f'Connected | Read failed: {exc}'
     checks.append(HardwareCheck('mensor', mensor_ok, mensor_detail))

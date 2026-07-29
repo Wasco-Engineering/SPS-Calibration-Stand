@@ -4,10 +4,12 @@
 
 | Location | What lives there | Scope |
 |----------|------------------|--------|
-| **Z: (or git clone)** | Source code, releases, shared docs, templates | All PCs / stands |
-| **Machine-local** | `stinger_config.yaml`, `quality_cal_config.yaml`, logs, Mensor offsets, leak-test state | **One folder per stand PC** |
+| **Git repo** | Source, plus **per-computer** `configs/<hostname>/*.yaml` (COM, equipment_id, Mensor/Alicat/transducer models) | Shared history; each host edits only its folder |
+| **C:\Stinger\logs** | Rotating logs | This PC only |
 
-Never treat repo-root `stinger_config.yaml` as the deploy target on a production PC unless you are actively developing. Copy templates to the local stand directory and set environment variables (or use `deploy_init_stand.ps1`).
+Runtime selects `configs/<COMPUTERNAME>/` automatically (`app.core.paths`). Leave `STINGER_CONFIG_DIR` unset (or pointed at `C:\Stinger`, which is treated as legacy and remapped to the hostname folder).
+
+Repo-root `stinger_config.yaml` is a deprecated fallback only.
 
 ---
 
@@ -31,23 +33,27 @@ $env:STINGER_RELEASE_ROOT = 'Z:\Engineering\Program Builds\Python Builds\Stinger
 
 ### Per-PC install (computer-specific) — **C:\Stinger**
 
-Standard layout on every stand / calibration PC:
+Standard layout on every stand / calibration PC (repo clone or installed tree):
 
 ```
 C:\Stinger\
   SPS Calibration Stand.exe
   QualityCal.exe
-  stinger_config.yaml          # COM ports, equipment_id, error models, DB
-  quality_cal_config.yaml      # Mensor COM, calibration profiles
+  configs\
+    <hostname>\
+      stinger_config.yaml      # COM ports, equipment_id, error models, DB
+      quality_cal_config.yaml  # Mensor COM, calibration profiles
   logs\                        # sweeps, quality cal, mensor checks
-  deploy\templates\qf87\       # QF87 Word template (copied on install)
+  deploy\
+    DEPLOYMENT_REGISTRY.yaml
+    templates\qf87\            # QF87 Word template (copied on install)
 ```
 
 Set machine environment (all users, including CalibrationUser):
 
 ```powershell
-STINGER_CONFIG_DIR=C:\Stinger
-STINGER_STAND_ID=CA-SPS-01      # equipment / stand label
+STINGER_STAND_ID=CA-SPS-02
+# Prefer leaving STINGER_CONFIG_DIR unset so configs/<hostname>/ is used.
 ```
 
 Legacy layout (still supported if YAML exists there):
@@ -62,9 +68,10 @@ Legacy layout (still supported if YAML exists there):
 
 | Variable | Purpose |
 |----------|---------|
-| `STINGER_STAND_ID` | Subfolder name under `STINGER_HOME` (e.g. `CA-SPS-01`) |
+| `STINGER_STAND_ID` | Stand / equipment label; maps via registry if hostname folder missing |
+| `STINGER_HOSTNAME` | Override hostname used for `configs/<hostname>/` |
 | `STINGER_HOME` | Override local root (default `%LOCALAPPDATA%\Stinger`) |
-| `STINGER_CONFIG_DIR` | Full path to folder containing **both** YAML configs |
+| `STINGER_CONFIG_DIR` | Explicit config directory override (tests/dev). If set to `C:\Stinger`, remaps to hostname folder when present |
 | `STINGER_CONFIG` | Full path to `stinger_config.yaml` only |
 | `STINGER_QUALITY_CONFIG` | Full path to `quality_cal_config.yaml` only |
 | `STINGER_RELEASE_ROOT` | Shared Z: root for docs/releases |

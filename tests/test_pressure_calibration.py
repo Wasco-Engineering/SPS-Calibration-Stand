@@ -11,13 +11,16 @@ from app.services.pressure_calibration import (
     SENSOR_TRANSDUCER,
     apply_error_model,
     filter_samples_pressure_band,
+    fit_interpolating_piecewise_error_model,
     fit_piecewise_linear_error_model,
     fit_quadratic_error_model,
     psi_to_torr,
     replay_corrected_series,
     score_replay,
     select_near_target_samples,
+    select_stable_hold_tail_samples,
     split_train_validation,
+    summarize_static_hold_means,
     torr_to_psi,
 )
 from tests.fixtures.pressure_data import calibration_sample
@@ -161,3 +164,146 @@ def test_fit_and_score_vs_mensor_reference() -> None:
         reference=REFERENCE_MENSOR,
     )
     assert score['p99_abs_torr'] < 1.0
+
+
+def test_interpolating_piecewise_hits_static_means() -> None:
+    """Knot interpolator zeros mean residual at each static target."""
+    targets = [0.29, 1.0, 5.0, 15.0, 30.0]
+    samples = []
+    idx = 0
+    for target in targets:
+        # Nonlinear bias vs Mensor (shape quantile fits struggle with).
+        mensor = target
+        error = 0.07 + 0.01 * math.sin(target) - 0.002 * target
+        transducer = mensor + error
+        for _ in range(5):
+            samples.append(
+                calibration_sample(
+                    idx,
+                    phase=f'static_{target}',
+                    target=target,
+                    transducer=transducer,
+                    alicat=mensor,
+                    mensor=mensor,
+                )
+            )
+            idx += 1
+
+    model = fit_interpolating_piecewise_error_model(
+        samples,
+        sensor=SENSOR_TRANSDUCER,
+        reference=REFERENCE_MENSOR,
+        min_samples_per_knot=3,
+    )
+    assert model['fit_method'] == 'interpolating_knots'
+    assert len(model['segments']) == len(targets)
+
+    for target in targets:
+        mensor = target
+        error = 0.07 + 0.01 * math.sin(target) - 0.002 * target
+        transducer = mensor + error
+        corrected = apply_error_model(transducer, model)
+        assert corrected == pytest.approx(mensor, abs=1e-9)
+
+    score = score_replay(
+        samples,
+        model=model,
+        ema_alpha=0.0,
+        sensor=SENSOR_TRANSDUCER,
+        reference=REFERENCE_MENSOR,
+    )
+    assert score['max_abs_torr'] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_interpolating_merges_close_knots() -> None:
+    samples = []
+    idx = 0
+    for target, transducer, mensor in (
+        (0.29, 0.36, 0.29),
+        (0.30, 0.361, 0.295),  # nearly same measured X → merge
+        (5.0, 5.1, 5.0),
+    ):
+        for _ in range(3):
+            samples.append(
+                calibration_sample(
+                    idx,
+                    phase=f'static_{target}',
+                    target=target,
+                    transducer=transducer,
+                    alicat=mensor,
+                    mensor=mensor,
+                )
+            )
+            idx += 1
+    model = fit_interpolating_piecewise_error_model(
+        samples,
+        sensor=SENSOR_TRANSDUCER,
+        reference=REFERENCE_MENSOR,
+        min_knot_spacing_psi=0.05,
+        min_samples_per_knot=3,
+    )
+    # 3 targets but first two merge → 2 knots → 2 segments (last open-ended)
+    assert len(model['segments']) == 2
+
+
+def test_select_stable_hold_tail_samples() -> None:
+    samples = []
+    idx = 0
+    for target in (1.0, 5.0):
+        for i in range(10):
+            samples.append(
+                calibration_sample(
+                    idx,
+                    phase=f'static_{target}',
+                    target=target,
+                    transducer=float(target + i),
+                    alicat=target,
+                    mensor=target,
+                )
+            )
+            idx += 1
+    tail = select_stable_hold_tail_samples(samples, tail_fraction=0.4, min_tail=3)
+    # 40% of 10 = 4 per target, min_tail 3 → 4 each → 8 total
+    assert len(tail) == 8
+    assert all(s.transducer_abs_psi >= s.target_abs_psi + 6 for s in tail)
+
+
+def test_summarize_static_hold_means_for_interp_pass() -> None:
+    samples = []
+    idx = 0
+    for target, bias in ((0.29, 0.07), (5.0, 0.04), (15.0, -0.15)):
+        for i in range(12):
+            # Early samples noisy; last samples stable around true bias.
+            noise = 0.2 if i < 4 else 0.0
+            mensor = target
+            transducer = target + bias + noise
+            samples.append(
+                calibration_sample(
+                    idx,
+                    phase=f'static_{target}',
+                    target=target,
+                    transducer=transducer,
+                    alicat=mensor,
+                    mensor=mensor,
+                )
+            )
+            idx += 1
+    means, stds = summarize_static_hold_means(samples, tail_count=8)
+    assert len(means) == 3
+    assert all(s >= 0.0 for s in stds)
+    model = fit_interpolating_piecewise_error_model(
+        means,
+        sensor=SENSOR_TRANSDUCER,
+        reference=REFERENCE_MENSOR,
+        min_samples_per_knot=1,
+        min_knot_spacing_psi=0.05,
+    )
+    score = score_replay(
+        means,
+        model=model,
+        ema_alpha=0.0,
+        sensor=SENSOR_TRANSDUCER,
+        reference=REFERENCE_MENSOR,
+    )
+    assert score['p99_abs_torr'] < 0.05
+

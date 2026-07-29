@@ -73,10 +73,6 @@ from app.services.pressure_domain import (
 )
 
 logger = logging.getLogger(__name__)
-LOW_PRESSURE_TRANSDUCER_LOCKOUT_TORR = 50.0
-LOW_PRESSURE_TRANSDUCER_LOCKOUT_MESSAGE = (
-    'This low-pressure part requires the transducer to be installed for this port.'
-)
 
 
 def _detail_equipment_id(base_equipment_id: str, port_id: str) -> str:
@@ -144,7 +140,7 @@ class WorkOrderController(QObject):
         self._hw_serial_busy_ports: set[str] = set()
         self._hw_action_cancel: Dict[str, threading.Event] = {}
         self._last_worker_alicat_refresh_s: Dict[str, float] = {}
-        self._worker_alicat_refresh_interval_s = 0.10
+        self._worker_alicat_refresh_interval_s = 0.05
         solenoid_cfg = self._config.get("hardware", {}).get("solenoid", {})
         self._auto_vacuum_threshold_psi = float(
             solenoid_cfg.get("safe_vacuum_switch_threshold_psi", 2.0)
@@ -192,9 +188,9 @@ class WorkOrderController(QObject):
         # State machines (one per port)
         self._state_machines: Dict[str, PortStateMachine] = {}
         self._test_executors: Dict[str, TestExecutor] = {}
-        self._precision_owner_port: Optional[str] = None
-        self._precision_wait_queue: List[str] = []
+        self._precision_active_ports: set[str] = set()
         self._precision_grant_events: Dict[str, threading.Event] = {}
+        self._result_save_workers: Dict[str, Any] = {}
         self._cycle_estimates_abs_psi = self._runtime_state.cycle_estimates_abs_psi
         # Track current measured values for preserving during partial updates
         self._current_measured_values = self._runtime_state.current_measured_values
@@ -593,95 +589,32 @@ class WorkOrderController(QObject):
         )
 
     def _request_precision_slot(self, port_id: str) -> bool:
-        """Try to acquire precision-sweep exclusivity for a port."""
-        if self._precision_owner_port == port_id:
-            self._signal_precision_grant(port_id)
-            return True
-        if (
-            self._precision_owner_port is None
-            and not self._precision_wait_queue
-            and not self._has_sibling_still_cycling(port_id)
-        ):
-            self._precision_owner_port = port_id
-            self._port_manager.set_alicat_poll_profile(port_id)
-            self._signal_precision_grant(port_id)
-            logger.info('%s: Precision slot granted immediately', port_id)
-            return True
-        if port_id not in self._precision_wait_queue:
-            self._precision_wait_queue.append(port_id)
-            logger.info(
-                '%s: Waiting for precision slot (owner=%s queue=%s)',
-                port_id,
-                self._precision_owner_port,
-                self._precision_wait_queue,
-            )
-            if self._ui_bridge:
-                self._ui_bridge.update_substate(port_id, 'cycling.waiting_precision_slot', {})
-        self._promote_waiting_precision_port()
-        return False
+        """Grant precision immediately so both ports can sweep concurrently.
 
-    def _has_sibling_still_cycling(self, port_id: str) -> bool:
-        """True when another port still needs full-speed cycling reads."""
-        for sibling_id, sm in self._state_machines.items():
-            if sibling_id == port_id:
-                continue
-            if sibling_id in self._precision_wait_queue:
-                continue
-            if self._precision_owner_port == sibling_id:
-                continue
-            if getattr(sm, 'current_state', None) != PortState.CYCLING.value:
-                continue
-            executor = self._test_executors.get(sibling_id)
-            if executor is None or executor.is_running:
-                return True
-        return False
+        Shared Alicat I/O is already serialized by AlicatController; exclusivity
+        only starved the sibling port and froze Alicat UI updates.
+        """
+        self._precision_active_ports.add(port_id)
+        self._port_manager.set_alicat_poll_profile(port_id)
+        self._signal_precision_grant(port_id)
+        logger.info('%s: Precision granted (active=%s)', port_id, sorted(self._precision_active_ports))
+        return True
 
     def _remove_precision_waiter(self, port_id: str) -> None:
-        if port_id not in self._precision_wait_queue:
-            return
-        self._precision_wait_queue = [pid for pid in self._precision_wait_queue if pid != port_id]
-        logger.info('%s: Removed from precision wait queue', port_id)
+        """Compatibility no-op; wait queue removed for concurrent precision."""
         self._signal_precision_grant(port_id)
 
     def _release_precision_slot(self, port_id: str, reason: str) -> None:
-        """Release precision ownership for a port and restore normal polling."""
-        self._remove_precision_waiter(port_id)
-        if self._precision_owner_port != port_id:
-            return
-        self._precision_owner_port = None
-        self._port_manager.set_alicat_poll_profile(None)
-        logger.info('%s: Precision slot released (%s)', port_id, reason)
-        self._promote_waiting_precision_port()
-
-    def _promote_waiting_precision_port(self) -> None:
-        """Grant precision to next waiting port (first-ready-first-served)."""
-        if self._precision_owner_port is not None:
-            return
-        while self._precision_wait_queue:
-            next_port = self._precision_wait_queue.pop(0)
-            sm = self._state_machines.get(next_port)
-            if not sm:
-                continue
-            if not sm.can_trigger('cycles_complete'):
-                logger.info(
-                    '%s: Skipping queued precision promotion (state=%s)',
-                    next_port,
-                    sm.current_state,
-                )
-                continue
-            if self._has_sibling_still_cycling(next_port):
-                self._precision_wait_queue.insert(0, next_port)
-                logger.info(
-                    '%s: Holding queued precision promotion until sibling cycling completes',
-                    next_port,
-                )
-                return
-            self._precision_owner_port = next_port
-            self._port_manager.set_alicat_poll_profile(next_port)
-            self._signal_precision_grant(next_port)
-            logger.info('%s: Precision slot granted from queue', next_port)
-            sm.trigger('cycles_complete')
-            return
+        """Release precision for one port; keep sibling precision if still active."""
+        self._precision_active_ports.discard(port_id)
+        self._port_manager.remove_precision_port(port_id)
+        logger.info(
+            '%s: Precision released (%s); active=%s',
+            port_id,
+            reason,
+            sorted(self._precision_active_ports),
+        )
+        self._signal_precision_grant(port_id)
 
     def _signal_precision_grant(self, port_id: str) -> None:
         event = self._precision_grant_events.get(port_id)
@@ -689,13 +622,12 @@ class WorkOrderController(QObject):
             event.set()
 
     def _reset_precision_coordination(self) -> None:
-        """Clear precision owner/queue state and return normal polling profile."""
-        self._precision_owner_port = None
-        self._precision_wait_queue.clear()
+        """Clear precision state and return normal polling profile."""
+        self._precision_active_ports.clear()
         for event in self._precision_grant_events.values():
             event.set()
         self._precision_grant_events.clear()
-        self._port_manager.set_alicat_poll_profile(None)
+        self._port_manager.clear_precision_ports()
     
     def _hardware_poll_labjack_only(self) -> bool:
         """GUI polls never touch Alicat serial — background thread owns refresh.
@@ -818,8 +750,10 @@ class WorkOrderController(QObject):
         except Exception as exc:
             logger.warning("Failed to read hardware status: %s", exc)
             status = {}
-        status['precision_owner'] = self._precision_owner_port or 'none'
-        status['precision_queue'] = list(self._precision_wait_queue)
+        status['precision_owner'] = (
+            ','.join(sorted(self._precision_active_ports)) if self._precision_active_ports else 'none'
+        )
+        status['precision_queue'] = []
         status['alicat_poll_divisors'] = self._port_manager.get_alicat_poll_divisors()
         status['precision_poll'] = self._port_manager.get_precision_poll_status()
         self._ui_bridge.update_hardware_status(status)
@@ -1182,18 +1116,11 @@ class WorkOrderController(QObject):
                 return self._latest_readings.get(port_id)
 
     def _refresh_alicat_for_worker_if_due(self, port_id: str, port: Any) -> None:
-        """Refresh cached Alicat pressure from the worker when tests use Alicat as source."""
-        measurement_cfg = self._config.get('hardware', {}).get('measurement', {})
-        preferred_source = (
-            str(measurement_cfg.get('preferred_source', 'auto')).strip().lower()
-            if isinstance(measurement_cfg, dict)
-            else 'auto'
-        )
-        port_cfg = self._config.get('hardware', {}).get('labjack', {}).get(port_id, {})
-        transducer_installed = bool(port_cfg.get('transducer_installed', True))
-        if preferred_source != 'alicat' and transducer_installed:
-            return
+        """Refresh cached Alicat pressure from the worker during live tests.
 
+        Preferred-source ``auto`` still uses Alicat above the handoff threshold, so
+        always keep the cache fresh while a test owns the port.
+        """
         now = time.perf_counter()
         last = self._last_worker_alicat_refresh_s.get(port_id, 0.0)
         if now - last < self._worker_alicat_refresh_interval_s:
@@ -1651,9 +1578,6 @@ class WorkOrderController(QObject):
         sm = self._state_machines.get(port_id)
         if not sm:
             return
-        if self._is_low_pressure_transducer_locked_out(port_id):
-            self._show_low_pressure_transducer_lockout(port_id)
-            return
         if not self._has_switch_presence(port_id):
             logger.info('%s: Pressurize blocked until switch presence is detected', port_id)
             return
@@ -1663,9 +1587,6 @@ class WorkOrderController(QObject):
     def _on_start_test(self, port_id: str) -> None:
         sm = self._state_machines.get(port_id)
         if not sm:
-            return
-        if self._is_low_pressure_transducer_locked_out(port_id):
-            self._show_low_pressure_transducer_lockout(port_id)
             return
         if not self._has_switch_presence(port_id):
             logger.info('%s: Test start blocked until switch presence is detected', port_id)
@@ -1697,7 +1618,6 @@ class WorkOrderController(QObject):
     def _on_cancel(self, port_id: str) -> None:
         self._restore_normal_viz(port_id)
         self._cancel_hw_action(port_id)
-        was_owner = self._precision_owner_port == port_id
         self._remove_precision_waiter(port_id)
         executor = self._test_executors.get(port_id)
         if executor and executor.is_running:
@@ -1706,8 +1626,7 @@ class WorkOrderController(QObject):
             sm = self._state_machines.get(port_id)
             if sm and not sm.trigger('cancel'):
                 sm.trigger('reset')
-            if was_owner:
-                self._release_precision_slot(port_id, reason='cancel')
+            self._release_precision_slot(port_id, reason='cancel')
             # Executor thread calls _safe_vent(); avoid racing exhaust here.
             return
         sm = self._state_machines.get(port_id)
@@ -1715,8 +1634,7 @@ class WorkOrderController(QObject):
             if not sm.trigger('cancel'):
                 sm.trigger('reset')
         self._vent_port(port_id)
-        if was_owner:
-            self._release_precision_slot(port_id, reason='cancel')
+        self._release_precision_slot(port_id, reason='cancel')
 
     def _cancel_hw_action(self, port_id: str) -> None:
         """Signal any in-flight pressurize worker on this port to stop."""
@@ -1757,9 +1675,11 @@ class WorkOrderController(QObject):
         sm = self._state_machines.get(port_id)
         if not sm:
             return
-        self._save_result(port_id, force_pass=True)
+        # Capture measurements/serial before advancing so UI can respond immediately.
+        save_args = self._capture_save_args(port_id, force_pass=True)
         sm.trigger('record_success')
-        self._advance_serial(port_id)
+        self._advance_serial(port_id, refresh_progress=False)
+        self._persist_result_async(port_id, save_args)
 
     def _on_record_failure(self, port_id: str) -> None:
         self._restore_normal_viz(port_id)
@@ -1767,20 +1687,21 @@ class WorkOrderController(QObject):
         if not sm:
             return
         if self._is_no_switch_decision(sm):
-            result = self._save_result(
+            save_args = self._capture_save_args(
                 port_id,
                 force_pass=False,
                 allow_null_measurements=True,
             )
-            if result == 'failed':
-                return
+            # Transition immediately; persist off-thread. Failed writes surface via DB status.
             if not sm.trigger('fail_no_switch'):
                 sm.trigger('reset')
-            self._advance_serial(port_id)
+            self._advance_serial(port_id, refresh_progress=False)
+            self._persist_result_async(port_id, save_args)
             return
-        self._save_result(port_id, force_pass=False)
+        save_args = self._capture_save_args(port_id, force_pass=False)
         sm.trigger('record_failure')
-        self._advance_serial(port_id)
+        self._advance_serial(port_id, refresh_progress=False)
+        self._persist_result_async(port_id, save_args)
 
     def _on_retest(self, port_id: str) -> None:
         self._restore_normal_viz(port_id)
@@ -1790,22 +1711,19 @@ class WorkOrderController(QObject):
         if sm._attempt_count >= sm._max_attempts - 1:
             logger.warning('%s: Retest blocked after %s attempts', port_id, sm._max_attempts)
             return
-        if self._is_low_pressure_transducer_locked_out(port_id):
-            self._show_low_pressure_transducer_lockout(port_id)
-            return
         if self._is_no_switch_decision(sm):
-            result = self._save_result(
+            save_args = self._capture_save_args(
                 port_id,
                 force_pass=False,
                 allow_null_measurements=True,
             )
-            if result == 'failed':
-                return
+            # Keep same serial for retry; persist failure async without advancing.
             if sm.trigger('retry_no_switch'):
                 if sm.current_state == PortState.CYCLING.value:
                     self._launch_test_executor(port_id)
                 elif sm.current_state == PortState.PRESSURIZING.value:
                     self._start_pressurize_hw(port_id)
+            self._persist_result_async(port_id, save_args, refresh_progress=False)
             return
         if sm.trigger('retest'):
             # Retest transitions to CYCLING (QAL16/17) or PRESSURIZING (QAL15)
@@ -1826,30 +1744,6 @@ class WorkOrderController(QObject):
             )
         except (TypeError, ValueError):
             return None
-
-    def _is_low_pressure_transducer_locked_out(self, port_id: str) -> bool:
-        activation_torr = self._activation_target_torr()
-        if activation_torr is None or activation_torr >= LOW_PRESSURE_TRANSDUCER_LOCKOUT_TORR:
-            return False
-
-        port_cfg = (
-            self._config
-            .get('hardware', {})
-            .get('labjack', {})
-            .get(port_id, {})
-        )
-        return not bool(port_cfg.get('transducer_installed', False))
-
-    def _show_low_pressure_transducer_lockout(self, port_id: str) -> None:
-        logger.warning(
-            '%s: %s',
-            port_id,
-            LOW_PRESSURE_TRANSDUCER_LOCKOUT_MESSAGE,
-        )
-        self._ui_bridge.show_error_message(
-            'Transducer Required',
-            LOW_PRESSURE_TRANSDUCER_LOCKOUT_MESSAGE,
-        )
 
     @staticmethod
     def _pressurize_target_reached(
@@ -2240,7 +2134,7 @@ class WorkOrderController(QObject):
                 current = self._test_executors.get(port_id)
                 if current is not executor or executor.cancel_requested:
                     return False
-            return self._precision_owner_port == port_id and not executor.cancel_requested
+            return port_id in self._precision_active_ports and not executor.cancel_requested
 
         def _on_edges_captured(act_psi: float, deact_psi: float) -> None:
             self._sig_edges_captured.emit(port_id, act_psi, deact_psi)
@@ -2286,9 +2180,9 @@ class WorkOrderController(QObject):
             wait_for_precision_slot=_wait_for_precision_slot,
         )
         self._test_executors[port_id] = executor
-        # Fast Alicat polling for the whole run (cycling + precision). Precision-slot
-        # ownership is granted separately at cycles_complete; do not pre-set
-        # _precision_owner_port here or the grant event never fires.
+        # Fast Alicat polling for the whole run (cycling + precision). Precision
+        # grant still happens at cycles_complete so the wait event fires.
+        self._precision_active_ports.add(port_id)
         self._port_manager.set_alicat_poll_profile(port_id)
         executor.start()
 
@@ -2577,7 +2471,6 @@ class WorkOrderController(QObject):
         logger.info('%s: Test cancelled', port_id)
         self._remove_precision_waiter(port_id)
         self._release_precision_slot(port_id, reason='executor-cancelled')
-        self._port_manager.set_alicat_poll_profile(None)
 
     def _slot_substate(self, port_id: str, substate: str) -> None:
         if self._ui_bridge:
@@ -2747,28 +2640,25 @@ class WorkOrderController(QObject):
             daemon=True,
         ).start()
 
-    def _save_result(
+    def _capture_save_args(
         self,
         port_id: str,
-        force_pass: bool,
         *,
+        force_pass: bool,
         allow_null_measurements: bool = False,
-    ) -> str:
-        """Save the test result to the database and surface the outcome to the UI."""
+    ) -> Optional[Dict[str, Any]]:
+        """Snapshot measurements/serial for an off-thread DB write."""
         sm = self._state_machines.get(port_id)
         wo = self._ui_bridge._current_work_order if self._ui_bridge else None
         if not sm or not wo:
-            return 'skipped'
+            return None
 
-        # Get measurements from state machine
         act = sm._increasing_activation
         deact = sm._decreasing_deactivation
-
         if (act is None or deact is None) and not allow_null_measurements:
             logger.warning('%s: Cannot save result - missing measurements', port_id)
-            return 'skipped'
+            return None
 
-        # Convert to display units for storage
         unit_label = self._ui_bridge.get_pressure_unit() if self._ui_bridge else 'PSI'
         setup = self._current_test_setup
         pressure_ref = setup.pressure_reference if setup else None
@@ -2782,25 +2672,171 @@ class WorkOrderController(QObject):
             if deact is not None
             else None
         )
+        increasing_activation, decreasing_deactivation = self._map_result_to_database_fields(
+            act_display,
+            deact_display,
+        )
+        if allow_null_measurements and (increasing_activation is None or decreasing_deactivation is None):
+            increasing_activation = 0.0 if increasing_activation is None else increasing_activation
+            decreasing_deactivation = 0.0 if decreasing_deactivation is None else decreasing_deactivation
 
-        test_mode = wo.get('test_mode', False)
-        if test_mode:
+        serial = 1
+        if self._ui_bridge is not None:
+            serial = int(self._ui_bridge._port_serials.get(port_id, 1))
+
+        try:
+            gage_reference_diff = self._get_barometric_pressure(port_id)
+        except Exception:
+            logger.debug('%s: Unable to read barometric pressure for DB result', port_id, exc_info=True)
+            gage_reference_diff = None
+
+        return {
+            'port_id': port_id,
+            'force_pass': force_pass,
+            'allow_null_measurements': allow_null_measurements,
+            'act_display': act_display,
+            'deact_display': deact_display,
+            'increasing_activation': increasing_activation,
+            'decreasing_deactivation': decreasing_deactivation,
+            'units_str': (setup.units_label if setup else None) or unit_label or 'PSI',
+            'activation_target': getattr(setup, 'activation_target', None) if setup else None,
+            'activation_direction': (
+                (getattr(setup, 'activation_direction', '') or '').strip() if setup else ''
+            ),
+            'serial': serial,
+            'shop_order': wo.get('shop_order', ''),
+            'part_id': wo.get('part_id', ''),
+            'sequence_id': wo.get('sequence_id', ''),
+            'operator_id': wo.get('operator_id', ''),
+            'total': int(wo.get('total', 1) or 1),
+            'test_mode': bool(wo.get('test_mode', False)),
+            'gage_reference_diff': gage_reference_diff,
+            'observed_max_pressure': self._max_test_pressure_display.get(port_id),
+        }
+
+    def _persist_result_async(
+        self,
+        port_id: str,
+        save_args: Optional[Dict[str, Any]],
+        *,
+        refresh_progress: bool = True,
+    ) -> None:
+        """Persist a captured result without blocking the Qt GUI thread."""
+        if save_args is None:
+            return
+
+        def _work() -> Dict[str, Any]:
+            return self._save_result_from_args(save_args, apply_status=False)
+
+        def _on_done(result: Any, error: Optional[Exception]) -> None:
+            self._result_save_workers.pop(port_id, None)
+            if error is not None:
+                logger.exception('%s: Async result save failed: %s', port_id, error)
+                self._set_database_activity_status(
+                    'Write Failed',
+                    queue=str(get_local_queue_count()),
+                )
+                return
+            payload = result if isinstance(result, dict) else {}
+            activity = payload.get('activity_status')
+            if activity:
+                self._set_database_activity_status(
+                    str(activity),
+                    last_write=payload.get('last_write'),
+                    queue=payload.get('queue'),
+                )
+            outcome = str(payload.get('result', 'failed'))
+            if refresh_progress and outcome in {'saved', 'skipped'}:
+                self._refresh_work_order_progress()
+
+        self._result_save_workers[port_id] = run_async(_work, _on_done)
+
+    def _save_result(
+        self,
+        port_id: str,
+        force_pass: bool,
+        *,
+        allow_null_measurements: bool = False,
+    ) -> str:
+        """Save the test result to the database and surface the outcome to the UI."""
+        save_args = self._capture_save_args(
+            port_id,
+            force_pass=force_pass,
+            allow_null_measurements=allow_null_measurements,
+        )
+        if save_args is None:
+            return 'skipped'
+        payload = self._save_result_from_args(save_args, apply_status=True)
+        return str(payload.get('result', 'failed'))
+
+    def _save_result_from_args(
+        self,
+        save_args: Dict[str, Any],
+        *,
+        apply_status: bool = True,
+    ) -> Dict[str, Any]:
+        """Save using a previously captured measurement/serial snapshot."""
+        port_id = str(save_args['port_id'])
+        force_pass = bool(save_args['force_pass'])
+        act_display = save_args.get('act_display')
+        deact_display = save_args.get('deact_display')
+        increasing_activation = save_args.get('increasing_activation')
+        decreasing_deactivation = save_args.get('decreasing_deactivation')
+        units_str = str(save_args.get('units_str') or 'PSI')
+
+        def _finish(
+            result: str,
+            *,
+            activity_status: Optional[str] = None,
+            last_write: Optional[str] = None,
+            queue: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            payload = {
+                'result': result,
+                'activity_status': activity_status,
+                'last_write': last_write,
+                'queue': queue,
+            }
+            if apply_status and activity_status:
+                self._set_database_activity_status(
+                    activity_status,
+                    last_write=last_write,
+                    queue=queue,
+                )
+            return payload
+
+        if (
+            (increasing_activation is None or decreasing_deactivation is None)
+            and not bool(save_args.get('allow_null_measurements', False))
+        ):
+            logger.warning('%s: Cannot save result - missing measurements', port_id)
+            return _finish('skipped')
+
+        if bool(save_args.get('test_mode', False)):
             logger.info(
                 '%s: Test mode - skipping DB write (act=%s, deact=%s %s, pass=%s)',
                 port_id,
-                self._format_optional_pressure(act_display),
-                self._format_optional_pressure(deact_display),
-                unit_label,
+                self._format_optional_pressure(
+                    float(act_display) if act_display is not None else None
+                ),
+                self._format_optional_pressure(
+                    float(deact_display) if deact_display is not None else None
+                ),
+                units_str,
                 force_pass,
             )
-            self._set_database_activity_status('Test Mode', last_write='Skipped', queue='0')
-            return 'skipped'
+            return _finish(
+                'skipped',
+                activity_status='Test Mode',
+                last_write='Skipped',
+                queue='0',
+            )
 
-        shop_order = wo.get('shop_order', '')
-        part_id = wo.get('part_id', '')
-        sequence_id = wo.get('sequence_id', '')
-        operator_id = wo.get('operator_id', '')
-        test_params = self._config.get('test_parameters', {})
+        shop_order = str(save_args.get('shop_order', ''))
+        part_id = str(save_args.get('part_id', ''))
+        sequence_id = str(save_args.get('sequence_id', ''))
+        operator_id = str(save_args.get('operator_id', ''))
+        test_params = self._config.get('test_parameters', {}) if isinstance(self._config, dict) else {}
         master_equipment_id = normalize_equipment_id(
             test_params.get('equipment_id'),
             DEFAULT_EQUIPMENT_ID,
@@ -2816,59 +2852,52 @@ class WorkOrderController(QObject):
                 temperature_c,
             )
 
-        serial = self._ui_bridge._port_serials.get(port_id, 1)
-        # ActivationID is a legacy column in the shared detail table.  Stinger
-        # keeps one current result per serial and overwrites it on each save;
-        # the state machine attempt count is not persisted as a row key.
+        serial = int(save_args.get('serial', 1) or 1)
         activation_id = 1
-
-        units_str = setup.units_label if setup else 'PSI'
-
-        increasing_activation, decreasing_deactivation = self._map_result_to_database_fields(
-            act_display,
-            deact_display,
-        )
-        if allow_null_measurements and (increasing_activation is None or decreasing_deactivation is None):
-            # The live OrderCalibrationDetail table does not allow NULL in these legacy
-            # measurement columns, so no-switch failures use 0.0 as the no-measurement sentinel.
-            increasing_activation = 0.0 if increasing_activation is None else increasing_activation
-            decreasing_deactivation = 0.0 if decreasing_deactivation is None else decreasing_deactivation
-        direction = (getattr(setup, 'activation_direction', '') or '').strip() if setup else ''
+        direction = str(save_args.get('activation_direction') or '')
         logger.info(
             '%s: Direction-based result mapping: increasing_direction_point=%s, '
             'decreasing_direction_point=%s %s (activation=%s, deactivation=%s, '
             'TargetActivationDirection=%s)',
             port_id,
-            self._format_optional_pressure(increasing_activation),
-            self._format_optional_pressure(decreasing_deactivation),
+            self._format_optional_pressure(
+                float(increasing_activation) if increasing_activation is not None else None
+            ),
+            self._format_optional_pressure(
+                float(decreasing_deactivation) if decreasing_deactivation is not None else None
+            ),
             units_str or 'PSI',
-            self._format_optional_pressure(act_display),
-            self._format_optional_pressure(deact_display),
+            self._format_optional_pressure(
+                float(act_display) if act_display is not None else None
+            ),
+            self._format_optional_pressure(
+                float(deact_display) if deact_display is not None else None
+            ),
             direction or 'unknown',
         )
 
         try:
             queue_before = get_local_queue_count()
-            observed_max_pressure = self._max_test_pressure_display.get(port_id)
+            observed_max_pressure = save_args.get('observed_max_pressure')
             if observed_max_pressure is None:
                 measured_values = [
-                    value
+                    float(value)
                     for value in (act_display, deact_display)
-                    if value is not None and math.isfinite(value)
+                    if value is not None and math.isfinite(float(value))
                 ]
                 observed_max_pressure = max(measured_values) if measured_values else None
-            try:
-                gage_reference_diff = self._get_barometric_pressure(port_id)
-            except Exception:
-                logger.debug('%s: Unable to read barometric pressure for DB result', port_id, exc_info=True)
-                gage_reference_diff = None
+            gage_reference_diff = save_args.get('gage_reference_diff')
             success = save_test_result(
                 shop_order=shop_order,
                 part_id=part_id,
                 sequence_id=sequence_id,
                 serial_number=serial,
-                increasing_activation=increasing_activation,
-                decreasing_deactivation=decreasing_deactivation,
+                increasing_activation=(
+                    float(increasing_activation) if increasing_activation is not None else None
+                ),
+                decreasing_deactivation=(
+                    float(decreasing_deactivation) if decreasing_deactivation is not None else None
+                ),
                 in_spec=force_pass,
                 temperature_c=temperature_c,
                 units_of_measure=units_str or 'PSI',
@@ -2876,10 +2905,14 @@ class WorkOrderController(QObject):
                 equipment_id=equipment_id,
                 master_equipment_id=master_equipment_id,
                 activation_id=activation_id,
-                max_pressure_achieved=observed_max_pressure,
-                gage_reference_diff=gage_reference_diff,
-                order_qty=int(wo.get('total', 1) or 1),
-                activation_target=getattr(setup, 'activation_target', None) if setup else None,
+                max_pressure_achieved=(
+                    float(observed_max_pressure) if observed_max_pressure is not None else None
+                ),
+                gage_reference_diff=(
+                    float(gage_reference_diff) if gage_reference_diff is not None else None
+                ),
+                order_qty=int(save_args.get('total', 1) or 1),
+                activation_target=save_args.get('activation_target'),
             )
             queue_after = get_local_queue_count()
         except Exception:
@@ -2889,17 +2922,20 @@ class WorkOrderController(QObject):
             queue_before = queue_after
         if not success:
             logger.error('%s: Failed to save test result (non-modal)', port_id)
-            self._set_database_activity_status('Write Failed', queue=str(max(queue_after, 1)))
-            return 'failed'
+            return _finish(
+                'failed',
+                activity_status='Write Failed',
+                queue=str(max(queue_after, 1)),
+            )
 
         status = 'Queued Locally' if queue_after > queue_before else 'Saved'
         last_write = 'Queued' if status == 'Queued Locally' else self._timestamp_for_status()
-        self._set_database_activity_status(
-            status,
+        return _finish(
+            'saved',
+            activity_status=status,
             last_write=last_write,
             queue=str(queue_after),
         )
-        return 'saved'
 
     @staticmethod
     def _format_optional_pressure(value: Optional[float]) -> str:
@@ -2918,7 +2954,7 @@ class WorkOrderController(QObject):
             return deactivation_value, activation_value
         return activation_value, deactivation_value
 
-    def _advance_serial(self, port_id: str) -> None:
+    def _advance_serial(self, port_id: str, *, refresh_progress: bool = True) -> None:
         """Advance to the next serial number after recording a result."""
         sm = self._state_machines.get(port_id)
         if sm:
@@ -2935,10 +2971,17 @@ class WorkOrderController(QObject):
             self._next_available_serial_for_port(port_id, current + 1, 1),
         )
 
-        if test_mode:
+        if test_mode or not refresh_progress:
             return
 
-        # Update progress
+        self._refresh_work_order_progress()
+
+    def _refresh_work_order_progress(self) -> None:
+        """Refresh WO progress counters (may hit SQL — keep off hot click path)."""
+        wo = self._ui_bridge._current_work_order if self._ui_bridge else None
+        if not wo or wo.get('test_mode', False):
+            return
+
         progress = get_work_order_progress(
             wo.get('shop_order', ''),
             wo.get('part_id', ''),

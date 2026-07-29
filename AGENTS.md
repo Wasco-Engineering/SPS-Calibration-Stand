@@ -23,11 +23,13 @@ This repo is typically run from a virtualenv located at `.venv/`.
   - `python -m pip install -r requirements.txt`
 
 Configuration:
-- **Production / stand PCs:** `C:\Stinger\` with `stinger_config.yaml` and `quality_cal_config.yaml`
-  (set machine `STINGER_CONFIG_DIR=C:\Stinger`). See `docs/DEPLOYMENT.md`.
-- **Legacy:** `%LOCALAPPDATA%\Stinger\<STAND_ID>\` still resolved if present.
-- **Development fallback:** repo-root YAML if no install copy exists.
-- Logs default to `<config_dir>/logs/`.
+- **Per-computer YAML (tracked in git):** `configs/<hostname>/stinger_config.yaml` and
+  `quality_cal_config.yaml`. Runtime picks the folder from this PC's hostname
+  (`CA-MAN-SPS-02`, `ID-MAN-SPS-01`, … — see `deploy/DEPLOYMENT_REGISTRY.yaml`).
+- **Overrides:** `STINGER_CONFIG` / `STINGER_QUALITY_CONFIG` (full file paths), or
+  `STINGER_CONFIG_DIR` (explicit directory). Prefer leaving `STINGER_CONFIG_DIR`
+  unset so hostname selection works after `git pull`.
+- **Logs:** `C:\Stinger\logs\` when using hostname configs.
 - Shared builds/docs on `Z:\Engineering\Program Builds\Python Builds\Stinger\` (set `STINGER_RELEASE_ROOT`).
 
 ---
@@ -212,14 +214,16 @@ Legacy labels `STINGER_01` may still appear in env on this PC. The DB equipment 
   Alicat polling, precision edge gating, cycle-prep, DB equipment-ID handling
 
 **Never overwrite blindly from another stand’s commit (config):**
+- Files under `configs/<other-hostname>/` — leave them alone; edit only *this*
+  PC’s `configs/<hostname>/` folder
 - `test_parameters.equipment_id` — must stay **`CA-SPS-02`** here
 - `hardware.alicat.baudrate` / COM addresses — must match *this* Alicat wiring
 - `open_fitting`, `transducer_installed`, switch COM polarity — bench-specific
 - Alicat / transducer `*_error_model` blocks — quality-cal for *this* hardware
 - `install_manifest.json` hostname / `stand_id`
 
-When merging `origin/main`, resolve conflicts by **keeping this stand’s site YAML
-identity** and **taking incoming application code**. After merge, re-check:
+When merging `origin/main`, take incoming `configs/` for *other* hosts and keep
+your local edits under `configs/CA-MAN-SPS-02/`. After merge, re-check:
 
 ```text
 equipment_id, baudrate, transducer_installed, COM ports

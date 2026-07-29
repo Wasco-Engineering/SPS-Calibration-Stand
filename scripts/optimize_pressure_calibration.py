@@ -330,8 +330,10 @@ def _optimize_for_port_sensor(
 
     axis = pressure_axis if pressure_axis in ('measured', 'target') else 'measured'
     piecewise_models: List[tuple[Dict[str, Any], str, str]] = []
+    # Allow denser piecewise for transducer low-Torr bias (3/5/7 segments).
+    allowed_segments = {3, 5, 7} if sensor == SENSOR_TRANSDUCER else {3, 5}
     for segment_count in segment_counts:
-        if segment_count not in {3, 5}:
+        if segment_count not in allowed_segments:
             continue
         min_seg = _min_segment_size_for_count(len(train), segment_count=segment_count)
         try:
@@ -368,7 +370,7 @@ def _optimize_for_port_sensor(
             train = pruned
             piecewise_models = []
             for segment_count in segment_counts:
-                if segment_count not in {3, 5}:
+                if segment_count not in allowed_segments:
                     continue
                 min_seg = _min_segment_size_for_count(len(train), segment_count=segment_count)
                 try:

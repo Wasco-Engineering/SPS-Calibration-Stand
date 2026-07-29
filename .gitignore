@@ -71,3 +71,6 @@ tmp/
 # Local config overrides (machine / stand specific)
 stinger_config.local.yaml
 quality_cal_config.local.yaml
+
+# Per-host runtime logs (YAML configs under configs/ are tracked)
+configs/*/logs/

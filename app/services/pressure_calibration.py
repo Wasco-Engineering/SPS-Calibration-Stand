@@ -120,6 +120,90 @@ def select_near_target_samples(
     return selected
 
 
+def select_stable_hold_tail_samples(
+    samples: Sequence[CalibrationSample],
+    *,
+    static_only: bool = True,
+    tail_fraction: float = 0.5,
+    min_tail: int = 5,
+) -> List[CalibrationSample]:
+    """Keep the last portion of each static target hold (drop settle transients).
+
+    Sweep CSVs include ramp/settle samples inside ``static_*`` phases. Fitting and
+    pass/fail on those spikes inflates p99 even when settled means are excellent.
+    """
+    if not 0.0 < float(tail_fraction) <= 1.0:
+        raise ValueError('tail_fraction must be in (0, 1]')
+    groups: Dict[float, List[CalibrationSample]] = {}
+    for sample in samples:
+        if static_only and not _is_static_phase(sample.phase):
+            continue
+        if sample.target_abs_psi is None:
+            continue
+        key = round(float(sample.target_abs_psi), 3)
+        groups.setdefault(key, []).append(sample)
+
+    selected: List[CalibrationSample] = []
+    for key in sorted(groups):
+        group = groups[key]
+        n_tail = max(int(min_tail), int(math.ceil(len(group) * float(tail_fraction))))
+        n_tail = min(len(group), n_tail)
+        selected.extend(group[-n_tail:])
+    selected.sort(key=lambda s: s.index)
+    return selected
+
+
+def summarize_static_hold_means(
+    samples: Sequence[CalibrationSample],
+    *,
+    sensor: SensorKind = SENSOR_TRANSDUCER,
+    static_only: bool = True,
+    tail_count: int = 8,
+) -> Tuple[List[CalibrationSample], List[float]]:
+    """Collapse each static target hold to one mean sample from the last ``tail_count`` rows.
+
+    Returns (mean_samples, per_hold_sensor_std_psi). Mean samples are the right
+    unit for interpolating-knot pass/fail: dense within-hold noise can span
+    multiple fine segments and inflate p99 even when settled means are excellent.
+    """
+    groups: Dict[float, List[CalibrationSample]] = {}
+    for sample in samples:
+        if static_only and not _is_static_phase(sample.phase):
+            continue
+        if sample.target_abs_psi is None:
+            continue
+        if _sensor_pressure(sample, sensor) is None:
+            continue
+        key = round(float(sample.target_abs_psi), 3)
+        groups.setdefault(key, []).append(sample)
+
+    means: List[CalibrationSample] = []
+    stds: List[float] = []
+    for index, key in enumerate(sorted(groups)):
+        group = groups[key]
+        tail = group[-max(1, int(tail_count)) :]
+        sensor_vals = [float(_sensor_pressure(s, sensor)) for s in tail]  # type: ignore[arg-type]
+        stds.append(statistics.pstdev(sensor_vals) if len(sensor_vals) > 1 else 0.0)
+
+        def _mean_field(getter) -> Optional[float]:
+            vals = [float(v) for s in tail if (v := getter(s)) is not None]
+            return statistics.fmean(vals) if vals else None
+
+        means.append(
+            CalibrationSample(
+                index=index,
+                timestamp=float(tail[-1].timestamp),
+                port_id=tail[-1].port_id,
+                phase=f'static_{key:g}',
+                target_abs_psi=float(key),
+                transducer_abs_psi=_mean_field(lambda s: s.transducer_abs_psi),
+                alicat_abs_psi=_mean_field(lambda s: s.alicat_abs_psi),
+                mensor_abs_psia=_mean_field(lambda s: s.mensor_abs_psia),
+            )
+        )
+    return means, stds
+
+
 def split_train_validation(
     samples: Sequence[CalibrationSample],
     *,
@@ -176,6 +260,9 @@ def _percentile_candidates(segment_count: int) -> List[Tuple[float, ...]]:
     if segment_count == 5:
         grid = [0.08, 0.16, 0.24, 0.32, 0.40, 0.52, 0.64, 0.76, 0.88]
         return list(itertools.combinations(grid, 4))
+    if segment_count == 7:
+        grid = [0.06, 0.12, 0.20, 0.30, 0.42, 0.55, 0.68, 0.80, 0.90]
+        return list(itertools.combinations(grid, 6))
     raise ValueError(f'Unsupported segment_count={segment_count}')
 
 
@@ -322,6 +409,117 @@ def replay_corrected_series(
     return corrected
 
 
+def build_piecewise_from_error_knots(
+    knots: Sequence[Tuple[float, float]],
+    *,
+    pressure_axis: Literal['measured', 'target'] = 'measured',
+    min_knot_spacing_psi: float = 0.01,
+) -> Dict[str, Any]:
+    """Build a piecewise-linear error model that interpolates (pressure, error) knots.
+
+    Knots are (axis_pressure_psi, error_psi) sorted by pressure. Consecutive knots
+    closer than ``min_knot_spacing_psi`` are averaged. Between knots the modeled
+    error is linear, so applying corrected = measured - error hits the knot
+    residuals exactly (within float noise).
+    """
+    if len(knots) < 2:
+        raise ValueError('Need at least two error knots for interpolating piecewise')
+    ordered = sorted((float(x), float(e)) for x, e in knots)
+    merged: List[List[float]] = [[ordered[0][0], ordered[0][1], 1.0]]
+    for x, e in ordered[1:]:
+        if abs(x - merged[-1][0]) < float(min_knot_spacing_psi):
+            n = merged[-1][2] + 1.0
+            merged[-1][0] = (merged[-1][0] * merged[-1][2] + x) / n
+            merged[-1][1] = (merged[-1][1] * merged[-1][2] + e) / n
+            merged[-1][2] = n
+        else:
+            merged.append([x, e, 1.0])
+    if len(merged) < 2:
+        raise ValueError('Need at least two distinct knots after merging close pressures')
+
+    segments: List[Dict[str, Any]] = []
+    for i in range(len(merged) - 1):
+        x0, e0, _ = merged[i]
+        x1, e1, _ = merged[i + 1]
+        slope = (e1 - e0) / (x1 - x0)
+        intercept = e0 - slope * x0
+        segments.append(
+            {
+                'max_psi': float(x1),
+                'slope_error_per_psi': float(slope),
+                'intercept_error_psi': float(intercept),
+            }
+        )
+    x_last, e_last, _ = merged[-1]
+    x_prev, e_prev, _ = merged[-2]
+    slope = (e_last - e_prev) / (x_last - x_prev)
+    intercept = e_last - slope * x_last
+    segments.append(
+        {
+            'max_psi': None,
+            'slope_error_per_psi': float(slope),
+            'intercept_error_psi': float(intercept),
+        }
+    )
+    return {
+        'type': 'piecewise_linear',
+        'segments': segments,
+        'pressure_axis': pressure_axis,
+        'fit_method': 'interpolating_knots',
+    }
+
+
+def fit_interpolating_piecewise_error_model(
+    train_samples: Sequence[CalibrationSample],
+    *,
+    sensor: SensorKind = SENSOR_TRANSDUCER,
+    reference: ReferenceKind = REFERENCE_ALICAT,
+    pressure_axis: Literal['measured', 'target'] = 'measured',
+    min_knot_spacing_psi: float = 0.01,
+    static_only: bool = True,
+    min_samples_per_knot: int = 1,
+) -> Dict[str, Any]:
+    """Fit piecewise-linear error by interpolating mean error at each static target.
+
+    Prefer this for transducers when Quality Cal has stable holds across the
+    profile band (``fit_max_psia``). The model only corrects within/near the
+    swept span; it does not invent behavior above the highest knot.
+    """
+    groups: Dict[float, List[Tuple[float, float]]] = {}
+    for sample in train_samples:
+        if static_only and not _is_static_phase(sample.phase):
+            continue
+        measured = _sensor_pressure(sample, sensor)
+        ref = _reference_pressure(sample, reference)
+        if measured is None or ref is None:
+            continue
+        axis = _pressure_axis_value(
+            sample,
+            measured=float(measured),
+            pressure_axis=pressure_axis,
+        )
+        if sample.target_abs_psi is not None:
+            key = round(float(sample.target_abs_psi), 3)
+        else:
+            key = round(float(axis), 3)
+        groups.setdefault(key, []).append((float(axis), float(measured) - float(ref)))
+
+    knots: List[Tuple[float, float]] = []
+    for key in sorted(groups):
+        pairs = groups[key]
+        if len(pairs) < int(min_samples_per_knot):
+            continue
+        mean_x = statistics.fmean(x for x, _ in pairs)
+        mean_e = statistics.fmean(e for _, e in pairs)
+        knots.append((mean_x, mean_e))
+
+    return build_piecewise_from_error_knots(
+        knots,
+        pressure_axis=pressure_axis,
+        min_knot_spacing_psi=min_knot_spacing_psi,
+    )
+
+
 def fit_piecewise_linear_error_model(
     train_samples: Sequence[CalibrationSample],
     *,
@@ -332,8 +530,8 @@ def fit_piecewise_linear_error_model(
     pressure_axis: Literal['measured', 'target'] = 'measured',
 ) -> Dict[str, Any]:
     """Fit piecewise-linear model for error vs measured pressure."""
-    if segment_count not in {3, 5}:
-        raise ValueError('segment_count must be 3 or 5')
+    if segment_count not in {3, 5, 7}:
+        raise ValueError('segment_count must be 3, 5, or 7')
     xs, ys = _extract_fit_pairs(
         train_samples,
         sensor=sensor,
@@ -414,6 +612,124 @@ def _quantile_abs(values: Sequence[float], q: float) -> float:
     if not values:
         return float('nan')
     return _quantile([abs(v) for v in values], q)
+
+
+def smooth_error_knots(
+    knots: Sequence[Tuple[float, float]],
+    lambda_roughness: float,
+) -> List[Tuple[float, float]]:
+    """Apply ridge smoothing to (pressure, error) knots.
+
+    Finds smoothed errors ê minimising:
+        Σ (ê_i - e_i)² + λ Σ ((ê_{i+1} - ê_i) / h_i)²
+    where h_i = x_{i+1} - x_i.
+
+    With λ=0 returns the original knots unchanged.  Large λ → linear trendline.
+    Solved as (I + λ D^T D) ê = e (numpy linear-algebra, no scipy).
+    """
+    n = len(knots)
+    if n < 2:
+        return list(knots)
+    xs = np.array([float(k[0]) for k in knots])
+    es = np.array([float(k[1]) for k in knots])
+    if lambda_roughness <= 0.0:
+        return [(float(xs[i]), float(es[i])) for i in range(n)]
+    h = np.diff(xs)
+    # D is (n-1) × n: row i divides the finite difference by h_i
+    D = np.zeros((n - 1, n))
+    for i in range(n - 1):
+        D[i, i] = -1.0 / float(h[i])
+        D[i, i + 1] = 1.0 / float(h[i])
+    A = np.eye(n) + lambda_roughness * (D.T @ D)
+    e_smooth = np.linalg.solve(A, es)
+    return [(float(xs[i]), float(e_smooth[i])) for i in range(n)]
+
+
+def fit_smoothed_interpolating_error_model(
+    train_samples: Sequence[CalibrationSample],
+    *,
+    sensor: SensorKind = SENSOR_TRANSDUCER,
+    reference: ReferenceKind = REFERENCE_ALICAT,
+    pressure_axis: Literal['measured', 'target'] = 'measured',
+    min_knot_spacing_psi: float = 0.01,
+    lambda_roughness: float = 1e-3,
+    static_only: bool = True,
+    min_samples_per_knot: int = 1,
+) -> Dict[str, Any]:
+    """Interpolating piecewise fit with ridge-roughness smoothing across knots.
+
+    Same hold-mean grouping as ``fit_interpolating_piecewise_error_model`` but
+    the target error at each knot is softened by a Tikhonov penalty on adjacent
+    slope differences before building segments.  This prevents steep inter-knot
+    segments that amplify transducer jitter.  ``lambda_roughness=0`` reproduces
+    the exact interpolator; larger values yield smoother curves at the cost of
+    non-zero residual at individual knots.
+    """
+    groups: Dict[float, List[Tuple[float, float]]] = {}
+    for sample in train_samples:
+        if static_only and not _is_static_phase(sample.phase):
+            continue
+        measured = _sensor_pressure(sample, sensor)
+        ref = _reference_pressure(sample, reference)
+        if measured is None or ref is None:
+            continue
+        axis = _pressure_axis_value(sample, measured=float(measured), pressure_axis=pressure_axis)
+        key = (
+            round(float(sample.target_abs_psi), 3)
+            if sample.target_abs_psi is not None
+            else round(float(axis), 3)
+        )
+        groups.setdefault(key, []).append((float(axis), float(measured) - float(ref)))
+
+    raw_knots: List[Tuple[float, float]] = []
+    for key in sorted(groups):
+        pairs = groups[key]
+        if len(pairs) < int(min_samples_per_knot):
+            continue
+        mean_x = statistics.fmean(x for x, _ in pairs)
+        mean_e = statistics.fmean(e for _, e in pairs)
+        raw_knots.append((mean_x, mean_e))
+
+    smoothed_knots = smooth_error_knots(raw_knots, lambda_roughness)
+    model = build_piecewise_from_error_knots(
+        smoothed_knots,
+        pressure_axis=pressure_axis,
+        min_knot_spacing_psi=min_knot_spacing_psi,
+    )
+    model['fit_method'] = 'smoothed_interpolating_knots'
+    model['lambda_roughness'] = float(lambda_roughness)
+    return model
+
+
+def score_band_replay(
+    samples: Sequence[CalibrationSample],
+    *,
+    model: Optional[Dict[str, Any]],
+    ema_alpha: float,
+    band_center_psi: float,
+    band_half_width_psi: float = 0.05,
+    sensor: SensorKind = SENSOR_TRANSDUCER,
+    reference: ReferenceKind = REFERENCE_ALICAT,
+) -> Dict[str, float]:
+    """Score a replay only for samples whose target falls within a pressure band.
+
+    Useful for isolating a specific operating point — e.g. the 15 Torr (~0.29 PSIA)
+    hold — without re-running the full replay.  EMA is still computed over all
+    samples in order; only the error statistics are restricted to the band.
+    """
+    include_mask = [
+        sample.target_abs_psi is not None
+        and abs(float(sample.target_abs_psi) - band_center_psi) <= band_half_width_psi
+        for sample in samples
+    ]
+    return score_replay(
+        samples,
+        model=model,
+        ema_alpha=ema_alpha,
+        include_mask=include_mask,
+        sensor=sensor,
+        reference=reference,
+    )
 
 
 def score_error_series_torr(errors_psi: Sequence[float]) -> Dict[str, float]:

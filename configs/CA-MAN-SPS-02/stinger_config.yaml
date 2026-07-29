@@ -1,0 +1,335 @@
+app:
+  name: Stinger
+  version: 1.0.0
+hardware:
+  labjack:
+    device_type: T7
+    connection_type: USB
+    identifier: ANY
+    resolution_index: 9
+    pressure_filter_alpha: 0.0
+    port_a:
+      transducer_ain: 2
+      transducer_ain_neg: 3
+      transducer_voltage_min: 0
+      transducer_voltage_max: 10
+      transducer_pressure_min: 0.0
+      transducer_pressure_max: 30.0
+      transducer_reference: absolute
+      port_installed: true
+      transducer_installed: false
+      switch_sensed_db9_pins:
+      - 3
+      vacuum_switch_trips_on_no_open: false
+      switch_com_state: 0
+      switch_active_low: true
+      solenoid_dio: 19
+      transducer_error_model:
+        type: piecewise_linear
+        segments:
+        - max_psi: 0.16275
+          slope_error_per_psi: 0.5127621935809957
+          intercept_error_psi: -0.0024520470053070523
+        - max_psi: 0.2056125
+          slope_error_per_psi: -0.33041703120443233
+          intercept_error_psi: 0.13477537182852137
+        - max_psi: 0.24255
+          slope_error_per_psi: 0.04230118443316325
+          intercept_error_psi: 0.05813984771573624
+        - max_psi: 0.2778875
+          slope_error_per_psi: -0.496639547223204
+          intercept_error_psi: 0.18885992217898812
+        - max_psi: 0.3786125
+          slope_error_per_psi: 0.3559195830230826
+          intercept_error_psi: -0.04805560312732686
+        - max_psi: 0.424675
+          slope_error_per_psi: 0.6664857530529172
+          intercept_error_psi: -0.16563983717774766
+        - max_psi: 0.5512125
+          slope_error_per_psi: -0.23698508347327873
+          intercept_error_psi: 0.21804164032401466
+        - max_psi: 0.6423375
+          slope_error_per_psi: -0.42126200274348435
+          intercept_error_psi: 0.31961738168724285
+        - max_psi: 0.9297625
+          slope_error_per_psi: 0.12964251543881042
+          intercept_error_psi: -0.034249249260676906
+        - max_psi: 1.1543
+          slope_error_per_psi: -0.07019985525802994
+          intercept_error_psi: 0.15155669292434415
+        - max_psi: 1.612575
+          slope_error_per_psi: 0.11546014947356918
+          intercept_error_psi: -0.06275065053734075
+        - max_psi: 2.1388
+          slope_error_per_psi: -0.07532424343199288
+          intercept_error_psi: 0.24490349185234603
+        - max_psi: 3.0207
+          slope_error_per_psi: -0.021927089239142005
+          intercept_error_psi: 0.13069765846467657
+        - max_psi: 5.0512125
+          slope_error_per_psi: 0.008667762449135299
+          intercept_error_psi: 0.03827978996989731
+        - max_psi: 7.8722125
+          slope_error_per_psi: -0.05697890818858584
+          intercept_error_psi: 0.3698750732785373
+        - max_psi: 9.7087375
+          slope_error_per_psi: -0.09193994092103241
+          intercept_error_psi: 0.6450957521678123
+        - max_psi: 14.7176875
+          slope_error_per_psi: 0.0012302977669971335
+          intercept_error_psi: -0.2594696380666109
+        - max_psi: 19.7498125
+          slope_error_per_psi: 0.0034478475793027086
+          intercept_error_psi: -0.292106843219808
+        - max_psi: 24.8394875
+          slope_error_per_psi: 0.01907292705329913
+          intercept_error_psi: -0.6006992331288359
+        - max_psi: 29.884775
+          slope_error_per_psi: 0.004231671634173821
+          intercept_error_psi: -0.23205005466116557
+        - max_psi: null
+          slope_error_per_psi: 0.004231671634173821
+          intercept_error_psi: -0.23205005466116557
+        pressure_axis: measured
+        fit_method: interpolating_knots
+    port_b:
+      port_installed: true
+      transducer_installed: false
+      transducer_ain: 0
+      transducer_ain_neg: 1
+      transducer_voltage_min: 0
+      transducer_voltage_max: 10
+      transducer_pressure_min: 0.0
+      transducer_pressure_max: 30.0
+      transducer_reference: absolute
+      switch_sensed_db9_pins:
+      - 3
+      vacuum_switch_trips_on_no_open: false
+      switch_com_state: 0
+      switch_active_low: true
+      solenoid_dio: 18
+      transducer_error_model:
+        type: piecewise_linear
+        segments:
+        - max_psi: 0.17570606060606062
+          slope_error_per_psi: -0.07269904922061995
+          intercept_error_psi: 0.08522517869987639
+        - max_psi: 0.1856878787878788
+          slope_error_per_psi: 0.22556162720097078
+          intercept_error_psi: 0.03281897021213973
+        - max_psi: 0.26425454545454546
+          slope_error_per_psi: -0.057083349404096054
+          intercept_error_psi: 0.08530271636798423
+        - max_psi: 0.29652121212121213
+          slope_error_per_psi: -0.05155897821187003
+          intercept_error_psi: 0.08384287616966035
+        - max_psi: 0.36133939393939396
+          slope_error_per_psi: -0.004160822814399338
+          intercept_error_psi: 0.06978831767889276
+        - max_psi: 0.36691212121212124
+          slope_error_per_psi: 1.597063621533442
+          intercept_error_psi: -0.5087971526026991
+        - max_psi: 0.4095393939393939
+          slope_error_per_psi: -0.06447714509135087
+          intercept_error_psi: 0.10084229456001778
+        - max_psi: 0.5576909090909091
+          slope_error_per_psi: 0.00018408672530232455
+          intercept_error_psi: 0.07436097287045097
+        - max_psi: 0.8388575757575758
+          slope_error_per_psi: -0.03874548687826679
+          intercept_error_psi: 0.0960716421639469
+        - max_psi: 1.1412121212121211
+          slope_error_per_psi: 0.022279683694638737
+          intercept_error_psi: 0.04488021551696682
+        - max_psi: 1.6314363636363638
+          slope_error_per_psi: 0.010774290058971571
+          intercept_error_psi: 0.05801031019330698
+        - max_psi: 2.0582121212121214
+          slope_error_per_psi: 0.010522877673321666
+          intercept_error_psi: 0.0584204735015248
+        - max_psi: 3.0779484848484846
+          slope_error_per_psi: -0.0037145667477929117
+          intercept_error_psi: 0.08772415418414672
+        - max_psi: 5.067915151515152
+          slope_error_per_psi: -0.008440829677365827
+          intercept_error_psi: 0.10227134800722124
+        - max_psi: 7.890355
+          slope_error_per_psi: -0.05990346950518801
+          intercept_error_psi: 0.36307964012760835
+        - max_psi: 9.83088
+          slope_error_per_psi: -0.04192937478259742
+          intercept_error_psi: 0.2212576519627421
+        - max_psi: 14.876675
+          slope_error_per_psi: 0.006925568716128711
+          intercept_error_psi: -0.2590294349800147
+        - max_psi: 19.81628
+          slope_error_per_psi: -0.0070926723897961124
+          intercept_error_psi: -0.0504846179755305
+        - max_psi: 24.88401
+          slope_error_per_psi: 0.011565335959098373
+          intercept_error_psi: -0.4202169356595613
+        - max_psi: 29.850455
+          slope_error_per_psi: 0.00015705398932140392
+          intercept_error_psi: -0.13633313304081152
+        - max_psi: null
+          slope_error_per_psi: 0.00015705398932140392
+          intercept_error_psi: -0.13633313304081152
+        pressure_axis: measured
+  alicat:
+    baudrate: 115200
+    timeout_s: 0.2
+    auto_tare_on_connect: true
+    auto_tare_max_delta_psi: 0.5
+    auto_tare_delay_s: 0.5
+    pressure_units_stat: 2
+    pressure_units_group: 0
+    pressure_units_value: 10
+    pressure_units_override: 0
+    pressure_index: 0
+    gauge_index: 1
+    barometric_index: 2
+    setpoint_index: 3
+    port_a:
+      com_port: COM3
+      address: A
+      alicat_error_model:
+        type: piecewise_linear
+        segments:
+        - max_psi: 0.08
+          slope_error_per_psi: 0.07020000000000037
+          intercept_error_psi: -0.006898000000000024
+        - max_psi: 0.2
+          slope_error_per_psi: -0.01871634543272837
+          intercept_error_psi: 0.0009731869656517209
+        - max_psi: 0.84
+          slope_error_per_psi: -0.002456260593514971
+          intercept_error_psi: 0.0010673861107328613
+        - max_psi: 14.94
+          slope_error_per_psi: 0.00021665267229943703
+          intercept_error_psi: 0.001746416111119458
+        - max_psi: null
+          slope_error_per_psi: 0.0009069981660309157
+          intercept_error_psi: -0.0109934908420668
+        pressure_axis: measured
+    port_b:
+      com_port: COM3
+      address: B
+      alicat_error_model:
+        type: quadratic
+        a_error_per_psi2: 9.37474716676539e-06
+        b_error_per_psi: 0.00016388089556907746
+        c_error_psi: -0.0014505022376989937
+        pressure_axis: measured
+  solenoid:
+    vacuum_state: 1
+    atmosphere_state: 0
+    safe_vacuum_switch_threshold_psi: 2.0
+  measurement:
+    # 2026-07-29: Transducers unreliable at low vacuum — use Alicat for all
+    # test/edge pressure until replacement transducers are qualified.
+    preferred_source: alicat
+    fallback_on_unavailable: true
+    transducer_only_below_psi: 5.0
+    alicat_only_above_psi: 5.0
+    switch_pivot_min_psi: 5.0
+    sensor_disagreement_fallback_enabled: true
+    sensor_disagreement_max_psi: 0.1
+control:
+  ramps:
+    fast_cycle_rate_psi_per_sec: 5.0
+    pre_approach_rate_multiplier: 1.0
+    precision_sweep_rate_torr_per_sec: 5.0
+    low_pressure_precision_threshold_psi: 1.0
+    low_pressure_precision_sweep_rate_torr_per_sec: 1.0
+  cycling:
+    num_cycles: 3
+  edge_detection:
+    overshoot_beyond_limit_percent: 10.0
+    timeout_sec: 60.0
+    precision_close_limit_offset_torr: 25.0
+    precision_approach_settle_sec: 0.2
+    precision_post_target_grace_sec: 0.35
+    precision_return_overshoot_torr: 15.0
+  debounce:
+    stable_sample_count: 3
+    min_edge_interval_ms: 50
+timing:
+  ui_refresh_interval_ms: 16
+  hardware_poll_interval_ms: 7
+  alicat_background_polling_enabled: true
+  alicat_background_poll_hz: 140
+  alicat_poll_divisor: 4
+  alicat_poll_divisor_normal: 5
+  alicat_poll_divisor_precision: 2
+  labjack_poll_divisor_sibling: 14
+  hardware_poll_interval_ms_precision: 7
+  button_lockout_ms: 300
+  graceful_stop_timeout_sec: 5.0
+database:
+  type: mssql
+  server: PASCAL
+  database: WASCO_Calibration
+  driver: ODBC Driver 18 for SQL Server
+  username: MAXSQLAdmin
+  password: M@x@dm1n
+  connection_timeout_sec: 5.0
+max_database:
+  database: ExactMAXWasco
+nexus:
+  enabled: true
+  base_url: https://id-production.wasconexus.com/
+  stand_key: null
+  timeout_sec: 10
+  verify_tls: true
+  cache_path: data/nexus-badge-cache.sqlite3
+  stand_keys:
+    CA-SPS-01: wsk_a12NoQgKjVsu4TRX59P91_5kJv6wPwcXf7DY4sNMyY8
+    CA-SPS-02: wsk_zwOGJ4jsyprRc3DSX4DLYZ8rbKwJO4cWwkuhb0uUMT4
+    ID-SPS-01: wsk_hGsNOhl4UCkf1TfHP26E7R_6M6qVbhZcdyXNjYoOi6I
+    ID-SPS-02: wsk_uHjPgBNlaPCbggAs6moST5jr8HQQKAkkMb_iZercP58
+ptp_database:
+  enabled: true
+  timeout_sec: 3
+  retry_primary_sec: 120
+  primary:
+    host: 192.168.1.159
+    port: 5432
+    database: wasco_calibration
+    username: postgres
+    password: W@sc0@dm1n
+  secondary:
+    host: null
+    port: 5432
+    database: wasco_calibration
+    username: postgres
+    password: null
+ui:
+  theme: dark
+  min_touch_target_px: 44
+  admin_pin: '2245'
+  debug_noise:
+    window_samples: 60
+    min_samples: 12
+    trend_alpha: 0.2
+    transition_sigma_factor: 8.0
+    max_holdoff_ms: 350
+  pressure_display:
+    decimal_places: 2
+  pressure_bar:
+    show_atmosphere_reference: true
+    show_acceptance_bands: true
+    show_measured_points: true
+test_parameters:
+  equipment_id: CA-SPS-02
+  default_temperature_c: 25.0
+  max_attempts: 3
+custom_work_orders:
+  stinger228:
+    part_id: SPS00000
+    sequence_id: '300'
+    order_qty: 1
+logging:
+  level: INFO
+  log_dir: logs
+  max_bytes: 10485760
+  backup_count: 5

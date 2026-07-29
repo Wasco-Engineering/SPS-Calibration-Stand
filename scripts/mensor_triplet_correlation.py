@@ -101,13 +101,16 @@ def _read_triplet(
     ctrl: AlicatController,
     target: float,
     elapsed: float,
+    port_key: str,
 ) -> TripletSample:
     mensor_psia = None
     mensor_raw = ''
     try:
-        r = mensor.read_pressure()
+        r = mensor.read_pressure(port_id=port_key)
         mensor_psia = r.pressure_psia
-        mensor_raw = mensor.response_tail[-1] if mensor.response_tail else ''
+        ch = r.channel or 'active'
+        raw = mensor.response_tail[-1] if mensor.response_tail else ''
+        mensor_raw = f'{ch}:{raw}'
     except Exception as exc:
         mensor_raw = str(exc)
 
@@ -191,7 +194,7 @@ def run_static(
         t0 = time.perf_counter()
         interval = 1.0 / max(rate_hz, 0.1)
         while time.perf_counter() - t0 < hold_s:
-            batch.append(_read_triplet(mensor, lj, ctrl, target, time.perf_counter() - t0))
+            batch.append(_read_triplet(mensor, lj, ctrl, target, time.perf_counter() - t0, port_key))
             time.sleep(interval)
         out.extend(batch)
 
@@ -277,6 +280,12 @@ def main() -> int:
     parser.add_argument('--max-psia', type=float, default=MENSOR_MAX_PSIA_DEFAULT,
                         help='Do not command above this (Mensor safety limit)')
     parser.add_argument('--mensor-port', type=str, default=None)
+    parser.add_argument(
+        '--mensor-channel',
+        type=str,
+        default=None,
+        help='Force Mensor channel A/B (overrides config channel / port_channels)',
+    )
     parser.add_argument('--discover-mensor', action='store_true')
     parser.add_argument('--qc-config', type=Path, default=None, help='quality_cal_config.yaml')
     args = parser.parse_args()
@@ -303,6 +312,13 @@ def main() -> int:
 
     if args.mensor_port:
         mensor_cfg['port'] = args.mensor_port
+    if args.mensor_channel:
+        mensor_cfg['channel'] = args.mensor_channel
+        # Force this channel even when port_channels would map otherwise.
+        mensor_cfg['port_channels'] = {
+            'port_a': args.mensor_channel,
+            'port_b': args.mensor_channel,
+        }
 
     targets = args.static if args.static is not None else DEFAULT_STATIC
     targets = _filter_targets(sorted(targets), args.max_psia)
@@ -310,10 +326,17 @@ def main() -> int:
         print('No targets within Mensor limit.')
         return 1
 
+    resolved_ch = (
+        args.mensor_channel
+        or (mensor_cfg.get('port_channels') or {}).get(args.port)
+        or mensor_cfg.get('channel')
+        or 'active'
+    )
     print('=' * 72)
     print('Triplet correlation (Mensor reference)')
     print(f'  Stinger port: {args.port} ({PORT_SIDE.get(args.port, "unknown")} physical)')
     print(f'  Mensor COM:   {mensor_cfg.get("port")} @ {mensor_cfg.get("baudrate", 57600)}')
+    print(f'  Mensor chan:  {resolved_ch}')
     print(f'  Max PSIA:     {args.max_psia} (Mensor safety cap)')
     print('=' * 72)
 

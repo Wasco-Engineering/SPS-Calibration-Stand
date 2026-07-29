@@ -15,6 +15,12 @@ from app.services.pressure_calibration import (
     SENSOR_ALICAT,
     SENSOR_TRANSDUCER,
     apply_error_model,
+    fit_interpolating_piecewise_error_model,
+    fit_smoothed_interpolating_error_model,
+    psi_to_torr,
+    score_band_replay,
+    score_replay,
+    summarize_static_hold_means,
 )
 from quality_cal.config import QualitySettings, get_default_config_path
 from quality_cal.core.calibration_export import (
@@ -63,20 +69,25 @@ def get_stinger_config_path() -> Path:
     return _stinger_path()
 
 
-def _filter_mensor_agreement_samples(
+def _filter_settle_quality_samples(
     samples: list,
     *,
-    max_gap_psi: float = 0.05,
+    max_alicat_mensor_gap_psi: float = 0.15,
 ) -> list:
-    """Drop static samples where transducer and Mensor disagree sharply (bad settle/leak)."""
+    """Drop static samples where Alicat and Mensor disagree (bad settle/leak).
+
+    Do **not** filter on transducer−Mensor gap: that systematic offset is exactly
+    what the transducer error model must learn (e.g. +2–4 Torr at low vacuum).
+    """
     kept: list = []
     for sample in samples:
         mensor = sample.mensor_abs_psia
-        transducer = sample.transducer_abs_psi
-        if mensor is None or transducer is None:
+        alicat = sample.alicat_abs_psi
+        if mensor is None:
             continue
-        if abs(float(mensor) - float(transducer)) <= max_gap_psi:
-            kept.append(sample)
+        if alicat is not None and abs(float(mensor) - float(alicat)) > max_alicat_mensor_gap_psi:
+            continue
+        kept.append(sample)
     return kept
 
 
@@ -93,21 +104,151 @@ def _fit_sensor_from_samples(
         _optimize_for_port_sensor,
     )
 
-    agreement_gaps_psi = (0.05, 0.08, 0.1, 0.2, 1.5)
+    # Prefer Alicat↔Mensor settle quality; keep transducer bias samples for fitting.
+    for gap in (0.08, 0.15, 0.25, 0.5, 1.5):
+        filtered = _filter_settle_quality_samples(samples, max_alicat_mensor_gap_psi=gap)
+        if len(filtered) >= min_samples // 2:
+            logger.info(
+                '%s/%s: using %s/%s samples after Alicat-Mensor settle filter (|A-M| <= %.3f psi)',
+                port_id,
+                sensor,
+                len(filtered),
+                len(samples),
+                gap,
+            )
+            samples = filtered
+            break
+
+    best: Optional[SensorFitResult] = None
+
+    # Transducers: prefer knot-interpolating piecewise over quantile 3/5/7 fits.
+    # Fit/score on settled hold *means* (not dense samples): within-hold X noise
+    # spans multiple fine segments and would fail p99 even when means are excellent.
+    # Span is whatever the profile's fit_max_psia band retained in ``samples``.
     if sensor == SENSOR_TRANSDUCER:
-        for gap in agreement_gaps_psi:
-            filtered = _filter_mensor_agreement_samples(samples, max_gap_psi=gap)
-            if len(filtered) >= min_samples // 2:
-                logger.info(
-                    '%s/%s: using %s/%s samples after Mensor agreement filter (|T-M| <= %.3f psi)',
-                    port_id,
-                    sensor,
-                    len(filtered),
-                    len(samples),
-                    gap,
+        try:
+            mean_samples, hold_stds = summarize_static_hold_means(
+                samples,
+                sensor=SENSOR_TRANSDUCER,
+                static_only=True,
+                tail_count=8,
+            )
+            if len(mean_samples) < 2:
+                raise ValueError('Need at least two static hold means')
+
+            median_std = sorted(hold_stds)[len(hold_stds) // 2] if hold_stds else 0.0
+            spacing_candidates = []
+            for candidate in (0.01, max(0.01, float(median_std)), max(0.05, 2.0 * float(median_std))):
+                if candidate not in spacing_candidates:
+                    spacing_candidates.append(candidate)
+
+            # Find the target closest to 15 Torr (~0.29 PSIA) for the 15T P95 gate.
+            _15torr_psi = 15.0 / 51.71493256
+            targets_psi = [
+                float(s.target_abs_psi)
+                for s in mean_samples
+                if s.target_abs_psi is not None
+            ]
+            band_center = min(targets_psi, key=lambda t: abs(t - _15torr_psi)) if targets_psi else _15torr_psi
+            _15t_gate = settings.pass_threshold_torr
+
+            best_model: Optional[dict] = None
+            best_score: Optional[dict] = None
+            best_p15: float = float('inf')
+
+            # --- Exact interpolating knots (existing behaviour) ---
+            for spacing in spacing_candidates:
+                try:
+                    m = fit_interpolating_piecewise_error_model(
+                        mean_samples,
+                        sensor=SENSOR_TRANSDUCER,
+                        reference=REFERENCE_MENSOR,
+                        pressure_axis='measured',
+                        min_knot_spacing_psi=spacing,
+                        static_only=True,
+                        min_samples_per_knot=1,
+                    )
+                except ValueError:
+                    continue
+                sc = score_replay(mean_samples, model=m, ema_alpha=0.0, sensor=SENSOR_TRANSDUCER, reference=REFERENCE_MENSOR)
+                p15_score = score_band_replay(samples, model=m, ema_alpha=0.0, band_center_psi=band_center, band_half_width_psi=0.05, sensor=SENSOR_TRANSDUCER, reference=REFERENCE_MENSOR)
+                p15 = float(p15_score.get('p95_abs_torr', float('inf')))
+                _is_better = best_score is None or (
+                    p15 < best_p15 - 0.05
+                    or (abs(p15 - best_p15) <= 0.05 and float(sc['p99_abs_torr']) < float(best_score['p99_abs_torr']))
                 )
-                samples = filtered
-                break
+                if _is_better:
+                    best_model, best_score, best_p15 = m, sc, p15
+                if float(sc['p99_abs_torr']) <= settings.pass_threshold_torr and p15 <= _15t_gate:
+                    break
+
+            # --- Smoothed interpolating knots (new candidates) ---
+            # Lambda grid spans from near-exact to smooth trendline.
+            lambda_grid = [1e-5, 1e-4, 1e-3, 5e-3, 1e-2, 5e-2, 1e-1]
+            for lam in lambda_grid:
+                try:
+                    m = fit_smoothed_interpolating_error_model(
+                        mean_samples,
+                        sensor=SENSOR_TRANSDUCER,
+                        reference=REFERENCE_MENSOR,
+                        pressure_axis='measured',
+                        min_knot_spacing_psi=0.01,
+                        lambda_roughness=lam,
+                        static_only=True,
+                        min_samples_per_knot=1,
+                    )
+                except ValueError:
+                    continue
+                sc = score_replay(mean_samples, model=m, ema_alpha=0.0, sensor=SENSOR_TRANSDUCER, reference=REFERENCE_MENSOR)
+                p15_score = score_band_replay(samples, model=m, ema_alpha=0.0, band_center_psi=band_center, band_half_width_psi=0.05, sensor=SENSOR_TRANSDUCER, reference=REFERENCE_MENSOR)
+                p15 = float(p15_score.get('p95_abs_torr', float('inf')))
+                _is_better = best_score is None or (
+                    p15 < best_p15 - 0.05
+                    or (abs(p15 - best_p15) <= 0.05 and float(sc['p99_abs_torr']) < float(best_score['p99_abs_torr']))
+                )
+                if _is_better:
+                    best_model, best_score, best_p15 = m, sc, p15
+                if float(sc['p99_abs_torr']) <= settings.pass_threshold_torr and p15 <= _15t_gate:
+                    break
+
+            if best_model is None or best_score is None:
+                raise ValueError('Interpolating fit produced no candidate')
+
+            fit_method = best_model.get('fit_method', 'interpolating_knots')
+            lam_tag = (
+                f' λ={best_model["lambda_roughness"]:.0e}'
+                if fit_method == 'smoothed_interpolating_knots'
+                else ''
+            )
+            interp_fit = SensorFitResult(
+                sensor=sensor,
+                p99_abs_torr=float(best_score['p99_abs_torr']),
+                mean_abs_torr=float(best_score['mean_abs_torr']),
+                max_abs_torr=float(best_score['max_abs_torr']),
+                passed=bool(
+                    float(best_score['p99_abs_torr']) <= settings.pass_threshold_torr
+                    and best_p15 <= _15t_gate
+                ),
+                model=dict(best_model),
+                ema_alpha=0.0,
+            )
+            logger.info(
+                '%s/%s %s%s: p99=%.3f Torr 15T-p95=%.3f Torr segs=%s holds=%s (%s)',
+                port_id,
+                sensor,
+                fit_method,
+                lam_tag,
+                interp_fit.p99_abs_torr,
+                best_p15,
+                len(best_model.get('segments', [])),
+                len(mean_samples),
+                'PASS' if interp_fit.passed else 'FAIL',
+            )
+            best = interp_fit
+            if interp_fit.passed:
+                return interp_fit
+        except ValueError as exc:
+            logger.info('%s/%s interpolating fit skipped: %s', port_id, sensor, exc)
 
     strategies = [
         {
@@ -115,7 +256,7 @@ def _fit_sensor_from_samples(
             'holdout_stride': 3,
             'pressure_axis': 'measured',
             'robust_refit_torr': 0.5,
-            'segment_counts': (5, 3),
+            'segment_counts': (7, 5, 3) if sensor == SENSOR_TRANSDUCER else (5, 3),
             'alpha_grid': [0.0, 0.15, 0.2, 0.25, 0.3],
         },
         {
@@ -123,7 +264,7 @@ def _fit_sensor_from_samples(
             'holdout_stride': 5,
             'pressure_axis': 'measured',
             'robust_refit_torr': 0.5,
-            'segment_counts': (5, 3),
+            'segment_counts': (7, 5, 3) if sensor == SENSOR_TRANSDUCER else (5, 3),
             'alpha_grid': [0.0, 0.15, 0.2, 0.25, 0.3],
         },
         {
@@ -144,7 +285,6 @@ def _fit_sensor_from_samples(
         },
     ]
 
-    best: Optional[SensorFitResult] = None
     for index, strategy in enumerate(strategies, start=1):
         try:
             opt = _optimize_for_port_sensor(

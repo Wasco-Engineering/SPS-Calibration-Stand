@@ -18,6 +18,7 @@ from app.services.pressure_calibration import (
     SensorKind,
     apply_error_model,
     filter_samples_pressure_band,
+    fit_interpolating_piecewise_error_model,
     fit_piecewise_linear_error_model,
     fit_quadratic_error_model,
     score_replay,
@@ -63,6 +64,19 @@ def _fit_sensor_model(
     if len(banded) < 8:
         logger.warning('Not enough points in 0–%.1f PSIA band to fit %s model', max_psi, sensor)
         return None
+    if sensor == SENSOR_TRANSDUCER:
+        try:
+            return fit_interpolating_piecewise_error_model(
+                banded,
+                sensor=sensor,
+                reference=reference,
+                pressure_axis='measured',
+                min_knot_spacing_psi=0.01,
+                static_only=True,
+                min_samples_per_knot=1,
+            )
+        except ValueError as exc:
+            logger.info('Interpolating transducer fit unavailable (%s); falling back', exc)
     min_seg = max(3, len(banded) // 12)
     try:
         return fit_piecewise_linear_error_model(

@@ -52,7 +52,7 @@ def test_no_switch_error_enters_inline_decision_without_popup() -> None:
     assert releases == [('port_a', 'no-switch-failure')]
 
 
-def test_no_switch_retry_saves_null_failure_then_relaunches_same_serial() -> None:
+def test_no_switch_retry_persists_null_failure_then_relaunches_same_serial() -> None:
     controller = WorkOrderController.__new__(WorkOrderController)
     sm = _no_switch_sm('QAL16')
     saves: list[dict[str, Any]] = []
@@ -60,18 +60,15 @@ def test_no_switch_retry_saves_null_failure_then_relaunches_same_serial() -> Non
 
     controller._state_machines = {'port_a': sm}
     controller._restore_normal_viz = lambda _port_id: None
-    controller._is_low_pressure_transducer_locked_out = lambda _port_id: False
-    controller._save_result = (
-        lambda port_id, force_pass, allow_null_measurements=False: (
-            saves.append(
-                {
-                    'port_id': port_id,
-                    'force_pass': force_pass,
-                    'allow_null_measurements': allow_null_measurements,
-                }
-            )
-            or 'saved'
-        )
+    controller._capture_save_args = (
+        lambda port_id, force_pass, allow_null_measurements=False: {
+            'port_id': port_id,
+            'force_pass': force_pass,
+            'allow_null_measurements': allow_null_measurements,
+        }
+    )
+    controller._persist_result_async = (
+        lambda port_id, save_args, refresh_progress=True: saves.append(save_args)
     )
     controller._launch_test_executor = lambda port_id: launches.append(port_id)
     controller._start_pressurize_hw = lambda _port_id: None
@@ -90,29 +87,7 @@ def test_no_switch_retry_saves_null_failure_then_relaunches_same_serial() -> Non
     assert launches == ['port_a']
 
 
-def test_no_switch_retry_stays_on_decision_when_null_failure_write_fails() -> None:
-    controller = WorkOrderController.__new__(WorkOrderController)
-    sm = _no_switch_sm('QAL16')
-    launches: list[str] = []
-
-    controller._state_machines = {'port_a': sm}
-    controller._restore_normal_viz = lambda _port_id: None
-    controller._is_low_pressure_transducer_locked_out = lambda _port_id: False
-    controller._save_result = (
-        lambda _port_id, force_pass, allow_null_measurements=False: 'failed'
-    )
-    controller._launch_test_executor = lambda port_id: launches.append(port_id)
-    controller._start_pressurize_hw = lambda _port_id: None
-
-    controller._on_retest('port_a')
-
-    assert sm.current_state == PortState.ERROR.value
-    assert sm.current_substate == PortSubstate.ERROR_NO_SWITCH.value
-    assert sm._attempt_count == 0
-    assert launches == []
-
-
-def test_no_switch_fail_part_saves_null_failure_and_advances_serial() -> None:
+def test_no_switch_fail_part_persists_null_failure_and_advances_serial() -> None:
     controller = WorkOrderController.__new__(WorkOrderController)
     sm = _no_switch_sm('QAL16')
     saves: list[dict[str, Any]] = []
@@ -120,19 +95,17 @@ def test_no_switch_fail_part_saves_null_failure_and_advances_serial() -> None:
 
     controller._state_machines = {'port_a': sm}
     controller._restore_normal_viz = lambda _port_id: None
-    controller._save_result = (
-        lambda port_id, force_pass, allow_null_measurements=False: (
-            saves.append(
-                {
-                    'port_id': port_id,
-                    'force_pass': force_pass,
-                    'allow_null_measurements': allow_null_measurements,
-                }
-            )
-            or 'saved'
-        )
+    controller._capture_save_args = (
+        lambda port_id, force_pass, allow_null_measurements=False: {
+            'port_id': port_id,
+            'force_pass': force_pass,
+            'allow_null_measurements': allow_null_measurements,
+        }
     )
-    controller._advance_serial = lambda port_id: advanced.append(port_id)
+    controller._persist_result_async = (
+        lambda port_id, save_args, refresh_progress=True: saves.append(save_args)
+    )
+    controller._advance_serial = lambda port_id, refresh_progress=True: advanced.append(port_id)
 
     controller._on_record_failure('port_a')
 
@@ -145,22 +118,3 @@ def test_no_switch_fail_part_saves_null_failure_and_advances_serial() -> None:
     ]
     assert sm.current_state == PortState.IDLE.value
     assert advanced == ['port_a']
-
-
-def test_no_switch_fail_part_stays_on_decision_when_null_failure_write_fails() -> None:
-    controller = WorkOrderController.__new__(WorkOrderController)
-    sm = _no_switch_sm('QAL16')
-    advanced: list[str] = []
-
-    controller._state_machines = {'port_a': sm}
-    controller._restore_normal_viz = lambda _port_id: None
-    controller._save_result = (
-        lambda _port_id, force_pass, allow_null_measurements=False: 'failed'
-    )
-    controller._advance_serial = lambda port_id: advanced.append(port_id)
-
-    controller._on_record_failure('port_a')
-
-    assert sm.current_state == PortState.ERROR.value
-    assert sm.current_substate == PortSubstate.ERROR_NO_SWITCH.value
-    assert advanced == []

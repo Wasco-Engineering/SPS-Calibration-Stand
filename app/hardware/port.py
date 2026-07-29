@@ -351,11 +351,36 @@ class Port:
         """Exit EXH/hold and set the Alicat pressure setpoint."""
         combined = getattr(self.alicat, 'resume_and_set_pressure', None)
         if callable(combined):
-            return bool(combined(setpoint))
-        if not self.alicat.cancel_hold():
+            ok = bool(combined(setpoint))
+        elif not self.alicat.cancel_hold():
             logger.warning('%s: Failed to enter Alicat control mode before setpoint', self.port_id.value)
             return False
-        return self.alicat.set_pressure(setpoint)
+        else:
+            ok = bool(self.alicat.set_pressure(setpoint))
+        if not ok:
+            return False
+        # Vent leaves EXH active; a single C+S sometimes ACKs while EXH remains.
+        # Re-assert control so vacuum-route ramps actually move the line.
+        if self._alicat_in_exhaust_mode():
+            logger.warning(
+                '%s: Alicat still EXH after setpoint %.3f — forcing control mode',
+                self.port_id.value,
+                setpoint,
+            )
+            for attempt in range(2):
+                self.alicat.cancel_hold()
+                if not self.alicat.set_pressure(setpoint):
+                    return False
+                time.sleep(0.15)
+                if not self._alicat_in_exhaust_mode():
+                    return True
+                logger.warning(
+                    '%s: Alicat EXH persists after force-exit attempt %s/2',
+                    self.port_id.value,
+                    attempt + 1,
+                )
+            return False
+        return True
     
     def set_ramp_rate(self, rate: float) -> bool:
         """Set the Alicat ramp rate."""
@@ -763,8 +788,34 @@ class Port:
         return False
 
     def prepare_vacuum_route_for_test(self, barometric_psi: float = _ATMOSPHERE_PSI) -> bool:
-        """Vent on atmosphere, then route to vacuum for test cycling (transducer-guarded)."""
-        self.vent_to_atmosphere()
+        """Route to vacuum for test cycling (transducer-guarded).
+
+        Skip the atmosphere vent when already idle so start-up does not pull
+        down and climb back to baro before the first cycle.
+
+        ``vent_to_atmosphere`` leaves Alicat EXH active by design. EXH must be
+        cleared on the atmosphere route *before* engaging vacuum — otherwise the
+        pump evacuates the DUT while setpoints ramp and pressure never tracks.
+        """
+        if not self.is_at_atmospheric_idle(barometric_psi):
+            self.vent_to_atmosphere()
+        # Always leave EXH before the vacuum solenoid. Idle skip above can still
+        # leave a prior EXH session active if status was stale.
+        if self._alicat_in_exhaust_mode():
+            if not self.daq.set_solenoid_safe():
+                logger.warning(
+                    '%s: Failed to engage atmosphere route before exiting Alicat EXH',
+                    self.port_id.value,
+                )
+            else:
+                self.daq.reset_filter()
+            self._exit_alicat_exhaust(barometric_psi)
+            if self._alicat_in_exhaust_mode():
+                logger.error(
+                    '%s: Alicat still in EXH after vacuum-prep exit — control will not track',
+                    self.port_id.value,
+                )
+                return False
         if self._transducer_installed:
             transducer = self.daq.read_transducer()
             if transducer is not None and transducer.pressure is not None:
@@ -861,7 +912,7 @@ class PortManager:
         self._poll_policy_lock = threading.Lock()
         self._alicat_poll_divisors: Dict[PortId, int] = {}
         self._alicat_refresh_countdown: Dict[PortId, int] = {}
-        self._precision_owner: Optional[PortId] = None
+        self._precision_ports: set[PortId] = set()
         self._labjack_sibling_countdown: Dict[PortId, int] = {}
         self._serial_busy_ports: set[PortId] = set()
         self._last_poll_readings: Dict[PortId, PortReading] = {}
@@ -1113,43 +1164,74 @@ class PortManager:
         """
         Apply precision polling profile for Alicat serial and LabJack transducer.
 
-        When a precision port is active:
-        - precision owner: Alicat divisor=precision, LabJack every cycle (no DIO)
-        - sibling port(s): Alicat divisor=normal, LabJack every sibling divisor cycles
+        ``None`` clears all precision ports (normal polling). Passing a port id
+        adds that port to the active precision set so both ports can precision
+        concurrently on the shared Alicat line.
         """
-        precision_id = self._normalize_port_id(precision_port) if precision_port is not None else None
-        with self._poll_policy_lock:
-            self._precision_owner = precision_id
-            for port_id in self.ports.keys():
-                if precision_id is not None and port_id == precision_id:
-                    self._alicat_poll_divisors[port_id] = self._alicat_poll_divisor_precision
-                else:
-                    self._alicat_poll_divisors[port_id] = self._alicat_poll_divisor_normal
-                # Force immediate refresh after profile change.
-                self._alicat_refresh_countdown[port_id] = 0
-                self._labjack_sibling_countdown[port_id] = 0
+        if precision_port is None:
+            self.clear_precision_ports()
+            return
+        precision_id = self._normalize_port_id(precision_port)
         if precision_id is None:
+            return
+        with self._poll_policy_lock:
+            self._precision_ports.add(precision_id)
+            self._apply_precision_divisors_locked()
+        logger.info(
+            'PortManager: Precision ports=%s (alicat precision=%d normal=%d, '
+            'labjack sibling_div=%d, interval_ms=%d)',
+            sorted(p.value for p in self._precision_ports),
+            self._alicat_poll_divisor_precision,
+            self._alicat_poll_divisor_normal,
+            self._labjack_poll_divisor_sibling,
+            self._poll_interval_ms_precision,
+        )
+
+    def clear_precision_ports(self) -> None:
+        """Return both ports to the normal Alicat/LabJack poll profile."""
+        with self._poll_policy_lock:
+            self._precision_ports.clear()
+            self._apply_precision_divisors_locked()
+        logger.info(
+            'PortManager: Poll profile normal (alicat_div=%d, labjack every cycle)',
+            self._alicat_poll_divisor_normal,
+        )
+
+    def remove_precision_port(self, precision_port: PortId | str) -> None:
+        """Drop one port from the precision set; clear profile when none remain."""
+        precision_id = self._normalize_port_id(precision_port)
+        if precision_id is None:
+            return
+        with self._poll_policy_lock:
+            self._precision_ports.discard(precision_id)
+            remaining = sorted(p.value for p in self._precision_ports)
+            self._apply_precision_divisors_locked()
+        if remaining:
+            logger.info('PortManager: Precision ports remaining=%s', remaining)
+        else:
             logger.info(
                 'PortManager: Poll profile normal (alicat_div=%d, labjack every cycle)',
                 self._alicat_poll_divisor_normal,
             )
-        else:
-            logger.info(
-                'PortManager: Precision poll owner=%s (alicat precision=%d normal=%d, '
-                'labjack sibling_div=%d, interval_ms=%d)',
-                precision_id.value,
-                self._alicat_poll_divisor_precision,
-                self._alicat_poll_divisor_normal,
-                self._labjack_poll_divisor_sibling,
-                self._poll_interval_ms_precision,
-            )
+
+    def _apply_precision_divisors_locked(self) -> None:
+        """Update per-port Alicat divisors from ``_precision_ports`` (lock held)."""
+        for port_id in self.ports.keys():
+            if port_id in self._precision_ports:
+                self._alicat_poll_divisors[port_id] = self._alicat_poll_divisor_precision
+            else:
+                self._alicat_poll_divisors[port_id] = self._alicat_poll_divisor_normal
+            self._alicat_refresh_countdown[port_id] = 0
+            self._labjack_sibling_countdown[port_id] = 0
 
     def get_precision_poll_status(self) -> Dict[str, Any]:
         """Return precision polling profile state for UI/diagnostics."""
         with self._poll_policy_lock:
-            owner = self._precision_owner.value if self._precision_owner is not None else None
+            active = sorted(p.value for p in self._precision_ports)
+            owner = active[0] if len(active) == 1 else (','.join(active) if active else None)
             return {
                 'precision_owner': owner,
+                'precision_ports': active,
                 'labjack_poll_divisor_sibling': self._labjack_poll_divisor_sibling,
                 'hardware_poll_interval_ms_precision': self._poll_interval_ms_precision,
             }
@@ -1163,10 +1245,10 @@ class PortManager:
             }
 
     def set_serial_busy(self, port_id: PortId | str, busy: bool) -> None:
-        """Mark a port's Alicat serial as owned by a worker (vent/pressurize/test).
+        """Mark a port as running a worker (vent/pressurize/test).
 
-        Background Alicat refresh skips busy ports so the GUI never contends for
-        the COM lock and stays responsive.
+        Kept for diagnostics/status. Background Alicat polling continues on busy
+        ports so live UI pressure stays fresh; the shared Alicat lock serializes I/O.
         """
         normalized = self._normalize_port_id(port_id)
         if normalized is None:
@@ -1252,9 +1334,6 @@ class PortManager:
             for port_id, port in list(self.ports.items()):
                 if self._alicat_background_stop.is_set():
                     break
-                with self._poll_policy_lock:
-                    if port_id in self._serial_busy_ports:
-                        continue
                 ok = False
                 try:
                     ok = bool(port.refresh_alicat())
@@ -1347,8 +1426,6 @@ class PortManager:
             for port_id, port in self.ports.items():
                 should_refresh = False
                 with self._poll_policy_lock:
-                    if port_id in self._serial_busy_ports:
-                        continue
                     remaining = int(self._alicat_refresh_countdown.get(port_id, 0))
                     if remaining <= 0:
                         should_refresh = True
@@ -1376,16 +1453,13 @@ class PortManager:
     def _poll_reading(self, port_id: PortId, port: Port) -> PortReading:
         """Read one port according to the active precision poll profile."""
         with self._poll_policy_lock:
-            owner = self._precision_owner
+            in_precision = port_id in self._precision_ports
 
-        if owner is None:
-            reading = port.read_fast()
-        elif port_id == owner:
+        if in_precision:
             reading = port.read_precision_fast()
         else:
             # Always read LabJack (transducer + switch); Alicat stays on the
-            # per-port refresh divisor in _poll_loop. Reusing a cached PortReading
-            # here froze the main UI pressure display on the non-precision port.
+            # background cache / per-port refresh divisor.
             reading = port.read_fast()
 
         self._last_poll_readings[port_id] = reading
@@ -1410,7 +1484,7 @@ class PortManager:
         while self._polling:
             start_time = time.perf_counter()
             with self._poll_policy_lock:
-                precision_active = self._precision_owner is not None
+                precision_active = bool(self._precision_ports)
             interval_ms = (
                 self._poll_interval_ms_precision
                 if precision_active
