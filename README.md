@@ -8,7 +8,7 @@ Each port runs independently with its own control + measurement hardware, and op
 
 1. Review **`docs/INITIAL_SETUP.md`** for new PC / stand bring-up
 2. Review documentation in `docs/README.md`
-3. Configure hardware channels in `stinger_config.yaml`
+3. Configure hardware channels in `configs/<hostname>/stinger_config.yaml` (see `configs/README.md`)
 4. Confirm open questions in `docs/OPEN_QUESTIONS.md`
 
 ## Documentation
@@ -31,7 +31,13 @@ All specs live in `docs/`:
 
 ## Configuration
 
-`stinger_config.yaml` contains all hardware, timing, and database configuration.
+Per-computer YAML lives under `configs/<hostname>/` (`stinger_config.yaml` and
+`quality_cal_config.yaml`). Runtime selects the folder from this PC's hostname
+(see `app.core.paths` and `deploy/DEPLOYMENT_REGISTRY.yaml`). Repo-root YAML
+files are deprecated fallbacks only.
+
+Desktop shortcuts target locally built EXEs in the install root (typically
+`C:\Stinger\`). Rebuild on each PC with `.\scripts\deploy_build_and_install.ps1`.
 
 ## Hardware Summary
 
@@ -89,5 +95,6 @@ Set consumers to that folder, or set `latest.txt`/`latest.json` back to the prev
 
 - The build is a onefile EXE, so there is no required `_internal` folder beside it.
 - Onefile EXE startup can be slightly slower because it self-extracts at launch.
-- `stinger_config.yaml` should remain editable next to `SPS Calibration Stand.exe` for machine-specific settings.
+- Machine-specific settings belong in `configs/<hostname>/`, not beside the EXE.
+- EXEs are not tracked in git; build and install locally (or via deploy scripts).
 

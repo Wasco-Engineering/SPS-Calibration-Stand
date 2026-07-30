@@ -25,7 +25,8 @@ wheels/
 .installed.cfg
 *.egg
 
-# PyInstaller
+# PyInstaller / local install artifacts (rebuilt per PC via deploy scripts)
+*.exe
 *.manifest
 *.spec
 !Stinger.spec
@@ -71,6 +72,9 @@ tmp/
 # Local config overrides (machine / stand specific)
 stinger_config.local.yaml
 quality_cal_config.local.yaml
+stinger_config.yaml.pre_*
+quality_cal_config.yaml.pre_*
+backups/
 
 # Per-host runtime logs (YAML configs under configs/ are tracked)
 configs/*/logs/

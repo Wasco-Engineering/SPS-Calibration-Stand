@@ -18,7 +18,9 @@
 
 ## Configuration
 
-- **`../stinger_config.yaml`**: hardware channels, timing, database, logging (authoritative)
+- **`../configs/<hostname>/stinger_config.yaml`**: hardware channels, timing, database, logging (authoritative per PC)
+- **`../configs/<hostname>/quality_cal_config.yaml`**: Mensor / calibration profiles
+- **`../configs/README.md`**: layout and hostname selection
 
 ## Quick reference
 
