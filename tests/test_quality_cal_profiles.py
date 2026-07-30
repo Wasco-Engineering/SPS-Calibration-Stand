@@ -16,7 +16,12 @@ from quality_cal.config import (
     point_timing_for_target,
 )
 
-_REPO_CAL_CONFIG = Path(__file__).resolve().parents[1] / 'quality_cal_config.yaml'
+_REPO_CAL_CONFIG = (
+    Path(__file__).resolve().parents[1]
+    / 'configs'
+    / 'CA-MAN-SPS-01'
+    / 'quality_cal_config.yaml'
+)
 
 
 def _repo_config() -> dict:

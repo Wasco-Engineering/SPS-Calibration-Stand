@@ -20,7 +20,8 @@ param(
     [switch]$SetMachineEnv,
     [switch]$ForceConfig,
     [switch]$DesktopShortcuts,
-    [switch]$SkipZBin
+    [switch]$SkipZBin,
+    [switch]$SkipPtpFixtureVerification
 )
 
 $ErrorActionPreference = 'Stop'
@@ -67,14 +68,14 @@ if ($ForceConfig) { $initArgs['Force'] = $true }
 
 if ($SetMachineEnv) {
     try {
-        & (Join-Path $projectPath 'scripts\deploy_set_machine_env.ps1') -StandId $StandId -ConfigDir $installPath
+        & (Join-Path $projectPath 'scripts\deploy_set_machine_env.ps1') -StandId $StandId
     } catch {
         Write-Warning "Machine env not set (run elevated for all users): $_"
         Write-Warning 'Setting per-user env for the current account instead.'
-        & (Join-Path $projectPath 'scripts\deploy_set_stand_env.ps1') -StandId $StandId -ConfigDir $installPath
+        & (Join-Path $projectPath 'scripts\deploy_set_stand_env.ps1') -StandId $StandId
     }
 } else {
-    & (Join-Path $projectPath 'scripts\deploy_set_stand_env.ps1') -StandId $StandId -ConfigDir $installPath
+    & (Join-Path $projectPath 'scripts\deploy_set_stand_env.ps1') -StandId $StandId
 }
 
 $pythonPath = Join-Path $projectPath '.venv\Scripts\python.exe'
@@ -83,10 +84,16 @@ if (-not (Test-Path $pythonPath)) {
 }
 
 $env:STINGER_STAND_ID = $StandId
-$env:STINGER_CONFIG_DIR = $installPath
+Remove-Item Env:STINGER_CONFIG_DIR -ErrorAction SilentlyContinue
 
 if ($Build) {
     & $pythonPath (Join-Path $projectPath 'scripts\bootstrap_qf87_template.py')
+    if (-not $SkipPtpFixtureVerification) {
+        & $pythonPath (Join-Path $projectPath 'scripts\verify_ptp_fixture_mapping.py') --all-sps --all-top-level
+        if ($LASTEXITCODE -ne 0) {
+            throw 'PTP fixture verification failed. Review logs\ptp_fixture_mapping.csv before building.'
+        }
+    }
     $buildArgs = @{ ProjectRoot = $projectPath }
     if ($InstallPyInstaller) { $buildArgs['InstallPyInstaller'] = $true }
     if ($SkipTests) { $buildArgs['SkipTests'] = $true }

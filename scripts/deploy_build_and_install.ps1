@@ -8,7 +8,8 @@ param(
     [string]$TargetUser = 'CalibrationUser',
     [switch]$SetMachineEnv,
     [switch]$DesktopShortcuts,
-    [switch]$SkipCalibrationUserDesktop
+    [switch]$SkipCalibrationUserDesktop,
+    [switch]$SkipPtpFixtureVerification
 )
 
 $ErrorActionPreference = 'Stop'
@@ -24,6 +25,7 @@ $installArgs = @{
 if ($InstallPyInstaller) { $installArgs['InstallPyInstaller'] = $true }
 if ($SkipTests) { $installArgs['SkipTests'] = $true }
 if ($SetMachineEnv) { $installArgs['SetMachineEnv'] = $true }
+if ($SkipPtpFixtureVerification) { $installArgs['SkipPtpFixtureVerification'] = $true }
 if ($DesktopShortcuts -or -not $SkipCalibrationUserDesktop) {
     $installArgs['DesktopShortcuts'] = $true
 }

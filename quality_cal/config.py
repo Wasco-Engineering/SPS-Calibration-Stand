@@ -5,12 +5,16 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import sys
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 import yaml
+
+from app.core.config import load_config as load_stinger_config
+from app.core.paths import get_logs_dir, get_stinger_config_path
 
 logger = logging.getLogger(__name__)
 
@@ -91,18 +95,62 @@ def get_default_config_path() -> Path:
 
 
 def load_config(config_path: Optional[Path] = None) -> dict[str, Any]:
+    """Load Quality Cal settings over the stand's authoritative hardware config."""
     path = config_path or get_default_config_path()
     if not path.exists():
         raise FileNotFoundError(f"Configuration file not found: {path}")
 
     with open(path, "r", encoding="utf-8") as handle:
-        config = yaml.safe_load(handle)
+        quality_config = yaml.safe_load(handle)
 
-    if not isinstance(config, dict):
+    if not isinstance(quality_config, dict):
         raise ValueError("Configuration root must be a mapping")
 
+    stinger_path = get_stinger_config_path() if config_path is None else path.parent / 'stinger_config.yaml'
+    stinger_config = load_stinger_config(stinger_path)
+    config = dict(quality_config)
+    config["hardware"] = _merge_quality_hardware(
+        stinger_config.get("hardware", {}),
+        quality_config.get("hardware", {}),
+        quality_config.get("quality", {}),
+    )
     validate_config(config)
     return config
+
+
+def _merge_quality_hardware(
+    stinger_hardware: Any,
+    quality_hardware: Any,
+    quality_settings: Any,
+) -> dict[str, Any]:
+    """Use Stinger hardware as the base, permitting Quality Cal-only overlays."""
+    if not isinstance(stinger_hardware, dict):
+        raise ValueError("Stinger hardware configuration must be a mapping")
+    merged = deepcopy(stinger_hardware)
+    if not isinstance(quality_hardware, dict):
+        return merged
+
+    mensor = quality_hardware.get("mensor")
+    if isinstance(mensor, dict):
+        merged["mensor"] = deepcopy(mensor)
+
+    if not isinstance(quality_settings, dict):
+        return merged
+    hardware_overrides = quality_settings.get("hardware_overrides")
+    if hardware_overrides is not None and not isinstance(hardware_overrides, dict):
+        raise ValueError("quality.hardware_overrides must be a mapping")
+    if isinstance(hardware_overrides, dict):
+        _deep_merge(merged, hardware_overrides)
+    return merged
+
+
+def _deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> None:
+    """Recursively apply explicit Quality Cal-only hardware overrides."""
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = deepcopy(value)
 
 
 def validate_config(config: dict[str, Any]) -> None:
@@ -361,7 +409,8 @@ def setup_logging(config: dict[str, Any]) -> None:
     level = getattr(logging, str(log_cfg.get("level", "INFO")).upper(), logging.INFO)
     log_dir = Path(log_cfg.get("log_dir", "logs"))
     if not log_dir.is_absolute():
-        log_dir = get_default_config_path().parent / log_dir
+        log_root = get_logs_dir()
+        log_dir = log_root if log_dir == Path("logs") else log_root / log_dir
     log_dir.mkdir(parents=True, exist_ok=True)
 
     formatter = logging.Formatter(

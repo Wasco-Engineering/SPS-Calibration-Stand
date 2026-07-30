@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from app.core.paths import get_hostname, get_stand_id
+from app.core.paths import get_hostname, get_logs_dir, get_stand_id
 
 logger = logging.getLogger(__name__)
 
@@ -19,9 +19,7 @@ RAW_REFERENCE_DIRNAME = 'raw_reference'
 
 def get_quality_cal_logs_dir() -> Path:
     """Directory where Quality Cal dated sweep CSVs are written."""
-    from quality_cal.config import get_default_config_path
-
-    path = get_default_config_path().parent / 'logs'
+    path = get_logs_dir()
     path.mkdir(parents=True, exist_ok=True)
     return path
 

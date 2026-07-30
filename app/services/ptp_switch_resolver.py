@@ -206,26 +206,28 @@ def resolve_ptp_switch_config(
                 warnings=warnings,
             )
             if fallback is None:
-                fallback = _resolve_single_throw_ptp_fallback(
-                    normalized_port,
-                    common_terminal=common_terminal,
-                    common_dio=common_dio,
-                    no_terminal=no_terminal,
-                    no_dio=no_ptp_dio,
-                    nc_terminal=nc_terminal,
-                    nc_dio=nc_ptp_dio,
-                    sensed_pins=sensed_pins,
-                    warnings=warnings,
-                )
-            if fallback is None:
-                fallback = _resolve_single_throw_adapter_fallback(
-                    normalized_port,
-                    common_terminal=common_terminal,
-                    no_terminal=no_terminal,
-                    nc_terminal=nc_terminal,
-                    sensed_pins=sensed_pins,
-                    warnings=warnings,
-                )
+                spst_read_source = _spst_read_source(port_config, errors)
+                if spst_read_source == 'adapter_common':
+                    fallback = _resolve_single_throw_adapter_fallback(
+                        normalized_port,
+                        common_terminal=common_terminal,
+                        no_terminal=no_terminal,
+                        nc_terminal=nc_terminal,
+                        sensed_pins=sensed_pins,
+                        warnings=warnings,
+                    )
+                elif spst_read_source == 'ptp_throw':
+                    fallback = _resolve_single_throw_ptp_fallback(
+                        normalized_port,
+                        common_terminal=common_terminal,
+                        common_dio=common_dio,
+                        no_terminal=no_terminal,
+                        no_dio=no_ptp_dio,
+                        nc_terminal=nc_terminal,
+                        nc_dio=nc_ptp_dio,
+                        sensed_pins=sensed_pins,
+                        warnings=warnings,
+                    )
             if fallback is not None:
                 (
                     drive_terminal,
@@ -264,6 +266,17 @@ def resolve_ptp_switch_config(
         warnings=tuple(warnings),
         errors=tuple(errors),
     )
+
+
+def _spst_read_source(port_config: dict[str, Any], errors: list[str]) -> str:
+    """Return the bench-approved SPST read topology for an ambiguous fixture."""
+    source = str(port_config.get('switch_spst_read_source', 'ptp_throw')).strip().lower()
+    if source in {'ptp_throw', 'adapter_common'}:
+        return source
+    errors.append(
+        'switch_spst_read_source must be "ptp_throw" or "adapter_common"'
+    )
+    return source
 
 
 def _resolve_single_throw_ptp_fallback(

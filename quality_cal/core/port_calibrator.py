@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 
 import yaml
 
-from app.core.config import is_transducer_installed, load_config
+from app.core.config import is_transducer_installed, load_config, save_config
 from app.services.pressure_calibration import (
     REFERENCE_MENSOR,
     SENSOR_ALICAT,
@@ -22,7 +22,7 @@ from app.services.pressure_calibration import (
     score_replay,
     summarize_static_hold_means,
 )
-from quality_cal.config import QualitySettings, get_default_config_path
+from quality_cal.config import QualitySettings
 from quality_cal.core.calibration_export import (
     merge_hardware_into_stinger_config,
     point_passes_after_correction,
@@ -466,17 +466,14 @@ def apply_port_models_to_stinger_config(
     *,
     require_passed: bool = True,
 ) -> Path:
-    """Merge fitted models for one port into stinger_config.yaml."""
+    """Merge fitted models into a validated stand stinger_config.yaml."""
     path = stinger_path or get_stinger_config_path()
     snippet = build_port_config_snippet(port_id, fit, require_passed=require_passed)
-    if path.exists():
-        stinger = yaml.safe_load(path.read_text(encoding='utf-8'))
-        if not isinstance(stinger, dict):
-            raise ValueError(f'Invalid stinger config: {path}')
-        merged = merge_hardware_into_stinger_config(stinger, snippet)
-    else:
-        merged = snippet
-    path.write_text(yaml.safe_dump(merged, sort_keys=False), encoding='utf-8')
+    if not path.exists():
+        raise FileNotFoundError(f'Stinger configuration not found: {path}')
+    stinger = load_config(path)
+    merged = merge_hardware_into_stinger_config(stinger, snippet)
+    save_config(merged, path)
     logger.info('Wrote calibration models for %s to %s', port_id, path)
     return path
 

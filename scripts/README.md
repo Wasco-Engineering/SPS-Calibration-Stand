@@ -15,6 +15,7 @@ The scripts folder contains diagnostics and calibration helpers.
 - `python scripts/suite.py` - Multi-step pressure validation suites (static, resolution, ramps, filtering, plotting)
 - `python scripts/calibrate.py` - Calibration workflow (collect correlation data and/or analyze CSVs)
 - `python scripts/certify_ptp_applications.py --all-sps --output logs/application_certification_all_sps.csv` - Software-certify all SPS PTP applications
+- `python scripts/verify_ptp_fixture_mapping.py --all-sps --all-top-level` - Required live pre-release check that resolves both fixture ports for all supported SPS and 17xxx final-test PTP records
 
 **Specialized Diagnostics:**
 - `python scripts/edge_replay.py <csv>` - Deterministic edge-detector replay diagnostics
@@ -35,6 +36,7 @@ The scripts folder contains diagnostics and calibration helpers.
 
 - `dio_switch_diagnostic.py` - Specialized DIO switch diagnostic (bypasses application layer)
 - `certify_ptp_applications.py` - Validate PTP completeness, switch resolution, pressure display, and cycle targets
+- `verify_ptp_fixture_mapping.py` - Live PTP-to-fixture mapping gate; reports resolvable wiring but does not replace a hardware switch-transition check
 - `generate_application_verification_matrix.py` - Generate the PTP application verification matrix
 - `hardware_test.py` - General hardware test (LabJack, Alicat)
 - `db_ptp_smoke_test.py` - Database/PTP smoke test helper

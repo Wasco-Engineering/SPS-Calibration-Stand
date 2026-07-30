@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
+from app.core.config import load_config as load_stinger_config, save_config
 from app.services.pressure_calibration import (
     ONE_TORR_PSI,
     REFERENCE_MENSOR,
@@ -163,10 +164,6 @@ def merge_hardware_into_stinger_config(
             ali[port_key] = port_cfg
     hw['alicat'] = ali
 
-    measurement = dict(hw.get('measurement', {}))
-    measurement['transducer_only_below_psi'] = 20.0
-    hw['measurement'] = measurement
-
     merged['hardware'] = hw
     return merged
 
@@ -184,11 +181,10 @@ def export_recommended_calibration_yaml(
     output_path.write_text(yaml.safe_dump(snippet, sort_keys=False), encoding='utf-8')
 
     if merge_stinger_path is not None and merge_stinger_path.exists():
-        stinger = yaml.safe_load(merge_stinger_path.read_text(encoding='utf-8'))
-        if isinstance(stinger, dict):
-            merged = merge_hardware_into_stinger_config(stinger, snippet)
-            merge_stinger_path.write_text(yaml.safe_dump(merged, sort_keys=False), encoding='utf-8')
-            logger.info('Merged calibration into %s', merge_stinger_path)
+        stinger = load_stinger_config(merge_stinger_path)
+        merged = merge_hardware_into_stinger_config(stinger, snippet)
+        save_config(merged, merge_stinger_path)
+        logger.info('Merged calibration into %s', merge_stinger_path)
 
     return output_path
 

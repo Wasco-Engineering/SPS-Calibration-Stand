@@ -84,7 +84,7 @@ def test_merge_hardware_into_stinger_config(tmp_path: Path) -> None:
         }
     }
     merged = merge_hardware_into_stinger_config(stinger, snippet)
-    assert merged['hardware']['measurement']['transducer_only_below_psi'] == 20.0
+    assert merged['hardware']['measurement']['transducer_only_below_psi'] == 10.0
     assert 'transducer_error_model' in merged['hardware']['labjack']['port_b']
 
     out = tmp_path / 'stinger.yaml'
