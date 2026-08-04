@@ -20,6 +20,7 @@ from app.services.measurement_source import (
     select_main_pressure_abs_psi,
 )
 from app.services.pressure_domain import (
+    is_plausible_barometric_psi,
     resolve_alicat_setpoint_reference_for_test,
     to_absolute_pressure,
     to_alicat_setpoint_psi,
@@ -34,6 +35,9 @@ from app.services.sweep_primitives import (
     observe_spdt_transition,
 )
 from app.services.sweep_utils import (
+    absolute_vacuum_near_target_tolerance_psi,
+    absolute_vacuum_reachable_floor_psi,
+    clamp_absolute_vacuum_low_target_psi,
     resolve_cycle_ramp_targets,
     resolve_sweep_bounds,
     resolve_sweep_mode,
@@ -86,6 +90,16 @@ class CyclePhaseRunner:
                     min_psi - self._ctx._precision_prepass_nudge_psi,
                     self._ctx._resolve_hardware_limits_test_reference()[0],
                 )
+                pressure_ref = (
+                    (self._ctx._test_setup.pressure_reference or '').strip().lower()
+                    if self._ctx._test_setup
+                    else ''
+                )
+                if pressure_ref == 'absolute':
+                    pre_approach_target = clamp_absolute_vacuum_low_target_psi(
+                        pre_approach_target,
+                        min_psi,
+                    )
                 pre_approach_abs = self._ctx._to_absolute(pre_approach_target)
             elif self._ctx._ptp_limits_use_psia_scale():
                 # Decreasing vacuum switches are exercised by pulling down
@@ -159,18 +173,38 @@ class CyclePhaseRunner:
         # Wait until close to the pre-approach target (generous tolerance)
         if sweep_mode == 'vacuum':
             tolerance = max(1.5, (max_psi - min_psi) * 0.15)
-            timeout_cap_s = 3.0 if not decreasing_vacuum else 8.0
+            # Deep absolute vacuum (baro -> ~0) needs more than a short 3s cap.
+            timeout_cap_s = 12.0 if not decreasing_vacuum else 8.0
+            pressure_ref = (
+                (self._ctx._test_setup.pressure_reference or '').strip().lower()
+                if self._ctx._test_setup
+                else ''
+            )
+            timeout_floor_s = 12.0 if pressure_ref == 'absolute' and not decreasing_vacuum else 0.5
         else:
             tolerance = max(0.15, min(0.35, (max_psi - min_psi) * 0.08))
             timeout_cap_s = self._ctx._edge_timeout_s
+            # Pressure mode stages to atmosphere first, then climbs; travel-based
+            # timeouts alone were ~0.7s and aborted before reaching the high
+            # reset side for decreasing mmHg parts (SPS01804-02).
+            timeout_floor_s = 3.0
         current_pressure, _switch_state = self._ctx._read_pressure_and_switch_state()
         if current_pressure is not None and math.isfinite(current_pressure):
             travel_psi = abs(current_pressure - pre_approach_target)
         else:
             travel_psi = abs(self._ctx._absolute_to_test_reference(baro_psi) - pre_approach_target)
-        pre_approach_timeout_s = min(
-            self._ctx._edge_timeout_s,
-            max(0.5, min(timeout_cap_s, travel_psi / max(pre_approach_rate, 0.1) + 0.5)),
+        calculated_timeout_s = max(
+            timeout_floor_s,
+            min(timeout_cap_s, travel_psi / max(pre_approach_rate, 0.1) + 0.5),
+        )
+        # A deep-vacuum pull routinely takes longer than the switch-edge
+        # timeout.  Starting the cycle from a partly evacuated line captures
+        # the preparatory transition as an edge, so honour the vacuum-specific
+        # cap instead of truncating it to the normal edge wait.
+        pre_approach_timeout_s = (
+            calculated_timeout_s
+            if sweep_mode == 'vacuum'
+            else min(self._ctx._edge_timeout_s, calculated_timeout_s)
         )
 
         if not self._ctx._wait_until_near_target(
@@ -338,16 +372,15 @@ class CyclePhaseRunner:
         edge_pressure, _edge_switch = self._ctx._read_pressure_and_switch_state()
         freeze_psi = edge_sample if edge_sample is not None else edge_pressure
         if freeze_psi is not None and math.isfinite(freeze_psi):
-            if not self._ctx._port.alicat.set_ramp_rate(0.0):
+            # Hold the valve — do not zero ramp rate (causes stick/creep on PCD).
+            if not self._ctx._port.alicat.hold_valve(closed=False):
                 logger.warning(
-                    '%s: Failed to zero ramp rate for activation freeze; continuing',
+                    '%s: Failed to hold valve at activation edge; continuing',
                     self._ctx._port_id,
                 )
             else:
-                self._ctx._set_pressure_or_raise(self._ctx._to_absolute(freeze_psi))
-                self._ctx._port.alicat.cancel_hold()
                 logger.info(
-                    '%s: Frozen at activation edge %.4f PSI before deactivation climb',
+                    '%s: Held valve at activation edge %.4f PSI before deactivation climb',
                     self._ctx._port_id,
                     freeze_psi,
                 )
@@ -459,6 +492,13 @@ class CyclePhaseRunner:
         Edge names are normalized later by PTP activation direction.
         """
         low_target = max(hw_min_psi, min_psi - overshoot)
+        pressure_ref = (
+            (self._ctx._test_setup.pressure_reference or '').strip().lower()
+            if self._ctx._test_setup
+            else ''
+        )
+        if pressure_ref == 'absolute':
+            low_target = clamp_absolute_vacuum_low_target_psi(low_target, min_psi)
         high_target = min(hw_max_psi, max_psi + overshoot)
         logger.info(
             '%s: NC-derived vacuum cycle traverse low=%.4f high=%.4f PSI',
@@ -1197,6 +1237,8 @@ class TestExecutor:
         self._cycle_waiting_edge: Optional[str] = None
         self._cycle_prep_confirmed: bool = True
         self._run_atmosphere_psi: Optional[float] = None
+        self._locked_baro_psi: Optional[float] = None
+        self._gauge_zero_raw_psi: Optional[float] = None
         self._alicat_setpoint_ref: Optional[str] = None
         self._last_pressure_source_used: Optional[str] = None
         self._last_precision_missing_edge: Optional[str] = None
@@ -1305,13 +1347,162 @@ class TestExecutor:
     # Internal: main loop
     # ------------------------------------------------------------------
 
+    def _try_mensor_barometric_psia(self) -> Optional[float]:
+        """Optional true-atmosphere reference when Mensor is on the stand."""
+        try:
+            from pathlib import Path
+
+            import yaml
+
+            from quality_cal.core.mensor_reader import MensorReader
+        except Exception:
+            return None
+
+        candidates = [
+            Path('configs') / 'CA-MAN-SPS-02' / 'quality_cal_config.yaml',
+            Path('quality_cal_config.yaml'),
+        ]
+        mensor_cfg: Optional[dict[str, Any]] = None
+        for path in candidates:
+            try:
+                if path.is_file():
+                    loaded = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+                    cfg = (loaded.get('hardware') or {}).get('mensor')
+                    if isinstance(cfg, dict):
+                        mensor_cfg = cfg
+                        break
+            except Exception:
+                continue
+        if not isinstance(mensor_cfg, dict) or not mensor_cfg.get('port'):
+            return None
+
+        reader = None
+        try:
+            reader = MensorReader(mensor_cfg)
+            if not reader.connect():
+                return None
+            samples: list[float] = []
+            for _ in range(8):
+                reading = reader.read_pressure()
+                samples.append(float(reading.pressure_psia))
+                time.sleep(0.05)
+            if not samples:
+                return None
+            samples.sort()
+            median = samples[len(samples) // 2]
+            if not is_plausible_barometric_psi(median):
+                return None
+            logger.info(
+                '%s: Mensor atmosphere reference %.4f PSIA (%.1f Torr)',
+                self._port_id,
+                median,
+                median * 51.7149325716,
+            )
+            return float(median)
+        except Exception as exc:
+            logger.info('%s: Mensor baro unavailable (%s)', self._port_id, exc)
+            return None
+        finally:
+            if reader is not None:
+                try:
+                    reader.disconnect()
+                except Exception:
+                    pass
+
+    def _lock_run_barometric_via_exhaust(self) -> Optional[float]:
+        """Lock gauge-zero (P0) for the run from the boot session sample.
+
+        PCD-115PSIA has no internal barometer. Gauge = process_raw − P0_raw.
+        Atmosphere is captured once at stand boot (EXH idle). Never re-EXH here
+        after QAL15 pressurize — that dumps the line and looks like pressure jumps.
+        """
+        mensor = self._try_mensor_barometric_psia()
+        session_p0 = Port.get_session_gauge_zero_psia()
+        callback_p0: Optional[float] = None
+        try:
+            callback_p0 = float(self._get_barometric_psi(self._port_id))
+        except Exception:
+            callback_p0 = None
+
+        measured: Optional[float] = None
+        source = 'none'
+        if session_p0 is not None and is_plausible_barometric_psi(session_p0):
+            measured = float(session_p0)
+            source = 'boot session'
+        elif callback_p0 is not None and is_plausible_barometric_psi(callback_p0):
+            measured = float(callback_p0)
+            source = 'controller baro'
+        elif mensor is not None and is_plausible_barometric_psi(mensor):
+            measured = float(mensor)
+            source = 'Mensor'
+
+        if measured is not None:
+            self._gauge_zero_raw_psi = float(measured)
+            if mensor is not None and source != 'Mensor':
+                delta_mmhg = (float(measured) - float(mensor)) * 51.7149325716
+                logger.info(
+                    '%s: Using %s gauge-zero P0=%.4f PSIA; '
+                    'Mensor=%.4f PSIA (delta=%+.2f mmHg) — no EXH re-sample',
+                    self._port_id,
+                    source,
+                    measured,
+                    mensor,
+                    delta_mmhg,
+                )
+            else:
+                logger.info(
+                    '%s: Using %s gauge-zero P0=%.4f PSIA (%.1f Torr) — no EXH re-sample',
+                    self._port_id,
+                    source,
+                    measured,
+                    measured * 51.7149325716,
+                )
+            return float(measured)
+
+        # Headless / no boot path only: sample once and lock for the process.
+        sample = getattr(self._port, '_sample_barometric_via_exhaust', None)
+        alicat_p0: Optional[float] = None
+        if callable(sample):
+            try:
+                alicat_p0 = sample(timeout_s=6.0)
+            except Exception as exc:
+                logger.warning(
+                    '%s: EXH gauge-zero sample failed: %s',
+                    self._port_id,
+                    exc,
+                )
+        measured = alicat_p0 if alicat_p0 is not None else mensor
+        if measured is not None and is_plausible_barometric_psi(measured):
+            Port.set_session_gauge_zero_psia(float(measured))
+            self._gauge_zero_raw_psi = float(measured)
+            logger.info(
+                '%s: Captured first gauge-zero P0=%.4f PSIA via EXH (no prior boot lock)',
+                self._port_id,
+                measured,
+            )
+            return float(measured)
+        logger.warning(
+            '%s: Gauge-zero unavailable (session=%s callback=%s mensor=%s); using live inference',
+            self._port_id,
+            session_p0,
+            callback_p0,
+            mensor,
+        )
+        return None
+
     def _run(self) -> None:
         """Main test execution sequence (runs in background thread)."""
+        original_get_baro = self._get_barometric_psi
         try:
             self._emit_event('run_started')
             self._ensure_alicat_units()
             self._lock_alicat_setpoint_reference()
             self._run_atmosphere_psi = None
+            self._gauge_zero_raw_psi = None
+            self._locked_baro_psi = self._lock_run_barometric_via_exhaust()
+            if self._locked_baro_psi is not None:
+                locked = float(self._locked_baro_psi)
+                self._get_barometric_psi = lambda _port_id, _locked=locked: _locked
             pressure_ref = (
                 str(self._test_setup.pressure_reference).strip().lower()
                 if self._test_setup and self._test_setup.pressure_reference
@@ -1326,7 +1517,7 @@ class TestExecutor:
             baro_psi = self._get_barometric_psi(self._port_id)
             logger.info(
                 '%s: Sweep config mode=%s ref=%s bounds=%.4f..%.4f psi '
-                'test_atm=%.4f baro=%.4f psi vacuum_no_open=%s',
+                'test_atm=%.4f P0=%.4f psi gauge_zero_raw=%s vacuum_no_open=%s',
                 self._port_id,
                 sweep_mode,
                 pressure_ref,
@@ -1334,6 +1525,11 @@ class TestExecutor:
                 bounds[1],
                 self._run_atmosphere_psi,
                 baro_psi,
+                (
+                    f'{self._gauge_zero_raw_psi:.4f}'
+                    if self._gauge_zero_raw_psi is not None
+                    else 'none'
+                ),
                 self._vacuum_switch_trips_on_no_open(),
             )
 
@@ -1415,7 +1611,10 @@ class TestExecutor:
                 TestFailure(TestFailureCode.INTERNAL_ERROR, str(exc)),
             )
         finally:
+            self._get_barometric_psi = original_get_baro
             self._run_atmosphere_psi = None
+            self._locked_baro_psi = None
+            self._gauge_zero_raw_psi = None
 
     # ------------------------------------------------------------------
     # Cycling
@@ -1675,12 +1874,17 @@ class TestExecutor:
                 reached_target = False
                 if direction > 0 and pressure_test >= target_test:
                     reached_target = True
-                elif direction < 0 and pressure_test <= target_test:
-                    if self._cycle_ramp_past_target_plausible(
-                        edge_type, pressure_test, target_test
-                    ):
-                        reached_target = True
-                
+                elif direction < 0:
+                    descend_tol = 0.0
+                    floor = absolute_vacuum_reachable_floor_psi()
+                    if target_test <= floor + absolute_vacuum_near_target_tolerance_psi():
+                        descend_tol = absolute_vacuum_near_target_tolerance_psi()
+                    if pressure_test <= target_test + descend_tol:
+                        if self._cycle_ramp_past_target_plausible(
+                            edge_type, pressure_test, target_test
+                        ):
+                            reached_target = True
+
                 if reached_target and not target_reached:
                     target_reached = True
                     target_reached_at = time.perf_counter()
@@ -2258,28 +2462,27 @@ class TestExecutor:
             overshoot=overshoot,
         )
 
-        # Skip prep if pressure is already at/past the band boundary on the prep
-        # side — the upcoming ramp will naturally cross the edge regardless of
-        # the current switch reading.  No margin here: mid-band should not skip,
-        # especially for narrow near-atmosphere bands.
+        # Skip prep if pressure is already on the prep side.
+        # High-side prep (decreasing activation): require near prep_target — merely
+        # crossing max_psi skipped the climb for SPS01804-02 (~0.67 vs ~0.97 PSI).
+        # Low-side prep: at/below the band edge is enough (legacy deactivation path).
         already_on_prep_side = (
             pressure is not None
             and math.isfinite(pressure)
             and (
-                (prep_target >= max_psi and pressure >= max_psi)
+                (prep_target >= max_psi and pressure >= prep_target - margin_psi)
                 or (prep_target <= min_psi and pressure <= min_psi)
             )
         )
-        if switch_state == prep_state or already_on_prep_side:
+        if already_on_prep_side:
             self._seed_debounce_from_live_reading()
             logger.info(
-                '%s: Cycle prep skipped for %s leg; switch=%s pressure=%s PSI%s '
-                '(target %.4f PSI)',
+                '%s: Cycle prep skipped for %s leg; switch=%s pressure=%s PSI '
+                'already on prep side (target %.4f PSI)',
                 self._port_id,
                 edge_type,
                 'activated' if switch_state else 'deactivated',
                 f'{pressure:.4f}' if pressure is not None else '--',
-                ' already on prep side' if already_on_prep_side else '',
                 prep_target,
             )
             self._cycle_prep_confirmed = True
@@ -3132,6 +3335,9 @@ class TestExecutor:
                     pad,
                     out_of_bounds_note,
                 )
+                approach_target, target_out, target_back = self._clamp_gauge_atm_floor(
+                    approach_target, target_out, target_back
+                )
                 return (approach_target, target_out, target_back, 'cycle-estimate-offset-close-limit')
             logger.warning(
                 '%s: Rejecting cycle-estimate precision targets: %s '
@@ -3384,6 +3590,12 @@ class TestExecutor:
             and self._vacuum_switch_trips_on_no_open()
         ):
             return True
+        if self._resolve_sweep_mode() == 'vacuum' and self._vacuum_switch_trips_on_no_open():
+            # An increasing absolute-vacuum cycle starts deep, where its
+            # preparatory NO-open transition is expected.  That transition is
+            # not activation; activation is the later, configured False state
+            # while pressure climbs through the PTP band.
+            return False
         return self._uses_single_sense_switch_derivation()
 
     def _vacuum_switch_trips_on_no_open(self) -> bool:
@@ -3742,7 +3954,27 @@ class TestExecutor:
         return bool(port_cfg.get('transducer_installed', True))
 
     def _reading_pressure_abs_psi(self, reading: PortReading) -> Optional[float]:
-        """Pressure for ramp, wait, and edge control using the main source policy."""
+        """Pressure for ramp, wait, and edge control using the main source policy.
+
+        When a gauge-zero lock is active, prefer Alicat **raw** absolute so gauge
+        = raw − P0_raw stays on one sensor scale (PCD has no internal barometer).
+        """
+        if self._gauge_zero_raw_psi is not None and reading.alicat is not None:
+            if reading.alicat.pressure_raw is not None:
+                pressure_abs = float(reading.alicat.pressure_raw)
+                source_used = 'alicat_raw'
+            elif reading.alicat.pressure is not None:
+                pressure_abs = float(reading.alicat.pressure)
+                source_used = 'alicat'
+            else:
+                pressure_abs = None
+                source_used = 'none'
+            if pressure_abs is not None:
+                if source_used != self._last_pressure_source_used:
+                    logger.info('%s: Test pressure source -> %s', self._port_id, source_used)
+                    self._last_pressure_source_used = source_used
+                return pressure_abs
+
         barometric_psi = self._get_barometric_psi(self._port_id)
         if not self._transducer_installed():
             from app.services.measurement_source import _alicat_pressure_abs_psi
@@ -3772,7 +4004,12 @@ class TestExecutor:
             return pressure_abs_psi
         pressure_ref = self._test_setup.pressure_reference if self._test_setup else None
         if str(pressure_ref or '').strip().lower() == 'gauge':
-            return pressure_abs_psi - self._get_barometric_psi(self._port_id)
+            zero = (
+                self._gauge_zero_raw_psi
+                if self._gauge_zero_raw_psi is not None
+                else self._get_barometric_psi(self._port_id)
+            )
+            return pressure_abs_psi - float(zero)
         return pressure_abs_psi
 
     def _reading_pressure_test_psi(self, reading: PortReading) -> Optional[float]:
@@ -3781,6 +4018,32 @@ class TestExecutor:
             return None
         return self._absolute_to_test_reference(pressure_abs)
 
+    def _clamp_gauge_atm_floor(
+        self,
+        approach_target: float,
+        target_out: float,
+        target_back: float,
+    ) -> tuple[float, float, float]:
+        """Keep open-fitting gauge sweeps from commanding below atmosphere."""
+        pressure_ref = (
+            str(self._test_setup.pressure_reference).strip().lower()
+            if self._test_setup and self._test_setup.pressure_reference
+            else ''
+        )
+        if pressure_ref != 'gauge' or self._resolve_sweep_mode() != 'pressure':
+            return approach_target, target_out, target_back
+        # Slightly below zero still looks like noise; deeper pulls fight the open line.
+        floor = -0.01
+        clamped_out = max(float(target_out), floor)
+        if clamped_out != float(target_out):
+            logger.info(
+                '%s: Clamped precision out target %.4f -> %.4f PSI (atm floor)',
+                self._port_id,
+                target_out,
+                clamped_out,
+            )
+        return float(approach_target), clamped_out, float(target_back)
+
     def _resolve_hardware_limits_test_reference(self) -> tuple[float, float]:
         labjack_cfg = self._config.get('hardware', {}).get('labjack', {})
         port_cfg = labjack_cfg.get(self._port_id, {})
@@ -3788,6 +4051,14 @@ class TestExecutor:
         max_abs = float(port_cfg.get('transducer_pressure_max', 115.0))
         min_ref = self._absolute_to_test_reference(min_abs)
         max_ref = self._absolute_to_test_reference(max_abs)
+        pressure_ref = (
+            (self._test_setup.pressure_reference or '').strip().lower()
+            if self._test_setup
+            else ''
+        )
+        # Absolute vacuum cannot command true 0.0000 PSIA on this stand.
+        if pressure_ref == 'absolute' and min_abs <= 0.0:
+            min_ref = max(min_ref, absolute_vacuum_reachable_floor_psi())
         if min_ref <= max_ref:
             return (min_ref, max_ref)
         return (max_ref, min_ref)

@@ -249,14 +249,48 @@ def test_barometric_plausibility_guard() -> None:
     assert not is_plausible_barometric_psi(0.2635)
 
 
+def test_infer_barometric_ignores_pressurized_hld() -> None:
+    """Pressurized hold must not be treated as local weather (gauge mmHg bias)."""
+    reading = AlicatReading(
+        pressure=14.86,
+        setpoint=14.90,
+        timestamp=0.0,
+        raw_response='A +014.86 +014.90 HLD',
+    )
+    assert infer_barometric_pressure_from_alicat(reading) is None
+
+
+def test_resolve_barometric_rejects_small_process_creep() -> None:
+    reading = build_port_reading(
+        alicat_pressure=14.86,
+        alicat_setpoint=14.90,
+    )
+    assert reading.alicat is not None
+    reading.alicat.barometric_pressure = None
+    reading.alicat.raw_response = 'A +014.86 +014.90 HLD'
+
+    assert resolve_barometric_psi(reading, last_value=14.60) == pytest.approx(14.60)
+
+
+def test_infer_barometric_from_gauge_hold_near_zero_setpoint() -> None:
+    reading = AlicatReading(
+        pressure=14.60,
+        setpoint=0.0,
+        timestamp=0.0,
+        raw_response='A +014.60 +000.00 HLD',
+    )
+    assert infer_barometric_pressure_from_alicat(reading) == pytest.approx(14.60, rel=1e-6)
+
+
 def test_infer_barometric_from_short_exh_status_packet() -> None:
+    """EXH process pressure must not become weather (bleed-down is elevated)."""
     reading = AlicatReading(
         pressure=13.51,
         setpoint=0.0,
         timestamp=0.0,
         raw_response='B +013.51 +000.00 EXH',
     )
-    assert infer_barometric_pressure_from_alicat(reading) == pytest.approx(13.51, rel=1e-6)
+    assert infer_barometric_pressure_from_alicat(reading) is None
 
 
 def test_infer_barometric_from_exh_status_with_stale_setpoint() -> None:
@@ -266,7 +300,17 @@ def test_infer_barometric_from_exh_status_with_stale_setpoint() -> None:
         timestamp=0.0,
         raw_response='B +013.51 +008.00 EXH',
     )
-    assert infer_barometric_pressure_from_alicat(reading) == pytest.approx(13.51, rel=1e-6)
+    assert infer_barometric_pressure_from_alicat(reading) is None
+
+
+def test_infer_barometric_ignores_elevated_exh_bleed() -> None:
+    reading = AlicatReading(
+        pressure=15.22,
+        setpoint=15.0,
+        timestamp=0.0,
+        raw_response='A +015.22 +015.00 EXH',
+    )
+    assert infer_barometric_pressure_from_alicat(reading) is None
 
 
 def test_resolve_barometric_holds_last_value_during_short_exh_status() -> None:
@@ -497,6 +541,19 @@ def test_pressurize_reach_check_accepts_mmhg_gauge_target_tolerance() -> None:
         target_gauge,
         direction=1,
         tolerance_psi=tolerance,
+    )
+
+
+def test_qal15_pressurize_requires_a_new_switch_transition() -> None:
+    assert not WorkOrderController._qal15_switch_transition_reached(
+        initial_switch_state=True,
+        current_switch_state=True,
+        target_switch_state=True,
+    )
+    assert WorkOrderController._qal15_switch_transition_reached(
+        initial_switch_state=False,
+        current_switch_state=True,
+        target_switch_state=True,
     )
 
 

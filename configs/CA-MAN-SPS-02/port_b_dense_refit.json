@@ -1,0 +1,112 @@
+{
+  "type": "piecewise_linear",
+  "segments": [
+    {
+      "max_psi": 0.155225,
+      "slope_error_per_psi": -0.890517636280349,
+      "intercept_error_psi": 0.19319310009161716
+    },
+    {
+      "max_psi": 0.18745,
+      "slope_error_per_psi": 0.8902249806051203,
+      "intercept_error_psi": -0.08322267261442981
+    },
+    {
+      "max_psi": 0.3072,
+      "slope_error_per_psi": -0.1091858037578291,
+      "intercept_error_psi": 0.10411687891440508
+    },
+    {
+      "max_psi": 0.3365375,
+      "slope_error_per_psi": 0.5087345547507451,
+      "intercept_error_psi": -0.08570825521942893
+    },
+    {
+      "max_psi": 0.3498,
+      "slope_error_per_psi": -2.2497643732327948,
+      "intercept_error_psi": 0.8426300777568316
+    },
+    {
+      "max_psi": 0.367775,
+      "slope_error_per_psi": 1.360917941585534,
+      "intercept_error_psi": -0.42038659596661976
+    },
+    {
+      "max_psi": 0.4982125,
+      "slope_error_per_psi": 0.10215620507906067,
+      "intercept_error_psi": 0.04255450167704846
+    },
+    {
+      "max_psi": 0.66025,
+      "slope_error_per_psi": -0.07282264907814535,
+      "intercept_error_psi": 0.12973115405384547
+    },
+    {
+      "max_psi": 0.8767375,
+      "slope_error_per_psi": -0.16097927132051532,
+      "intercept_error_psi": 0.18793656388937025
+    },
+    {
+      "max_psi": 1.1501875,
+      "slope_error_per_psi": 0.10916072408118463,
+      "intercept_error_psi": -0.048905300329127654
+    },
+    {
+      "max_psi": 1.5470625,
+      "slope_error_per_psi": -0.0775748031496062,
+      "intercept_error_psi": 0.16587556889763755
+    },
+    {
+      "max_psi": 2.0523375,
+      "slope_error_per_psi": 0.050492306169908,
+      "intercept_error_psi": -0.03225225341398337
+    },
+    {
+      "max_psi": 3.0883875,
+      "slope_error_per_psi": 0.014200569470585307,
+      "intercept_error_psi": 0.042230638754162816
+    },
+    {
+      "max_psi": 5.0760625,
+      "slope_error_per_psi": -0.00799929565950158,
+      "intercept_error_psi": 0.11079242472360903
+    },
+    {
+      "max_psi": 7.8691375,
+      "slope_error_per_psi": -0.060560493363049736,
+      "intercept_error_psi": 0.37759634934167596
+    },
+    {
+      "max_psi": 9.914275,
+      "slope_error_per_psi": 0.0020292034154183267,
+      "intercept_error_psi": -0.11493058069139628
+    },
+    {
+      "max_psi": 14.8058625,
+      "slope_error_per_psi": -0.02216816115422669,
+      "intercept_error_psi": 0.12496874592732107
+    },
+    {
+      "max_psi": 19.7936,
+      "slope_error_per_psi": 0.0016916487686056015,
+      "intercept_error_psi": -0.22829631906626946
+    },
+    {
+      "max_psi": 24.814875,
+      "slope_error_per_psi": 0.00243713001179933,
+      "intercept_error_psi": -0.24305207660154884
+    },
+    {
+      "max_psi": 29.863574999999997,
+      "slope_error_per_psi": 0.013882286529204771,
+      "intercept_error_psi": -0.5270622049364002
+    },
+    {
+      "max_psi": null,
+      "slope_error_per_psi": 0.013882286529204771,
+      "intercept_error_psi": -0.5270622049364002
+    }
+  ],
+  "pressure_axis": "measured",
+  "fit_method": "interpolating_knots"
+}

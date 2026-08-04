@@ -88,16 +88,6 @@ $manifest = [ordered]@{
 
 $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path $manifestPath -Encoding UTF8
 
-# Publish EXE only to Z:\bin (do not MIR repo docs on Z: root)
-$releaseRoot = 'Z:\Engineering\Program Builds\Python Builds\Stinger'
-$binPath = Join-Path $releaseRoot 'bin'
-if (Test-Path (Split-Path $releaseRoot -Parent)) {
-    New-Item -ItemType Directory -Path $binPath -Force | Out-Null
-    Copy-Item $exePath (Join-Path $binPath $appExeName) -Force
-    Copy-Item $manifestPath (Join-Path $binPath 'stinger_build_manifest.json') -Force
-    Write-Host "Published $appExeName to: $binPath"
-}
-
 Write-Host "Build complete: $exePath"
 Write-Host "Root executable updated: $rootExePath"
 Write-Host "Manifest: $manifestPath"

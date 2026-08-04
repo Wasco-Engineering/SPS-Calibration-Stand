@@ -52,6 +52,43 @@ def test_no_switch_error_enters_inline_decision_without_popup() -> None:
     assert releases == [('port_a', 'no-switch-failure')]
 
 
+def test_active_test_cancel_starts_hardware_vent() -> None:
+    """Cancel must start hardware vent; the state-machine callback only logs."""
+    controller = WorkOrderController.__new__(WorkOrderController)
+    sm = PortStateMachine('port_a')
+    sm.set_workflow_type('QAL16')
+    sm.trigger('initialize_complete')
+    sm.trigger('start_test')
+    vents: list[str] = []
+    releases: list[tuple[str, str]] = []
+
+    class _Executor:
+        is_running = True
+
+        def __init__(self) -> None:
+            self.cancel_requested = False
+
+        def request_cancel(self) -> None:
+            self.cancel_requested = True
+
+    executor = _Executor()
+    controller._state_machines = {'port_a': sm}
+    controller._test_executors = {'port_a': executor}
+    controller._restore_normal_viz = lambda _port_id: None
+    controller._cancel_hw_action = lambda _port_id: None
+    controller._remove_precision_waiter = lambda _port_id: None
+    controller._release_precision_slot = (
+        lambda port_id, reason: releases.append((port_id, reason))
+    )
+    controller._vent_port = lambda port_id: vents.append(port_id)
+
+    controller._on_cancel('port_a')
+
+    assert executor.cancel_requested is True
+    assert vents == ['port_a']
+    assert releases == [('port_a', 'cancel')]
+
+
 def test_no_switch_retry_persists_null_failure_then_relaunches_same_serial() -> None:
     controller = WorkOrderController.__new__(WorkOrderController)
     sm = _no_switch_sm('QAL16')

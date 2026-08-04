@@ -10,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, ClassVar, Dict, List, Optional, Callable
 
 from app.core.config import is_port_installed
 from app.services.ptp_switch_resolver import PtpSwitchResolution, resolve_ptp_switch_config
@@ -49,12 +49,17 @@ class EdgeEvent:
 # Nominal atmosphere for absolute-pressure safety check (PSI)
 _ATMOSPHERE_PSI = 14.7
 _IDLE_ATMOSPHERE_TOLERANCE_PSIA = 1.0
+_RELEASE_GAUGE_TOLERANCE_PSI = 0.15  # ~7.8 Torr; post-test / vent completion
 _IDLE_BLEED_TIMEOUT_S = 90.0
 
 
 class Port:
     """Single test port with LabJack + Alicat hardware."""
-    
+
+    # Boot-once atmosphere (P0) shared across ports for the process lifetime.
+    # Sampled at EXH idle on connect; tests must not re-vent to remeasure.
+    _session_gauge_zero_psia: ClassVar[Optional[float]] = None
+
     def __init__(
         self,
         port_id: PortId,
@@ -71,7 +76,7 @@ class Port:
         # Initialize hardware controllers
         self.daq = LabJackController(labjack_config)
         self.alicat = AlicatController(alicat_config)
-        
+
         # Edge detection state
         self._last_switch_state: Optional[SwitchState] = None
         self._edge_history: List[EdgeEvent] = []
@@ -80,13 +85,28 @@ class Port:
         # Cached Alicat reading for fast polling (updated every Nth cycle)
         self._cached_alicat: Optional[AlicatReading] = None
         self._cached_alicat_lock = threading.Lock()
-        
+
         # Current test context
         self._no_pin: Optional[int] = None
         self._nc_pin: Optional[int] = None
         self._last_switch_resolution: Optional[PtpSwitchResolution] = None
-        
+
         logger.info(f"Port {port_id.value} initialized")
+
+    @classmethod
+    def get_session_gauge_zero_psia(cls) -> Optional[float]:
+        """Return the boot-locked atmosphere P0 (PSIA), if captured."""
+        return cls._session_gauge_zero_psia
+
+    @classmethod
+    def set_session_gauge_zero_psia(cls, value: float) -> None:
+        """Lock atmosphere P0 for this process (boot / reconnect only)."""
+        cls._session_gauge_zero_psia = float(value)
+
+    @classmethod
+    def clear_session_gauge_zero_psia(cls) -> None:
+        """Clear boot P0 so reconnect can re-sample once."""
+        cls._session_gauge_zero_psia = None
 
     def _open_fitting_line(self) -> bool:
         """True when the DUT line is open to room air (no sealed transducer path)."""
@@ -431,27 +451,92 @@ class Port:
             self.daq.reset_filter()
         return result
 
-    def _sample_barometric_via_exhaust(self, timeout_s: float = 2.0) -> Optional[float]:
-        """Vent the Alicat to EXH on the atmosphere route and read local baro."""
+    def _alicat_process_psia(
+        self,
+        reading: Optional[PortReading],
+        *,
+        prefer_raw: bool = True,
+    ) -> Optional[float]:
+        """Alicat process absolute PSI; prefer uncorrected raw for gauge-zero math."""
+        if reading is None or reading.alicat is None:
+            return None
+        if prefer_raw and reading.alicat.pressure_raw is not None:
+            return float(reading.alicat.pressure_raw)
+        if reading.alicat.pressure is not None:
+            return float(reading.alicat.pressure)
+        return None
+
+    def _sample_barometric_via_exhaust(self, timeout_s: float = 5.0) -> Optional[float]:
+        """Vent to EXH on the atmosphere route and read settled gauge-zero (P0).
+
+        PCD absolute Alicats (no internal barometer) have no true gauge field.
+        Gauge is always process_abs − P0. Use **uncorrected** process pressure so
+        the absolute error model cannot skew near-atmosphere mmHg gauge by a few
+        Torr. Reject the first EXH packets while a pressurized line is still
+        bleeding down.
+        """
         from app.services.pressure_domain import is_plausible_barometric_psi
 
         self.daq.set_solenoid_safe()
         self.daq.reset_filter()
         if not self.alicat.exhaust():
             return None
-        deadline = time.perf_counter() + max(0.5, timeout_s)
-        last_plausible: Optional[float] = None
+
+        local_default = self._configured_barometric_psia()
+        deadline = time.perf_counter() + max(2.0, timeout_s)
+        samples: list[float] = []
+        settled: Optional[float] = None
+
         while time.perf_counter() < deadline:
             time.sleep(0.15)
             reading = self.read_all()
-            pressure = self._alicat_abs_psia(reading, 0.0)
-            if pressure is not None and is_plausible_barometric_psi(pressure):
-                last_plausible = float(pressure)
-                if self._alicat_in_exhaust_mode():
-                    break
-        if last_plausible is not None:
-            self.alicat.hold_valve(closed=True)
-        return last_plausible
+            pressure = self._alicat_process_psia(reading, prefer_raw=True)
+            if pressure is None or not is_plausible_barometric_psi(pressure):
+                continue
+            if not self._alicat_in_exhaust_mode():
+                self.alicat.exhaust()
+                continue
+            samples.append(float(pressure))
+            if len(samples) < 8:
+                continue
+            window = samples[-8:]
+            span = max(window) - min(window)
+            if span > 0.03:
+                continue
+            window_sorted = sorted(window)
+            candidate = window_sorted[len(window_sorted) // 2]  # median
+            if candidate > local_default + 0.35:
+                continue
+            settled = candidate
+            break
+
+        if settled is None and samples:
+            tail = samples[-min(8, len(samples)) :]
+            candidate = float(sorted(tail)[len(tail) // 2])
+            if (
+                is_plausible_barometric_psi(candidate)
+                and abs(candidate - local_default) <= 1.0
+                and candidate <= local_default + 0.35
+            ):
+                logger.warning(
+                    '%s: EXH gauge-zero timed out; using median=%.4f PSIA (n=%d)',
+                    self.port_id.value,
+                    candidate,
+                    len(samples),
+                )
+                settled = candidate
+
+        if settled is not None:
+            logger.info(
+                '%s: EXH gauge-zero (raw) settled at %.4f PSIA (samples=%d, %.1f Torr)',
+                self.port_id.value,
+                settled,
+                len(samples),
+                settled * 51.7149325716,
+            )
+            Port.set_session_gauge_zero_psia(settled)
+            return settled
+        return None
 
     def _infer_barometric_psia(self, reading: Optional[PortReading] = None) -> float:
         local_default = self._configured_barometric_psia()
@@ -493,6 +578,51 @@ class Port:
             return float(reading.alicat.pressure)
         return None
 
+    def _gauge_pressure_psi(
+        self,
+        reading: Optional[PortReading] = None,
+        *,
+        barometric_psia: Optional[float] = None,
+    ) -> Optional[float]:
+        """Gauge pressure in PSI when available, else absolute minus baro."""
+        if reading is None:
+            try:
+                reading = self.read_all()
+            except Exception:
+                return None
+        if reading.alicat is None:
+            return None
+        gauge = reading.alicat.gauge_pressure
+        if gauge is not None:
+            return float(gauge)
+        abs_psi = self._alicat_abs_psia(reading, barometric_psia or _ATMOSPHERE_PSI)
+        if abs_psi is None:
+            return None
+        if barometric_psia is None:
+            barometric_psia = self._infer_barometric_psia(reading)
+        return abs_psi - float(barometric_psia)
+
+    def _is_released_to_atmosphere(
+        self,
+        reading: Optional[PortReading],
+        barometric_psia: float,
+        *,
+        tolerance_psi: float = _RELEASE_GAUGE_TOLERANCE_PSI,
+    ) -> bool:
+        """True when the DUT line is at ~0 gauge (not just within abs baro band)."""
+        if reading is None:
+            try:
+                reading = self.read_all()
+            except Exception:
+                return False
+        gauge = self._gauge_pressure_psi(reading, barometric_psia=barometric_psia)
+        if gauge is not None:
+            return abs(gauge) <= tolerance_psi
+        current = self._alicat_abs_psia(reading, barometric_psia)
+        if current is None:
+            return False
+        return abs(current - barometric_psia) <= tolerance_psi
+
     def _alicat_in_exhaust_mode(self) -> bool:
         reading = self.alicat.read_status()
         if reading is None or not reading.raw_response:
@@ -509,20 +639,31 @@ class Port:
         """True when the DUT line is already at safe atmospheric idle.
 
         Used on connect/disconnect to avoid disturbing ports that are already
-        sitting near barometric pressure with no exhaust bleed active.
+        sitting near barometric pressure. Alicat EXH near local baro is the
+        preferred idle state and must not be treated as “needs recovery”
+        (recovery was exiting EXH and commanding a baro setpoint, which
+        pressurizes slightly on boot).
         """
-        if self._alicat_in_exhaust_mode():
-            return False
         if barometric_psia is None:
             barometric_psia = self._infer_barometric_psia()
         reading = self.read_all()
         current = self._alicat_abs_psia(reading, barometric_psia)
         if current is None:
             return False
+
+        from app.services.pressure_domain import is_plausible_barometric_psi
+
+        near_baro = (
+            is_plausible_barometric_psi(current)
+            and abs(current - barometric_psia) <= max(_IDLE_ATMOSPHERE_TOLERANCE_PSIA * 2.0, 1.5)
+        )
+
+        # Preferred idle: ATM route with Alicat EXH at local baro.
+        if self._alicat_in_exhaust_mode():
+            return near_baro
+
         # Held closed near local baro (common on open fittings at altitude).
         if self._alicat_in_hold_mode():
-            from app.services.pressure_domain import is_plausible_barometric_psi
-
             if is_plausible_barometric_psi(current):
                 hold_tolerance = (
                     _IDLE_ATMOSPHERE_TOLERANCE_PSIA
@@ -541,6 +682,33 @@ class Port:
         if current < low or current > high:
             return False
         return True
+
+    def ensure_exhaust_idle(
+        self,
+        *,
+        timeout_s: float = _IDLE_BLEED_TIMEOUT_S,
+    ) -> bool:
+        """Park the port on the atmosphere route with Alicat EXH (boot/idle)."""
+        barometric_psia = _ATMOSPHERE_PSI
+        try:
+            barometric_psia = self._infer_barometric_psia()
+        except Exception:
+            pass
+
+        if self._alicat_in_exhaust_mode() and self.is_at_atmospheric_idle(barometric_psia):
+            if not self._engage_atmosphere_route(context='EXH idle'):
+                return False
+            logger.info(
+                '%s: Already in EXH atmospheric idle (%.2f psia)',
+                self.port_id.value,
+                self._alicat_abs_psia(self.read_all(), barometric_psia) or float('nan'),
+            )
+            return True
+
+        return self._complete_exhaust_vent(
+            barometric_psia,
+            timeout_s=timeout_s,
+        )
 
     def _exit_alicat_exhaust(self, target_psia: float = _ATMOSPHERE_PSI) -> None:
         """Leave Alicat EXH so closed-loop setpoints can move the DUT line."""
@@ -637,7 +805,9 @@ class Port:
             and low_threshold <= current <= high_threshold
         )
         in_exh = self._alicat_in_exhaust_mode()
-        if in_exh:
+        # Only leave EXH when actively commanding closed-loop pressure.
+        # Leaving EXH on a "gentle" idle lock is what pressurizes slightly on boot.
+        if in_exh and command_pressure:
             self._exit_alicat_exhaust(barometric_psia)
 
         need_pressure_command = command_pressure and (in_exh or not in_band)
@@ -675,6 +845,71 @@ class Port:
         )
         return ok
 
+    def _engage_atmosphere_route(self, *, context: str) -> bool:
+        """Switch the solenoid to the atmosphere path before vent or EXH."""
+        if not self.daq.set_solenoid_safe():
+            logger.warning(
+                '%s: Failed to engage atmosphere route for %s',
+                self.port_id.value,
+                context,
+            )
+            return False
+        self.daq.reset_filter()
+        logger.info('%s: Atmosphere solenoid engaged for %s', self.port_id.value, context)
+        return True
+
+    def _release_to_atmosphere_via_setpoint(
+        self,
+        barometric_psia: float,
+        *,
+        timeout_s: float = _IDLE_BLEED_TIMEOUT_S,
+        route_engaged: bool = False,
+    ) -> bool:
+        """Depressurize a sealed DUT line to ~0 gauge without Alicat EXH."""
+        if not route_engaged and not self._engage_atmosphere_route(context='setpoint release'):
+            return False
+        self._exit_alicat_exhaust(barometric_psia)
+        self.alicat.set_ramp_rate(8.0)
+        if not self.set_pressure(barometric_psia):
+            logger.warning(
+                '%s: Failed to command atmosphere release setpoint',
+                self.port_id.value,
+            )
+            return False
+
+        gauge_psi = self._gauge_pressure_psi(barometric_psia=barometric_psia)
+        logger.info(
+            '%s: Releasing to atmosphere via setpoint (target %.2f psia, gauge=%s PSI)',
+            self.port_id.value,
+            barometric_psia,
+            f'{gauge_psi:.4f}' if gauge_psi is not None else '--',
+        )
+
+        deadline = time.perf_counter() + max(0.5, timeout_s)
+        current: Optional[float] = None
+        while time.perf_counter() < deadline:
+            reading = self.read_all()
+            current = self._alicat_abs_psia(reading, barometric_psia)
+            if self._is_released_to_atmosphere(reading, barometric_psia):
+                logger.info(
+                    '%s: Setpoint release complete at %.2f psia',
+                    self.port_id.value,
+                    current if current is not None else float('nan'),
+                )
+                return self._lock_idle_at_atmosphere(
+                    barometric_psia,
+                    command_pressure=False,
+                )
+            time.sleep(0.25)
+
+        logger.warning(
+            '%s: Setpoint release timed out (P=%.2f psia, target=%.2f psia)',
+            self.port_id.value,
+            current if current is not None else float('nan'),
+            barometric_psia,
+        )
+        return self._lock_idle_at_atmosphere(barometric_psia, command_pressure=False)
+
     def _vent_to_atmosphere_via_setpoint(
         self,
         *,
@@ -699,17 +934,26 @@ class Port:
         except Exception:
             pass
 
-        if self.is_at_atmospheric_idle(barometric_psia):
-            reading = self.read_all()
+        reading = self.read_all()
+        if self._is_released_to_atmosphere(reading, barometric_psia):
             current = self._alicat_abs_psia(reading, barometric_psia)
             logger.info(
                 '%s: Already at atmospheric idle (%.2f psia) — no vent action',
                 self.port_id.value,
                 current if current is not None else float('nan'),
             )
-            return True
+            return self._lock_idle_at_atmosphere(
+                barometric_psia,
+                command_pressure=False,
+            )
 
-        reading = self.read_all()
+        gauge_psi = self._gauge_pressure_psi(reading, barometric_psia=barometric_psia)
+        if gauge_psi is not None and gauge_psi > _RELEASE_GAUGE_TOLERANCE_PSI:
+            return self._release_to_atmosphere_via_setpoint(
+                barometric_psia,
+                timeout_s=timeout_s,
+            )
+
         current = self._alicat_abs_psia(reading, barometric_psia)
         low_threshold = barometric_psia - _IDLE_ATMOSPHERE_TOLERANCE_PSIA
         high_threshold = (
@@ -743,37 +987,26 @@ class Port:
 
         return self._lock_idle_at_atmosphere(barometric_psia)
 
-    def vent_to_atmosphere(
+    def _complete_exhaust_vent(
         self,
+        barometric_psia: float,
         *,
-        bleed_installed_dut: bool = True,
         timeout_s: float = _IDLE_BLEED_TIMEOUT_S,
+        route_engaged: bool = False,
     ) -> bool:
-        """Vent with Alicat EXH and leave EXH active at atmospheric pressure."""
-        del bleed_installed_dut  # Retained for compatibility with existing callers.
-        barometric_psia = _ATMOSPHERE_PSI
-        try:
-            barometric_psia = self._infer_barometric_psia()
-        except Exception:
-            pass
-
-        if self.is_at_atmospheric_idle(barometric_psia):
-            return True
-        if not self.daq.set_solenoid_safe():
-            logger.warning('%s: Failed to engage atmosphere route for EXH vent', self.port_id.value)
+        """Vent via Alicat EXH after the solenoid is on the atmosphere route."""
+        if not route_engaged and not self._engage_atmosphere_route(context='EXH vent'):
             return False
-        self.daq.reset_filter()
         if not self.alicat.exhaust():
             logger.warning('%s: Failed to enable Alicat EXH', self.port_id.value)
             return False
 
-        tolerance = _IDLE_ATMOSPHERE_TOLERANCE_PSIA if self._open_fitting_line() else 2.0
         deadline = time.perf_counter() + max(0.5, timeout_s)
         current: Optional[float] = None
         while time.perf_counter() < deadline:
             reading = self.read_all()
             current = self._alicat_abs_psia(reading, barometric_psia)
-            if current is not None and abs(current - barometric_psia) <= tolerance:
+            if self._is_released_to_atmosphere(reading, barometric_psia):
                 logger.info('%s: EXH vent complete at %.2f psia', self.port_id.value, current)
                 return True
             time.sleep(0.25)
@@ -784,8 +1017,97 @@ class Port:
             current if current is not None else float('nan'),
             barometric_psia,
         )
-        # Leave EXH enabled on a timeout; closing the valve could trap pressure.
         return False
+
+    def vent_to_atmosphere(
+        self,
+        *,
+        bleed_installed_dut: bool = True,
+        timeout_s: float = _IDLE_BLEED_TIMEOUT_S,
+    ) -> bool:
+        """Return the DUT line to atmospheric idle."""
+        barometric_psia = _ATMOSPHERE_PSI
+        try:
+            barometric_psia = self._infer_barometric_psia()
+        except Exception:
+            pass
+
+        reading = self.read_all()
+        if self._is_released_to_atmosphere(reading, barometric_psia):
+            if self.is_at_atmospheric_idle(barometric_psia) or self._alicat_in_hold_mode():
+                return True
+            if not self._engage_atmosphere_route(context='vent'):
+                return False
+            return self._lock_idle_at_atmosphere(
+                barometric_psia,
+                command_pressure=False,
+            )
+        if self._alicat_in_hold_mode() and self.is_at_atmospheric_idle(barometric_psia):
+            return True
+
+        if not self._engage_atmosphere_route(context='vent'):
+            return False
+
+        gauge_psi = self._gauge_pressure_psi(reading, barometric_psia=barometric_psia)
+        if gauge_psi is not None and gauge_psi > _RELEASE_GAUGE_TOLERANCE_PSI:
+            return self._release_to_atmosphere_via_setpoint(
+                barometric_psia,
+                timeout_s=timeout_s,
+                route_engaged=True,
+            )
+
+        current = self._alicat_abs_psia(reading, barometric_psia)
+        if self._open_fitting_line() or (
+            current is not None
+            and current < barometric_psia - _RELEASE_GAUGE_TOLERANCE_PSI
+        ):
+            return self._complete_exhaust_vent(
+                barometric_psia,
+                timeout_s=timeout_s,
+                route_engaged=True,
+            )
+
+        if self._alicat_in_exhaust_mode():
+            self._exit_alicat_exhaust(barometric_psia)
+            return self._lock_idle_at_atmosphere(
+                barometric_psia,
+                command_pressure=False,
+            )
+
+        if bleed_installed_dut:
+            try:
+                self._bleed_line_to_atmosphere(
+                    barometric_psia=barometric_psia,
+                    timeout_s=timeout_s,
+                )
+            except Exception as exc:
+                logger.warning(
+                    '%s: Atmosphere bleed failed (continuing to idle lock): %s',
+                    self.port_id.value,
+                    exc,
+                )
+
+        return self._lock_idle_at_atmosphere(barometric_psia)
+
+    def _vent_to_atmosphere_via_exhaust(
+        self,
+        *,
+        timeout_s: float = _IDLE_BLEED_TIMEOUT_S,
+    ) -> bool:
+        """Backward-compatible wrapper: atmosphere route, then EXH."""
+        barometric_psia = _ATMOSPHERE_PSI
+        try:
+            barometric_psia = self._infer_barometric_psia()
+        except Exception:
+            pass
+        reading = self.read_all()
+        if self.is_at_atmospheric_idle(barometric_psia):
+            if (
+                self._is_released_to_atmosphere(reading, barometric_psia)
+                or self._alicat_in_hold_mode()
+            ):
+                return True
+        return self._complete_exhaust_vent(barometric_psia, timeout_s=timeout_s)
 
     def prepare_vacuum_route_for_test(self, barometric_psi: float = _ATMOSPHERE_PSI) -> bool:
         """Route to vacuum for test cycling (transducer-guarded).
@@ -847,6 +1169,7 @@ class Port:
         if restore_safe_state:
             try:
                 self.vent_to_atmosphere()
+                self.ensure_exhaust_idle()
             except Exception as exc:
                 logger.warning(
                     '%s: Safe vent on disconnect failed: %s',
@@ -855,13 +1178,13 @@ class Port:
                 )
                 try:
                     self.daq.set_solenoid_safe()
-                    self.alicat.hold_valve(closed=True)
+                    self.alicat.exhaust()
                 except Exception:
                     pass
 
         self.daq.cleanup(preserve_solenoid_state=not restore_safe_state)
         self.alicat.disconnect()
-        
+
         logger.info(f"Port {self.port_id.value}: Disconnected")
     
     def get_status(self) -> Dict[str, Any]:
@@ -989,8 +1312,8 @@ class PortManager:
         Alicat controller is updated and the connection retried.
 
         When ``safe_idle_on_connect`` is True (default), each connected port
-        is checked for atmospheric idle. Ports already near barometric
-        pressure are left alone; only vacuum or mis-routed lines are recovered.
+        is parked in Alicat EXH on the atmosphere route. Ports already in EXH
+        near barometric pressure are left alone.
         """
         import time
 
@@ -1037,24 +1360,63 @@ class PortManager:
         return success
 
     def safe_idle_connected_ports(self) -> None:
-        """Vent connected ports to atmospheric idle after connect/polling is live."""
+        """Park connected ports in Alicat EXH on the atmosphere route after connect."""
         for port_id, port in self.ports.items():
             try:
                 port.refresh_alicat()
-                if port.is_at_atmospheric_idle():
+                if port.is_at_atmospheric_idle() and port._alicat_in_exhaust_mode():
                     logger.info(
-                        'PortManager: %s already at atmospheric idle on connect',
+                        'PortManager: %s already at EXH atmospheric idle on connect',
                         port_id.value,
                     )
                     continue
-                port.vent_to_atmosphere()
-                logger.info('PortManager: %s safe idle (atmosphere hold)', port_id.value)
+                port.ensure_exhaust_idle()
+                logger.info('PortManager: %s safe idle (EXH)', port_id.value)
             except Exception as exc:
                 logger.warning(
-                    'PortManager: %s safe idle vent on connect failed: %s',
+                    'PortManager: %s safe idle EXH on connect failed: %s',
                     port_id.value,
                     exc,
                 )
+
+    def capture_boot_barometric(self) -> Optional[float]:
+        """Sample atmosphere once at boot (EXH idle) and lock it for the session.
+
+        Subsequent tests reuse this P0 — never re-EXH mid-pressurize to remeasure.
+        """
+        from app.services.pressure_domain import is_plausible_barometric_psi
+
+        existing = Port.get_session_gauge_zero_psia()
+        if existing is not None and is_plausible_barometric_psi(existing):
+            logger.info(
+                'PortManager: Boot barometric already locked at %.4f PSIA (%.1f Torr)',
+                existing,
+                existing * 51.7149325716,
+            )
+            return float(existing)
+
+        for port_id, port in self.ports.items():
+            try:
+                if not bool(port.alicat.get_status().get('connected')):
+                    continue
+                measured = port._sample_barometric_via_exhaust(timeout_s=6.0)
+                if measured is not None and is_plausible_barometric_psi(measured):
+                    Port.set_session_gauge_zero_psia(measured)
+                    logger.info(
+                        'PortManager: Boot barometric locked via %s at %.4f PSIA (%.1f Torr)',
+                        port_id.value,
+                        measured,
+                        measured * 51.7149325716,
+                    )
+                    return float(measured)
+            except Exception as exc:
+                logger.warning(
+                    'PortManager: %s boot barometric sample failed: %s',
+                    port_id.value,
+                    exc,
+                )
+        logger.warning('PortManager: Boot barometric sample unavailable; live inference will be used')
+        return None
 
     def _discover_alicat_port(self, port: Port) -> Optional[str]:
         """Scan available serial ports for a responding Alicat at the expected address."""
@@ -1120,7 +1482,8 @@ class PortManager:
             for port_id, port in ports:
                 try:
                     port.vent_to_atmosphere()
-                    logger.info('PortManager: %s safe idle before disconnect', port_id.value)
+                    port.ensure_exhaust_idle()
+                    logger.info('PortManager: %s safe idle (EXH) before disconnect', port_id.value)
                 except Exception as exc:
                     logger.warning(
                         'PortManager: %s safe vent before disconnect failed: %s',

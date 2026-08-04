@@ -25,20 +25,28 @@ def infer_barometric_pressure(reading: Optional[PortReading]) -> Optional[float]
 
 
 def _alicat_status_indicates_vented(reading: AlicatReading) -> bool:
-    """True when the Alicat status line looks like exhaust/hold at atmosphere."""
+    """True when the Alicat status line looks like exhaust/hold at atmosphere.
+
+    Do not treat every HLD in the broad baro band as vented: a pressurized
+    hold (e.g. 14.8–15.5 PSIA) is still plausible as weather, and would poison
+    gauge conversions for near-atmosphere mmHg parts.
+    """
     raw = (reading.raw_response or '').upper()
     if 'EXH' in raw or 'ATM' in raw:
         return True
-    if 'HLD' in raw and reading.pressure is not None:
-        if is_plausible_barometric_psi(float(reading.pressure)):
-            return True
+    # Gauge-mode hold near zero setpoint is a common idle-at-atmosphere state.
     if reading.setpoint is not None and abs(float(reading.setpoint)) <= 0.25:
         return 'HLD' in raw
     return False
 
 
 def infer_barometric_pressure_from_alicat(reading: Optional[AlicatReading]) -> Optional[float]:
-    """Infer barometric PSI directly from Alicat absolute/gauge fields."""
+    """Infer barometric PSI directly from Alicat absolute/gauge fields.
+
+    Do **not** treat EXH/ATM process pressure as weather: during bleed-down the
+    absolute reading is still elevated and would inflate gauge conversions.
+    EXH atmosphere is locked once at boot via ``PortManager.capture_boot_barometric``.
+    """
     if reading is None:
         return None
     if reading.barometric_pressure is not None:
@@ -49,15 +57,11 @@ def infer_barometric_pressure_from_alicat(reading: Optional[AlicatReading]) -> O
         inferred = float(reading.pressure - reading.gauge_pressure)
         if is_plausible_barometric_psi(inferred):
             return inferred
-    if (
-        reading.pressure is not None
-        and float(reading.pressure) >= 12.0
-        and is_plausible_barometric_psi(reading.pressure)
-        and _alicat_status_indicates_vented(reading)
-    ):
-        return float(reading.pressure)
-    # Short status packets (pressure + setpoint only) omit barometric index.
-    # When vented to atmosphere the absolute line pressure is local baro.
+    raw = (reading.raw_response or '').upper()
+    # Never treat EXH/ATM line pressure as baro (bleed / vacuum pull).
+    if 'EXH' in raw or 'ATM' in raw:
+        return None
+    # Gauge-mode hold near zero setpoint at a plausible absolute is idle atm.
     if (
         reading.pressure is not None
         and reading.setpoint is not None
@@ -84,12 +88,17 @@ def is_plausible_barometric_psi(
     return minimum <= value <= maximum
 
 
+# Once a good atmosphere sample exists, reject small process-pressure creep
+# (pressurized HLD / near-atm cycling) that would still look like "weather".
+_BAROMETRIC_MAX_JUMP_PSI = 0.15
+
+
 def resolve_barometric_psi(
     reading: Optional[PortReading],
     *,
     fallback: float = DEFAULT_BAROMETRIC_PSI,
     last_value: Optional[float] = None,
-    max_jump_psi: float = 2.0,
+    max_jump_psi: float = _BAROMETRIC_MAX_JUMP_PSI,
 ) -> float:
     """Return a usable barometric PSI for conversions and vacuum safety checks."""
     # These controllers often provide only pressure + setpoint, with no

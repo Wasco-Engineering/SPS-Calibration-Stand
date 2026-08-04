@@ -6,7 +6,9 @@ import pytest
 
 from app.services.ptp_service import TestSetup, convert_pressure
 from app.services.sweep_utils import (
+    absolute_vacuum_reachable_floor_psi,
     band_midpoint,
+    clamp_absolute_vacuum_low_target_psi,
     narrow_bounds,
     ptp_limits_use_psia_scale,
     resolve_cycle_ramp_targets,
@@ -242,3 +244,16 @@ def test_narrow_bounds_clamps_to_global_limits() -> None:
     )
     assert low == 5.0
     assert high == 23.0
+
+
+def test_absolute_vacuum_low_target_raises_unreachable_zero() -> None:
+    """SPS-17123-style ~7 Torr band must not command absolute 0.0000 PSIA."""
+    band_min = convert_pressure(7.0, 'Torr', 'PSI')
+    overshoot = convert_pressure(8.0, 'Torr', 'PSI')
+    raw_low = max(0.0, band_min - overshoot)
+    assert raw_low == pytest.approx(0.0)
+
+    clamped = clamp_absolute_vacuum_low_target_psi(raw_low, band_min)
+    floor = absolute_vacuum_reachable_floor_psi()
+    assert clamped == pytest.approx(floor)
+    assert clamped < band_min

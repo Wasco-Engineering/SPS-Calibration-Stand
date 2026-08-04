@@ -24,7 +24,9 @@ class PortRuntimeState:
     def with_defaults(cls) -> 'PortRuntimeState':
         ports = ('port_a', 'port_b')
         return cls(
-            last_barometric_psi={pid: 14.7 for pid in ports},
+            # Do not seed 14.7 as a "measured" baro — that blocks real site
+            # samples (and P−G inference) under the jump filter.
+            last_barometric_psi={},
             barometric_warning_issued={pid: False for pid in ports},
             cycle_estimates_abs_psi={
                 pid: {'activation': None, 'deactivation': None, 'count': 0}

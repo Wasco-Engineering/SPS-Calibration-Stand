@@ -21,6 +21,8 @@ class _FakeAlicat:
     def __init__(self) -> None:
         self.configure_calls = 0
         self.cancel_hold_calls = 0
+        self.hold_calls = 0
+        self.last_hold_closed: bool | None = None
         self.ramp_rates: list[float] = []
 
     def configure_units_from_ptp(self, _units_code: str) -> bool:
@@ -37,6 +39,11 @@ class _FakeAlicat:
 
     def set_ramp_rate(self, _rate: float) -> bool:
         self.ramp_rates.append(_rate)
+        return True
+
+    def hold_valve(self, closed: bool = False) -> bool:
+        self.hold_calls += 1
+        self.last_hold_closed = closed
         return True
 
 
@@ -704,7 +711,8 @@ def test_increasing_vacuum_no_open_uses_false_activation_state() -> None:
     assert executor._vacuum_switch_trips_on_no_open() is True
     assert executor._cycle_target_switch_state('activation') is False
     assert executor._cycle_target_switch_state('deactivation') is True
-    assert executor._cycle_edge_switch_state_allowed('activation', True)
+    assert not executor._accept_observed_switch_polarity_for_cycle_edges()
+    assert not executor._cycle_edge_switch_state_allowed('activation', True)
     assert executor._cycle_edge_switch_state_allowed('activation', False)
 
 
@@ -1606,7 +1614,7 @@ def test_vacuum_increasing_pre_approach_starts_on_low_reset_side() -> None:
     assert convert_pressure(waits[0], 'PSI', 'Torr') < 400.0
     assert commanded[0] == pytest.approx(14.7, rel=1e-6)
     assert commanded[1] == pytest.approx(waits[0], rel=1e-6)
-    assert wait_timeouts[0] < executor._edge_timeout_s
+    assert wait_timeouts[0] == pytest.approx(12.0)
 
 
 def test_vacuum_decreasing_pre_approach_approaches_baro_on_atmosphere_then_vacuum() -> None:
@@ -1759,6 +1767,67 @@ def test_pressure_decreasing_activation_edge_allowed_up_to_reset_band() -> None:
     assert executor._cycle_edge_pressure_allowed('activation', 8.87) is True
     assert executor._cycle_edge_pressure_allowed('activation', 9.50) is True
     assert executor._cycle_edge_pressure_allowed('activation', 10.20) is False
+
+
+def test_decreasing_pressure_activation_prep_climbs_when_deactivated_below_band() -> None:
+    """SPS01804-02: deactivated below band must climb before descending activation."""
+    port = _FakePort([True])
+    setup = TestSetup(
+        part_id='SPS01804-02',
+        sequence_id='300',
+        units_code='19',
+        units_label='mmHg @ 0 C',
+        activation_direction='Decreasing',
+        activation_target=15.0,
+        pressure_reference='gauge',
+        terminals={},
+        bands={
+            'increasing': {'lower': float('-inf'), 'upper': 30.0},
+            'decreasing': {'lower': 12.5, 'upper': 17.5},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    min_psi = convert_pressure(12.5, 'mmHg @ 0 C', 'PSI')
+    max_psi = convert_pressure(17.5, 'mmHg @ 0 C', 'PSI')
+    overshoot = 0.15
+    prep_target = min(15.35, max_psi + overshoot)
+    readings = [
+        (0.28, False),  # below band, deactivated (looks like prep DI state)
+        (prep_target, False),
+        (prep_target, False),
+    ]
+    idx = {'value': 0}
+
+    def _read_state() -> tuple[float, bool]:
+        pressure, switch = readings[min(idx['value'], len(readings) - 1)]
+        idx['value'] += 1
+        return pressure, switch
+
+    executor = _TestExecutor(
+        port_id='port_a',
+        port=cast(Any, port),
+        test_setup=setup,
+        config={'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}}},
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.7,
+    )
+    executor._read_pressure_and_switch_state = _read_state  # type: ignore[method-assign]
+
+    executor._prepare_switch_for_cycle_edge(
+        sweep_mode='pressure',
+        min_psi=min_psi,
+        max_psi=max_psi,
+        direction=-1,
+        edge_type='activation',
+        overshoot=overshoot,
+        hw_min_psi=-14.65,
+        hw_max_psi=15.35,
+    )
+
+    assert port.set_pressure_calls
+    # Must climb above the decreasing band before the descending activation ramp.
+    assert port.set_pressure_calls[-1] > 14.7 + max_psi
 
 
 def test_decreasing_pressure_activation_prep_not_skipped_when_switch_wrong_state() -> None:
@@ -2693,3 +2762,29 @@ def test_cycle_prep_confirmed_false_causes_full_range_in_run_single_cycle() -> N
     assert any(sp <= full_act_abs + 0.2 for sp in act_targets_used), (
         f'Expected full-range target ~{full_act_abs:.3f}; got {act_targets_used}'
     )
+
+
+def test_lock_run_barometric_reuses_boot_session_without_exh() -> None:
+    """Per-run lock must reuse boot P0 and must not dump via EXH."""
+    from app.hardware.port import Port
+
+    Port.clear_session_gauge_zero_psia()
+    Port.set_session_gauge_zero_psia(14.60)
+
+    class _PortNoSample(_FakePort):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.sample_calls = 0
+
+        def _sample_barometric_via_exhaust(self, timeout_s: float = 5.0) -> float:
+            self.sample_calls += 1
+            raise AssertionError('EXH sample must not run when boot P0 is locked')
+
+    port = _PortNoSample()
+    executor = _build_executor(port)
+    executor._try_mensor_barometric_psia = lambda: None  # type: ignore[method-assign]
+    measured = executor._lock_run_barometric_via_exhaust()
+    assert measured == pytest.approx(14.60)
+    assert executor._gauge_zero_raw_psi == pytest.approx(14.60)
+    assert port.sample_calls == 0
+    Port.clear_session_gauge_zero_psia()

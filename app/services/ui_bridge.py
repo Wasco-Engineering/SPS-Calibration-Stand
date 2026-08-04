@@ -128,24 +128,23 @@ class UIBridge(QObject):
             "port_a": 0.0,
             "port_b": 0.0,
         }
-        self._last_barometric_psi: Dict[str, float] = {
-            "port_a": 14.7,
-            "port_b": 14.7,
-        }
+        self._last_barometric_psi: Dict[str, float] = {}
+        self._barometric_locked = False
+        self._locked_barometric_psi: Optional[float] = None
         self._last_debug_readings: Dict[str, Dict[str, Optional[float]]] = {
             "port_a": {
                 "timestamp": None,
                 "pressure_abs_psi": None,
                 "setpoint_abs_psi": None,
                 "alicat_abs_psi": None,
-                "barometric_psi": 14.7,
+                "barometric_psi": None,
             },
             "port_b": {
                 "timestamp": None,
                 "pressure_abs_psi": None,
                 "setpoint_abs_psi": None,
                 "alicat_abs_psi": None,
-                "barometric_psi": 14.7,
+                "barometric_psi": None,
             },
         }
         self._last_debug_chart_emit_s: Dict[str, float] = {
@@ -190,7 +189,21 @@ class UIBridge(QObject):
 
     def _infer_barometric_pressure(self, reading: Optional[PortReading]) -> Optional[float]:
         return infer_barometric_pressure(reading)
-    
+
+    def lock_barometric_psi(self, value: float) -> None:
+        """Freeze barometric PSI for the session (boot sample only)."""
+        locked = float(value)
+        self._barometric_locked = True
+        self._locked_barometric_psi = locked
+        for port_id in ('port_a', 'port_b'):
+            self._last_barometric_psi[port_id] = locked
+            self.barometric_pressure_updated.emit(port_id, locked)
+
+    def unlock_barometric_psi(self) -> None:
+        """Allow a fresh boot sample after hardware reconnect."""
+        self._barometric_locked = False
+        self._locked_barometric_psi = None
+
     # -------------------------------------------------------------------------
     # Work order management
     # -------------------------------------------------------------------------
@@ -215,11 +228,14 @@ class UIBridge(QObject):
     
     def update_pressure(self, port_id: str, reading: PortReading) -> None:
         """Update pressure display for a port."""
-        baro_value = resolve_barometric_psi(
-            reading,
-            last_value=self._last_barometric_psi.get(port_id),
-        )
-        self._last_barometric_psi[port_id] = baro_value
+        if self._barometric_locked and self._locked_barometric_psi is not None:
+            baro_value = float(self._locked_barometric_psi)
+        else:
+            baro_value = resolve_barometric_psi(
+                reading,
+                last_value=self._last_barometric_psi.get(port_id),
+            )
+            self._last_barometric_psi[port_id] = baro_value
 
         measurement_settings = get_measurement_settings(self.config)
         ui_pressure_abs_psi, _ui_source = select_ui_pressure_abs_psi(
@@ -290,10 +306,9 @@ class UIBridge(QObject):
                 reading.switch.nc_active
             )
         
-        barometric = self._infer_barometric_pressure(reading)
-        if barometric is not None and is_plausible_barometric_psi(barometric):
-            self._last_barometric_psi[port_id] = float(barometric)
-            self.barometric_pressure_updated.emit(port_id, float(barometric))
+        # Boot-locked baro: do not re-emit every poll (avoids atmosphere jitter).
+        if not self._barometric_locked:
+            self.barometric_pressure_updated.emit(port_id, float(baro_value))
 
     def update_debug_dio(self, port_id: str, dio_values: Dict[int, int]) -> None:
         """Update debug DIO readouts for a port."""

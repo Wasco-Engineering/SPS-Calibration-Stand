@@ -7,6 +7,31 @@ from typing import Optional
 from app.services.pressure_domain import to_absolute_pressure
 from app.services.ptp_service import TestSetup, convert_pressure
 
+# Alicat absolute control bottoms out above true 0 PSIA (~2–3 Torr on this stand).
+# Commanding / waiting for 0.0000 hangs NC-derived vacuum cycles.
+_ABS_VACUUM_FLOOR_TORR = 2.5
+_ABS_VACUUM_NEAR_TARGET_TOL_TORR = 3.0
+
+
+def absolute_vacuum_reachable_floor_psi() -> float:
+    """Lowest absolute PSI setpoint expected to be reachable under control."""
+    return float(convert_pressure(_ABS_VACUUM_FLOOR_TORR, 'Torr', 'PSI'))
+
+
+def absolute_vacuum_near_target_tolerance_psi() -> float:
+    """Tolerance when deciding a deep-vacuum descending target was reached."""
+    return float(convert_pressure(_ABS_VACUUM_NEAR_TARGET_TOL_TORR, 'Torr', 'PSI'))
+
+
+def clamp_absolute_vacuum_low_target_psi(low_target_psi: float, band_min_psi: float) -> float:
+    """Raise unreachable absolute lows while staying below the activation band."""
+    floor = absolute_vacuum_reachable_floor_psi()
+    below_band = band_min_psi - float(convert_pressure(1.0, 'Torr', 'PSI'))
+    raised = max(float(low_target_psi), floor)
+    if below_band > floor:
+        return min(raised, below_band)
+    return raised
+
 
 def band_midpoint(band: Optional[dict[str, Optional[float]]]) -> Optional[float]:
     """Return midpoint of a pressure band when both limits exist."""

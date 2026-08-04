@@ -78,6 +78,7 @@ def run_headless_executor(
     pm = PortManager(config)
     pm.initialize_ports()
     pm.connect_all()
+    boot_baro = pm.capture_boot_barometric()
     pm.start_polling()
 
     port = pm.get_port(PortId(port_id))
@@ -114,9 +115,11 @@ def run_headless_executor(
                 last_worker_alicat_s['value'] = now
         return port.read_fast()
 
-    last_baro: dict[str, Optional[float]] = {'value': None}
+    last_baro: dict[str, Optional[float]] = {'value': boot_baro}
 
     def get_baro(_pid: str) -> float:
+        if boot_baro is not None:
+            return float(boot_baro)
         if not transducer_installed:
             port.refresh_alicat()
         reading = port.read_fast()
@@ -288,6 +291,12 @@ def main() -> int:
         help='Override pre-approach multiplier applied to fast cycle rate.',
     )
     parser.add_argument(
+        '--precision-sweep-rate-torr-per-sec',
+        type=float,
+        default=None,
+        help='Override both normal and near-atmosphere precision sweep rates for diagnostics.',
+    )
+    parser.add_argument(
         '--cycles-only',
         action='store_true',
         help='Stop after cycling (skip precision); success requires act+deact cycle estimates.',
@@ -307,6 +316,10 @@ def main() -> int:
         ramp_cfg['fast_cycle_rate_psi_per_sec'] = max(0.1, args.fast_cycle_rate_psi_per_sec)
     if args.pre_approach_rate_multiplier is not None:
         ramp_cfg['pre_approach_rate_multiplier'] = max(1.0, args.pre_approach_rate_multiplier)
+    if args.precision_sweep_rate_torr_per_sec is not None:
+        precision_rate = max(0.1, args.precision_sweep_rate_torr_per_sec)
+        ramp_cfg['precision_sweep_rate_torr_per_sec'] = precision_rate
+        ramp_cfg['low_pressure_precision_sweep_rate_torr_per_sec'] = precision_rate
     setup_logging(config)
 
     runs = [(args.port, args.part, args.sequence)]

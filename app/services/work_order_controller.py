@@ -132,6 +132,8 @@ class WorkOrderController(QObject):
         self._runtime_state = PortRuntimeState.with_defaults()
         self._last_barometric_psi = self._runtime_state.last_barometric_psi
         self._barometric_warning_issued = self._runtime_state.barometric_warning_issued
+        self._boot_barometric_locked = False
+        self._boot_barometric_psi: Optional[float] = None
         self._debug_sweep_lock = threading.Lock()
         self._debug_sweeps_in_progress: set[str] = set()
         self._debug_solenoid_mode = self._runtime_state.debug_solenoid_mode
@@ -587,6 +589,7 @@ class WorkOrderController(QObject):
             'Hardware init: safe idle completed in %.3fs',
             time.perf_counter() - idle_start,
         )
+        self._capture_and_lock_boot_barometric()
 
     def _request_precision_slot(self, port_id: str) -> bool:
         """Grant precision immediately so both ports can sweep concurrently.
@@ -1065,6 +1068,9 @@ class WorkOrderController(QObject):
     
     def _on_barometric_pressure_updated(self, port_id: str, barometric_pressure: float) -> None:
         """Handle barometric pressure update from Alicat - update atmosphere reference."""
+        if self._boot_barometric_locked and self._boot_barometric_psi is not None:
+            # Boot lock wins — ignore live inference creep after connect.
+            return
         self._last_barometric_psi[port_id] = barometric_pressure
         # Use barometric pressure from any port (they should be similar)
         # Update visualization for all ports with the barometric reading
@@ -1288,7 +1294,26 @@ class WorkOrderController(QObject):
             return baro
         return 0.0
 
+    def _capture_and_lock_boot_barometric(self) -> None:
+        """Sample EXH atmosphere once at boot and freeze it for the session."""
+        measured = self._port_manager.capture_boot_barometric()
+        if measured is None or not is_plausible_barometric_psi(measured):
+            logger.warning('Boot barometric lock skipped; no plausible EXH sample')
+            return
+        self._boot_barometric_psi = float(measured)
+        self._boot_barometric_locked = True
+        for port_id in ('port_a', 'port_b'):
+            self._last_barometric_psi[port_id] = float(measured)
+        self._ui_bridge.lock_barometric_psi(float(measured))
+        logger.info(
+            'Session barometric locked at boot: %.4f PSIA (%.1f Torr) — will not re-sample',
+            measured,
+            measured * 51.7149325716,
+        )
+
     def _get_barometric_pressure(self, port_id: str) -> float:
+        if self._boot_barometric_locked and self._boot_barometric_psi is not None:
+            return float(self._boot_barometric_psi)
         reading = self._get_latest_reading(port_id)
         inferred = infer_barometric_pressure(reading)
         last_value = self._last_barometric_psi.get(port_id)
@@ -1316,7 +1341,7 @@ class WorkOrderController(QObject):
         elif (
             inferred is not None
             and is_plausible_barometric_psi(last_value)
-            and abs(float(inferred) - float(last_value)) > 1.0
+            and abs(float(inferred) - float(last_value)) > 0.15
         ):
             logger.warning(
                 '%s: Ignoring barometric jump %.4f -> %.4f PSI; using last good value',
@@ -1581,8 +1606,39 @@ class WorkOrderController(QObject):
         if not self._has_switch_presence(port_id):
             logger.info('%s: Pressurize blocked until switch presence is detected', port_id)
             return
+        # After cancel/vent the prior executor may still be releasing pressure;
+        # wait so pressurize does not fight the leftover vent thread.
+        if not self._wait_for_executor_stopped(port_id):
+            logger.warning('%s: Pressurize blocked — prior executor still running', port_id)
+            return
         if sm.trigger('start_pressurize'):
             self._start_pressurize_hw(port_id)
+
+    def _wait_for_executor_stopped(self, port_id: str, timeout_s: float = 8.0) -> bool:
+        """Cancel any live executor and wait briefly for its thread to exit.
+
+        QAL15 retest after vent/cancel often re-enters cycling while the prior
+        executor is still finishing ``_safe_vent``; starting then left the SM in
+        ``cycling`` with ``Test already running — ignoring duplicate start``.
+        """
+        executor = self._test_executors.get(port_id)
+        if executor is None or not executor.is_running:
+            return True
+        if not executor.cancel_requested:
+            logger.info('%s: Cancelling prior test executor before restart', port_id)
+            executor.request_cancel()
+        deadline = time.perf_counter() + max(0.5, timeout_s)
+        while executor.is_running and time.perf_counter() < deadline:
+            time.sleep(0.05)
+        if executor.is_running:
+            logger.warning(
+                '%s: Prior test executor still running after %.1fs wait',
+                port_id,
+                timeout_s,
+            )
+            return False
+        logger.info('%s: Prior test executor stopped — ready to restart', port_id)
+        return True
 
     def _on_start_test(self, port_id: str) -> None:
         sm = self._state_machines.get(port_id)
@@ -1591,10 +1647,23 @@ class WorkOrderController(QObject):
         if not self._has_switch_presence(port_id):
             logger.info('%s: Test start blocked until switch presence is detected', port_id)
             return
+        if not self._wait_for_executor_stopped(port_id):
+            logger.warning('%s: Test start blocked — prior executor still running', port_id)
+            if self._ui_bridge:
+                self._ui_bridge.show_info_message(
+                    'Test',
+                    (
+                        f'{port_id.upper().replace("_", " ")}: previous test is still '
+                        'stopping (vent). Wait a moment, then press Test again.'
+                    ),
+                )
+            return
         if sm.trigger('start_test'):
             existing = self._test_executors.get(port_id)
             if existing and existing.is_running:
                 logger.warning('%s: Test already running — ignoring duplicate start', port_id)
+                if not sm.trigger('cancel'):
+                    sm.trigger('reset')
                 return
             self._precision_grant_events.pop(port_id, None)
             self._launch_test_executor(port_id)
@@ -1627,7 +1696,12 @@ class WorkOrderController(QObject):
             if sm and not sm.trigger('cancel'):
                 sm.trigger('reset')
             self._release_precision_slot(port_id, reason='cancel')
-            # Executor thread calls _safe_vent(); avoid racing exhaust here.
+            # Do not wait for the executor's next cancellation checkpoint.  A
+            # vacuum pre-approach can be in flight, and the state machine only
+            # records the vent transition; it does not operate the hardware.
+            # Port/Alicat operations are serialized, so this worker safely
+            # follows any in-progress command and releases the line promptly.
+            self._vent_port(port_id)
             return
         sm = self._state_machines.get(port_id)
         if sm:
@@ -1788,6 +1862,19 @@ class WorkOrderController(QObject):
             if _config_bool(trips_on_no_open):
                 return False
         return True
+
+    @staticmethod
+    def _qal15_switch_transition_reached(
+        initial_switch_state: Optional[bool],
+        current_switch_state: Optional[bool],
+        target_switch_state: bool,
+    ) -> bool:
+        """True only when QAL15 pressurize causes a new target-state transition."""
+        return (
+            initial_switch_state is not None
+            and current_switch_state == target_switch_state
+            and current_switch_state != initial_switch_state
+        )
 
     def _resolve_qal15_pressurize_target_psi(
         self,
@@ -2001,7 +2088,6 @@ class WorkOrderController(QObject):
                     sweep_mode,
                 )
                 initial_switch_state: Optional[bool] = None
-                target_switch_since: Optional[float] = None
                 last_pressure_abs_psi = None
                 last_source_used = None
                 while time.perf_counter() - start < timeout:
@@ -2016,19 +2102,14 @@ class WorkOrderController(QObject):
                             initial_switch_state = current_switch_active
                         if (
                             is_qal15
-                            and current_switch_active == target_switch_state
+                            and self._qal15_switch_transition_reached(
+                                initial_switch_state,
+                                current_switch_active,
+                                target_switch_state,
+                            )
                         ):
-                            now = time.perf_counter()
-                            if target_switch_since is None:
-                                target_switch_since = now
-                            elif (
-                                current_switch_active != initial_switch_state
-                                or now - target_switch_since >= 0.20
-                            ):
-                                switch_actuated = True
-                                break
-                        else:
-                            target_switch_since = None
+                            switch_actuated = True
+                            break
                         pressure_abs_psi, _source_used = select_main_pressure_abs_psi(
                             reading=reading,
                             settings=measurement_settings,
@@ -3067,10 +3148,15 @@ class WorkOrderController(QObject):
         self._reset_precision_coordination()
         self._port_manager.stop_polling()
         self._port_manager.disconnect_all()
+        Port.clear_session_gauge_zero_psia()
+        self._boot_barometric_locked = False
+        self._boot_barometric_psi = None
+        self._ui_bridge.unlock_barometric_psi()
         connected = self._port_manager.connect_all(safe_idle_on_connect=False)
         self._port_manager.start_polling()
         self._port_manager.set_alicat_poll_profile(None)
         self._port_manager.safe_idle_connected_ports()
+        self._capture_and_lock_boot_barometric()
         self._refresh_hardware_status()
         level = self._ui_bridge.show_info_message if connected else self._ui_bridge.show_error_message
         level('Admin', 'Hardware reconnect completed.' if connected else 'Hardware reconnect completed with failures.')
