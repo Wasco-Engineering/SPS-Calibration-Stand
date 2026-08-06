@@ -246,6 +246,14 @@ def test_detail_equipment_ids_are_port_specific() -> None:
     assert work_order_controller._detail_equipment_id('CA-SPS-01', 'port_a') == 'CA-SPS-01-L'
     assert work_order_controller._detail_equipment_id('CA-SPS-01', 'port_b') == 'CA-SPS-01-R'
     assert work_order_controller._detail_equipment_id('CA-SPS-01', 'other') == 'CA-SPS-01'
+    assert (
+        work_order_controller._detail_equipment_id('ID-SPS-01', 'port_a', '601126')
+        == 'ID-SPS-01-L-601126'
+    )
+    assert (
+        work_order_controller._detail_equipment_id('ID-SPS-01', 'port_b', '601127')
+        == 'ID-SPS-01-R-601127'
+    )
 
 
 def test_save_result_maps_decreasing_direction_edges_to_database_fields(monkeypatch) -> None:

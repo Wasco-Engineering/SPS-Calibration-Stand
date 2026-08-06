@@ -10,9 +10,10 @@ Provides the primary operator interface with:
 import logging
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional, TYPE_CHECKING, cast, Tuple
 
-from PyQt6.QtCore import Qt, pyqtSlot, QTimer
+from PyQt6.QtCore import QBuffer, QIODevice, Qt, pyqtSlot, QTimer
 from PyQt6.QtGui import QAction, QFont
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -29,8 +30,10 @@ if TYPE_CHECKING:
 from app.ui.login_dialog import LoginDialog
 from app.ui.port_column import PortColumn
 from app.core.config import is_port_installed
+from app.services.bug_report_service import create_bug_report
 from app.ui.styles import STYLES, STATUS_COLORS, status_badge_style, status_tool_button_style
 from app.ui.debug_panel import DebugPortPanel
+from app.ui.bug_report_dialog import BugReportDialog
 from app.services.ptp_service import convert_pressure
 
 
@@ -333,6 +336,10 @@ class MainWindow(QMainWindow):
         for action in self._status_actions.values():
             if action is not None:
                 action.setEnabled(False)
+        menu.addSeparator()
+        report_bug_action = menu.addAction("Report Bug...")
+        report_bug_action.setToolTip("Save a screenshot, logs, and report details")
+        report_bug_action.triggered.connect(self._on_report_bug)
 
         button.setMenu(menu)
         self._update_status_icon()
@@ -904,6 +911,7 @@ class MainWindow(QMainWindow):
         logs_card, logs_layout = self._build_admin_card("Logs")
         logs_layout.addLayout(self._build_admin_action_row([
             ("Open Logs", lambda: self._emit_admin_action("open_logs", {})),
+            ("Open Bug Reports", lambda: self._emit_admin_action("open_bug_reports", {})),
             ("Export Logs", lambda: self._emit_admin_action("export_logs", {})),
         ]))
         self._logs_preview = QTextEdit()
@@ -1144,6 +1152,56 @@ class MainWindow(QMainWindow):
             if self._ui_bridge:
                 self._ui_bridge.close_program_requested.emit()
             self.close()
+
+    @pyqtSlot()
+    def _on_report_bug(self) -> None:
+        """Save an operator bug report with current UI and diagnostic context."""
+        dialog = BugReportDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        description, steps = dialog.values()
+        if not description:
+            self._show_styled_message(
+                title='Report Bug',
+                text='Please enter a description before saving the report.',
+                icon=QMessageBox.Icon.Warning,
+            )
+            return
+
+        screenshot = self.grab()
+        screenshot_bytes = bytes()
+        if not screenshot.isNull():
+            buffer = QBuffer()
+            buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+            screenshot.save(buffer, 'PNG')
+            screenshot_bytes = bytes(buffer.data())
+
+        log_cfg = self.config.get('logging', {})
+        log_dir = Path(log_cfg.get('log_dir', 'logs'))
+        if not log_dir.is_absolute():
+            log_dir = Path(__file__).resolve().parents[2] / log_dir
+        report = create_bug_report(
+            log_dir=log_dir,
+            description=description,
+            steps=steps,
+            screenshot_bytes=screenshot_bytes,
+            repo_root=Path(__file__).resolve().parents[2],
+            context={
+                'equipment_id': self.config.get('test_parameters', {}).get('equipment_id'),
+                'hostname': self.config.get('app', {}).get('hostname'),
+                'operator': self._lbl_operator.text(),
+                'shop_order': self._lbl_shop_order.text(),
+                'part': self._lbl_part.text(),
+                'sequence': self._lbl_sequence.text(),
+                'last_error': self._status_data.get('last_error'),
+            },
+        )
+        self._show_styled_message(
+            title='Report Bug',
+            text=f'Bug report saved to:\n{report.report_dir}',
+            icon=QMessageBox.Icon.Information,
+        )
     
     # -------------------------------------------------------------------------
     # Public interface for controller

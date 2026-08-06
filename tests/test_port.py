@@ -93,12 +93,14 @@ class _FakeAlicatController:
         self.cancel_hold_calls = 0
         self.disconnect_calls = 0
         self.set_pressure_calls: list[float] = []
+        self.read_status_calls = 0
 
     def connect(self) -> bool:
         self.connected = True
         return True
 
     def read_status(self) -> AlicatReading:
+        self.read_status_calls += 1
         return self.next_reading
 
     def set_pressure(self, setpoint: float) -> bool:
@@ -160,6 +162,62 @@ def _make_port(
         alicat_config={'address': 'A'},
         solenoid_config=solenoid_cfg or {},
     )
+
+
+def test_published_alicat_snapshot_drives_fast_reading(monkeypatch: Any) -> None:
+    """UI/test consumers use a poller-published reading without serial I/O."""
+    port = _make_port(monkeypatch)
+    alicat = port.alicat
+    assert isinstance(alicat, _FakeAlicatController)
+    alicat.next_reading = AlicatReading(
+        pressure=9.5,
+        setpoint=10.0,
+        timestamp=1.0,
+        raw_response='A +009.50 +010.00 EXH',
+    )
+
+    assert port.refresh_alicat() is True
+    snapshot = port.get_alicat_snapshot()
+    assert snapshot is not None
+    assert snapshot.generation == 1
+    assert port.read_fast().alicat is snapshot.reading
+    assert port._alicat_in_exhaust_mode() is True
+
+
+def test_publishing_alicat_readings_advances_snapshot_generation(monkeypatch: Any) -> None:
+    port = _make_port(monkeypatch)
+    first = AlicatReading(pressure=10.0, setpoint=10.0, timestamp=1.0)
+    second = AlicatReading(pressure=11.0, setpoint=11.0, timestamp=2.0)
+
+    port.publish_alicat_reading(first)
+    first_snapshot = port.get_alicat_snapshot()
+    port.publish_alicat_reading(second)
+    second_snapshot = port.get_alicat_snapshot()
+
+    assert first_snapshot is not None
+    assert second_snapshot is not None
+    assert second_snapshot.generation == first_snapshot.generation + 1
+    assert port.read_fast().alicat is second
+
+
+def test_cached_mode_checks_and_full_read_do_not_query_alicat(monkeypatch: Any) -> None:
+    """Transitions consume the poller snapshot instead of a competing status read."""
+    port = _make_port(monkeypatch)
+    alicat = port.alicat
+    assert isinstance(alicat, _FakeAlicatController)
+    cached = AlicatReading(
+        pressure=12.0,
+        setpoint=12.0,
+        timestamp=1.0,
+        raw_response='A +012.00 +012.00 HLD EXH',
+    )
+    port.publish_alicat_reading(cached)
+    calls_before = alicat.read_status_calls
+
+    assert port.read_all().alicat is cached
+    assert port._alicat_in_exhaust_mode() is True
+    assert port._alicat_in_hold_mode() is True
+    assert alicat.read_status_calls == calls_before
 
 
 def test_configure_from_ptp_maps_terminal_pins(monkeypatch: Any) -> None:
@@ -757,8 +815,8 @@ def test_vent_to_atmosphere_skips_when_already_at_atmospheric_idle(monkeypatch: 
     assert daq.solenoid_calls == []
 
 
-def test_vent_to_atmosphere_skips_idaho_open_fitting_hold(monkeypatch: Any) -> None:
-    """Open fittings at altitude: P~13.5 HLD should not trigger bleed to 14.7."""
+def test_vent_to_atmosphere_skips_idaho_open_fitting_atmosphere(monkeypatch: Any) -> None:
+    """Open fittings already at local atmosphere do not need an EXH command."""
     port = _make_port(monkeypatch)
     alicat = port.alicat
     assert isinstance(alicat, _FakeAlicatController)
@@ -766,7 +824,7 @@ def test_vent_to_atmosphere_skips_idaho_open_fitting_hold(monkeypatch: Any) -> N
         pressure=13.476,
         setpoint=14.7,
         timestamp=1.0,
-        gauge_pressure=-1.22,
+        gauge_pressure=0.0,
         raw_response='A +013.48 +014.70 HLD',
     )
     daq = port.daq
@@ -776,6 +834,7 @@ def test_vent_to_atmosphere_skips_idaho_open_fitting_hold(monkeypatch: Any) -> N
     assert alicat.hold_calls == 0
     assert alicat.cancel_hold_calls == 0
     assert daq.solenoid_calls == []
+    assert alicat.exhaust_calls == 0
 
 
 def test_is_at_atmospheric_idle_accepts_exh_near_baro(monkeypatch: Any) -> None:
@@ -809,6 +868,7 @@ def test_ensure_exhaust_idle_enables_exh_from_hold(monkeypatch: Any) -> None:
     )
     assert port.ensure_exhaust_idle() is True
     assert alicat.exhaust_calls >= 1
+    assert port.refresh_alicat() is True
     assert port._alicat_in_exhaust_mode() is True
     assert alicat.set_pressure_calls == []
 
@@ -827,8 +887,8 @@ def test_is_at_atmospheric_idle_rejects_vacuum_hold(monkeypatch: Any) -> None:
     assert port.is_at_atmospheric_idle(14.7) is False
 
 
-def test_vent_to_atmosphere_reduces_low_gauge_positive_pressure(monkeypatch: Any) -> None:
-    """Low mmHg tests can sit ~0.8 PSIG above baro while abs still looks idle."""
+def test_vent_to_atmosphere_exhausts_low_gauge_positive_pressure(monkeypatch: Any) -> None:
+    """Low mmHg tests above baro are released through EXH."""
     port = _make_port(monkeypatch)
     alicat = port.alicat
     assert isinstance(alicat, _FakeAlicatController)
@@ -860,12 +920,12 @@ def test_vent_to_atmosphere_reduces_low_gauge_positive_pressure(monkeypatch: Any
 
     assert port.is_at_atmospheric_idle(14.6) is True
     assert port.vent_to_atmosphere() is True
-    assert alicat.exhaust_calls == 0
-    assert alicat.set_pressure_calls
+    assert alicat.exhaust_calls == 1
+    assert alicat.set_pressure_calls == []
 
 
-def test_vent_to_atmosphere_reduces_positive_test_pressure(monkeypatch: Any) -> None:
-    """A completed positive-pressure test must not be locked at its test pressure."""
+def test_vent_to_atmosphere_exhausts_positive_test_pressure(monkeypatch: Any) -> None:
+    """A completed positive-pressure test is released through EXH."""
     port = _make_port(monkeypatch)
     alicat = port.alicat
     assert isinstance(alicat, _FakeAlicatController)
@@ -894,8 +954,8 @@ def test_vent_to_atmosphere_reduces_positive_test_pressure(monkeypatch: Any) -> 
     port.read_all = _next_reading  # type: ignore[method-assign]
 
     assert port.vent_to_atmosphere() is True
-    assert alicat.exhaust_calls == 0
-    assert alicat.set_pressure_calls
+    assert alicat.exhaust_calls == 1
+    assert alicat.set_pressure_calls == []
 
 
 def test_vent_to_atmosphere_prefers_session_gauge_zero_over_alicat_baro(
@@ -1083,6 +1143,7 @@ def test_sample_barometric_locks_session_gauge_zero(monkeypatch: Any) -> None:
         raw_response='A +014.60 +014.60 EXH',
     )
     alicat.next_reading = atm
+    port.publish_alicat_reading(atm)
     port.read_all = lambda: PortReading(alicat=atm, timestamp=1.0)  # type: ignore[method-assign]
     measured = port._sample_barometric_via_exhaust(timeout_s=2.0)
     assert measured == pytest.approx(14.60)

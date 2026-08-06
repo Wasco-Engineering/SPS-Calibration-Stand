@@ -37,6 +37,14 @@ class PortReading:
     timestamp: float = 0.0
 
 
+@dataclass(frozen=True)
+class AlicatSnapshot:
+    """Thread-safe status sample published by the dedicated Alicat poller."""
+    reading: AlicatReading
+    captured_monotonic_s: float
+    generation: int
+
+
 @dataclass
 class EdgeEvent:
     """Record of a switch edge detection."""
@@ -82,8 +90,10 @@ class Port:
         self._edge_history: List[EdgeEvent] = []
         self._edge_callbacks: List[Callable[[EdgeEvent], None]] = []
 
-        # Cached Alicat reading for fast polling (updated every Nth cycle)
+        # Alicat status is owned by PortManager's background poller. All other
+        # paths consume this immutable snapshot and must not issue status reads.
         self._cached_alicat: Optional[AlicatReading] = None
+        self._alicat_snapshot: Optional[AlicatSnapshot] = None
         self._cached_alicat_lock = threading.Lock()
 
         # Current test context
@@ -198,22 +208,54 @@ class Port:
         return success
     
     def read_all(self) -> PortReading:
-        """Read all sensors for this port."""
-        return self._read(use_cached_alicat=False)
+        """Read all sensors using the latest poller-owned Alicat snapshot."""
+        return self._read(use_cached_alicat=True)
     
     def refresh_alicat(self) -> bool:
-        """Update the cached Alicat reading (slow serial I/O)."""
+        """Poll and publish Alicat status; called only by PortManager's owner."""
         reading = self.alicat.read_status()
         if reading is None:
             return False
+        self.publish_alicat_reading(reading)
+        return True
+
+    def publish_alicat_reading(self, reading: AlicatReading) -> None:
+        """Publish one poller-owned Alicat reading for every consumer."""
         with self._cached_alicat_lock:
             self._cached_alicat = reading
-        return True
+            prior = self._alicat_snapshot
+            self._alicat_snapshot = AlicatSnapshot(
+                reading=reading,
+                captured_monotonic_s=time.monotonic(),
+                generation=(prior.generation + 1) if prior else 1,
+            )
 
     def get_cached_alicat(self) -> Optional[AlicatReading]:
         """Return the most recent complete Alicat status reading."""
         with self._cached_alicat_lock:
             return self._cached_alicat
+
+    def get_alicat_snapshot(self) -> Optional[AlicatSnapshot]:
+        """Return the latest immutable Alicat status snapshot without serial I/O."""
+        with self._cached_alicat_lock:
+            return self._alicat_snapshot
+
+    def _wait_for_alicat_snapshot_after(
+        self,
+        generation: Optional[int],
+        *,
+        timeout_s: float = 0.35,
+    ) -> Optional[AlicatSnapshot]:
+        """Wait briefly for the poller to publish status after a command."""
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while time.monotonic() <= deadline:
+            snapshot = self.get_alicat_snapshot()
+            if snapshot is not None and (
+                generation is None or snapshot.generation > generation
+            ):
+                return snapshot
+            time.sleep(0.01)
+        return self.get_alicat_snapshot()
 
     def read_fast(self) -> PortReading:
         """Read LabJack-only sensors (fast path) using cached Alicat.
@@ -233,10 +275,13 @@ class Port:
 
     def _read(self, use_cached_alicat: bool, include_dio: bool = True) -> PortReading:
         """Shared read path used by full, fast, and precision reads."""
-        import time
-
         timestamp = time.time()
-        alicat_reading = self.get_cached_alicat() if use_cached_alicat else self.alicat.read_status()
+        alicat_reading = self.get_cached_alicat()
+        if alicat_reading is None:
+            # Startup-only fallback. Once PortManager starts its owner poller,
+            # this branch is never taken and foreground paths remain serial-free.
+            self.refresh_alicat()
+            alicat_reading = self.get_cached_alicat()
 
         reading = PortReading(
             transducer=self.daq.read_transducer() if self._transducer_installed else None,
@@ -320,7 +365,7 @@ class Port:
                     barometric = float(reading.alicat.barometric_pressure)
                 return pressure, barometric
 
-        alicat_reading = self.alicat.read_status() or self.get_cached_alicat()
+        alicat_reading = self.get_cached_alicat()
         barometric = _ATMOSPHERE_PSI
         if alicat_reading and alicat_reading.barometric_pressure is not None:
             barometric = float(alicat_reading.barometric_pressure)
@@ -369,6 +414,10 @@ class Port:
     
     def set_pressure(self, setpoint: float) -> bool:
         """Exit EXH/hold and set the Alicat pressure setpoint."""
+        previous_snapshot = self.get_alicat_snapshot()
+        previous_generation = (
+            previous_snapshot.generation if previous_snapshot is not None else None
+        )
         combined = getattr(self.alicat, 'resume_and_set_pressure', None)
         if callable(combined):
             ok = bool(combined(setpoint))
@@ -380,8 +429,9 @@ class Port:
         if not ok:
             return False
         # Vent leaves EXH active; a single C+S sometimes ACKs while EXH remains.
-        # Re-assert control so vacuum-route ramps actually move the line.
-        if self._alicat_in_exhaust_mode():
+        # Wait for the poller rather than inspecting a stale pre-command cache.
+        snapshot = self._wait_for_alicat_snapshot_after(previous_generation)
+        if snapshot is not None and 'EXH' in (snapshot.reading.raw_response or '').upper():
             logger.warning(
                 '%s: Alicat still EXH after setpoint %.3f — forcing control mode',
                 self.port_id.value,
@@ -631,13 +681,13 @@ class Port:
         return abs(current - barometric_psia) <= tolerance_psi
 
     def _alicat_in_exhaust_mode(self) -> bool:
-        reading = self.alicat.read_status()
+        reading = self.get_cached_alicat()
         if reading is None or not reading.raw_response:
             return False
         return 'EXH' in reading.raw_response.upper()
 
     def _alicat_in_hold_mode(self) -> bool:
-        reading = self.alicat.read_status()
+        reading = self.get_cached_alicat()
         if reading is None or not reading.raw_response:
             return False
         return 'HLD' in reading.raw_response.upper()
@@ -1032,7 +1082,7 @@ class Port:
         bleed_installed_dut: bool = True,
         timeout_s: float = _IDLE_BLEED_TIMEOUT_S,
     ) -> bool:
-        """Return the DUT line to atmospheric idle."""
+        """Vent a non-atmospheric DUT line through the atmosphere route using EXH."""
         barometric_psia = _ATMOSPHERE_PSI
         try:
             barometric_psia = self._infer_barometric_psia()
@@ -1041,60 +1091,16 @@ class Port:
 
         reading = self.read_all()
         if self._is_released_to_atmosphere(reading, barometric_psia):
-            if self.is_at_atmospheric_idle(barometric_psia) or self._alicat_in_hold_mode():
-                return True
-            if not self._engage_atmosphere_route(context='vent'):
-                return False
-            return self._lock_idle_at_atmosphere(
-                barometric_psia,
-                command_pressure=False,
-            )
-        if self._alicat_in_hold_mode() and self.is_at_atmospheric_idle(barometric_psia):
             return True
 
         if not self._engage_atmosphere_route(context='vent'):
             return False
 
-        gauge_psi = self._gauge_pressure_psi(reading, barometric_psia=barometric_psia)
-        if gauge_psi is not None and gauge_psi > _RELEASE_GAUGE_TOLERANCE_PSI:
-            return self._release_to_atmosphere_via_setpoint(
-                barometric_psia,
-                timeout_s=timeout_s,
-                route_engaged=True,
-            )
-
-        current = self._alicat_abs_psia(reading, barometric_psia)
-        if self._open_fitting_line() or (
-            current is not None
-            and current < barometric_psia - _RELEASE_GAUGE_TOLERANCE_PSI
-        ):
-            return self._complete_exhaust_vent(
-                barometric_psia,
-                timeout_s=timeout_s,
-                route_engaged=True,
-            )
-
-        if self._alicat_in_exhaust_mode():
-            self._exit_alicat_exhaust(barometric_psia)
-            return self._lock_idle_at_atmosphere(
-                barometric_psia,
-                command_pressure=False,
-            )
-
-        if bleed_installed_dut:
-            try:
-                self._bleed_line_to_atmosphere(
-                    barometric_psia=barometric_psia,
-                    timeout_s=timeout_s,
-                )
-            except Exception as exc:
-                logger.warning(
-                    '%s: Atmosphere bleed failed (continuing to idle lock): %s',
-                    self.port_id.value,
-                    exc,
-                )
-
-        return self._lock_idle_at_atmosphere(barometric_psia)
+        return self._complete_exhaust_vent(
+            barometric_psia,
+            timeout_s=timeout_s,
+            route_engaged=True,
+        )
 
     def _vent_to_atmosphere_via_exhaust(
         self,
@@ -1226,7 +1232,7 @@ class PortManager:
         )
         self._poll_interval_ms_precision = int(timing_cfg.get('hardware_poll_interval_ms_precision', 0))
         self._alicat_background_enabled = bool(
-            timing_cfg.get('alicat_background_polling_enabled', False)
+            timing_cfg.get('alicat_background_polling_enabled', True)
         )
         self._alicat_background_hz = max(
             1.0, float(timing_cfg.get('alicat_background_poll_hz', 120.0))

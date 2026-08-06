@@ -55,6 +55,7 @@ from app.services.sweep_utils import (
 from app.services.test_executor import TestExecutor
 from app.services.test_protocol import TestEvent
 from app.services.admin_action_service import AdminActionService
+from app.services.bug_report_service import bug_reports_dir
 from app.services.debug_action_service import DebugActionService
 from app.services.port_runtime_state import PortRuntimeState
 from app.services.ui_bridge import UIBridge
@@ -75,14 +76,20 @@ from app.services.pressure_domain import (
 logger = logging.getLogger(__name__)
 
 
-def _detail_equipment_id(base_equipment_id: str, port_id: str) -> str:
-    """Return the database EquipmentID that identifies the physical test side."""
+def _detail_equipment_id(
+    base_equipment_id: str,
+    port_id: str,
+    alicat_serial: Optional[str] = None,
+) -> str:
+    """Return the database EquipmentID for a physical side and Alicat."""
     suffixes = {
         PortId.PORT_A.value: 'L',
         PortId.PORT_B.value: 'R',
     }
     suffix = suffixes.get(str(port_id))
-    return f'{base_equipment_id}-{suffix}' if suffix else base_equipment_id
+    detail_id = f'{base_equipment_id}-{suffix}' if suffix else base_equipment_id
+    serial = str(alicat_serial or '').strip()
+    return f'{detail_id}-{serial}' if serial and suffix else detail_id
 
 
 def _config_bool(value: Any, default: bool = False) -> bool:
@@ -141,8 +148,6 @@ class WorkOrderController(QObject):
         self._debug_solenoid_last_route = self._runtime_state.debug_solenoid_last_route
         self._hw_serial_busy_ports: set[str] = set()
         self._hw_action_cancel: Dict[str, threading.Event] = {}
-        self._last_worker_alicat_refresh_s: Dict[str, float] = {}
-        self._worker_alicat_refresh_interval_s = 0.05
         solenoid_cfg = self._config.get("hardware", {}).get("solenoid", {})
         self._auto_vacuum_threshold_psi = float(
             solenoid_cfg.get("safe_vacuum_switch_threshold_psi", 2.0)
@@ -250,6 +255,7 @@ class WorkOrderController(QObject):
             on_reconnect_hardware=self._reconnect_hardware,
             on_reconnect_database=self._reconnect_database,
             on_open_logs=self._open_logs,
+            on_open_bug_reports=self._open_bug_reports,
             on_export_logs=self._export_logs,
             on_export_history=self._export_history,
             on_safety_override=self._safety_override,
@@ -1136,36 +1142,25 @@ class WorkOrderController(QObject):
     def _get_latest_reading(self, port_id: str) -> Optional[PortReading]:
         """Return a reading for test/edge logic.
 
-        While a test runs, read LabJack sensors on the caller thread instead of
-        the GUI poll cache. Cached snapshots can carry a stale Alicat value when
-        polls are LabJack-only, which makes ramps appear finished instantly.
+        While a test runs, read LabJack sensors on the caller thread and pair
+        them with the Alicat poller's immutable cache snapshot. The executor
+        must not compete with the poller for shared-COM status reads.
         """
         executor = self._test_executors.get(port_id)
         if executor and executor.is_running:
-            return self._read_live_hardware(port_id, refresh_alicat=True)
+            return self._read_live_hardware(port_id)
         with self._latest_readings_lock:
             return self._latest_readings.get(port_id)
 
     def _read_live_hardware(
         self,
         port_id: str,
-        *,
-        refresh_alicat: bool = True,
     ) -> Optional[PortReading]:
-        """Live LabJack (+ optional Alicat) read; publish to UI cache."""
+        """Live LabJack read paired with the Alicat poller cache."""
         port = self._port_manager.get_port(port_id)
         if port is None:
             return None
         try:
-            if refresh_alicat:
-                if port_id in self._hw_serial_busy_ports or (
-                    self._test_executors.get(port_id)
-                    and self._test_executors[port_id].is_running
-                ):
-                    # Worker already owns serial — refresh directly.
-                    self._refresh_alicat_for_worker_if_due(port_id, port)
-                else:
-                    self._refresh_alicat_for_worker_if_due(port_id, port)
             if is_transducer_installed(self._config, port_id):
                 reading = port.read_precision_fast()
             else:
@@ -1177,19 +1172,6 @@ class WorkOrderController(QObject):
             logger.warning('%s: Live hardware read failed: %s', port_id, exc)
             with self._latest_readings_lock:
                 return self._latest_readings.get(port_id)
-
-    def _refresh_alicat_for_worker_if_due(self, port_id: str, port: Any) -> None:
-        """Refresh cached Alicat pressure from the worker during live tests.
-
-        Preferred-source ``auto`` still uses Alicat above the handoff threshold, so
-        always keep the cache fresh while a test owns the port.
-        """
-        now = time.perf_counter()
-        last = self._last_worker_alicat_refresh_s.get(port_id, 0.0)
-        if now - last < self._worker_alicat_refresh_interval_s:
-            return
-        self._last_worker_alicat_refresh_s[port_id] = now
-        port.refresh_alicat()
 
     def _start_find_setpoint(self, port_id: str, payload: Dict[str, Any]) -> None:
         with self._debug_sweep_lock:
@@ -2154,8 +2136,7 @@ class WorkOrderController(QObject):
                     if cancel.is_set():
                         logger.info('%s: Pressurize cancelled during ramp', port_id)
                         return
-                    # Live Alicat read — cache is stale while this worker owns serial.
-                    reading = self._read_live_hardware(port_id, refresh_alicat=True)
+                    reading = self._read_live_hardware(port_id)
                     if reading is not None:
                         current_switch_active = self._switch_is_activated(reading)
                         if initial_switch_state is None:
@@ -2982,7 +2963,30 @@ class WorkOrderController(QObject):
             test_params.get('equipment_id'),
             DEFAULT_EQUIPMENT_ID,
         )
-        equipment_id = _detail_equipment_id(master_equipment_id, port_id)
+        port_manager = self.__dict__.get('_port_manager')
+        port = port_manager.get_port(port_id) if port_manager is not None else None
+        alicat_serial = port.alicat.serial_number if port is not None else None
+        if port_manager is not None and not alicat_serial:
+            logger.error('%s: Cannot save result without attached Alicat serial number', port_id)
+            return _finish(
+                'failed',
+                activity_status='Alicat serial unavailable',
+                last_write='Blocked',
+                queue=str(get_local_queue_count()),
+            )
+        equipment_id = _detail_equipment_id(master_equipment_id, port_id, alicat_serial)
+        if len(equipment_id) > 20:
+            logger.error(
+                '%s: Alicat-qualified EquipmentID %r exceeds database limit of 20 characters',
+                port_id,
+                equipment_id,
+            )
+            return _finish(
+                'failed',
+                activity_status='Alicat EquipmentID too long',
+                last_write='Blocked',
+                queue=str(get_local_queue_count()),
+            )
         try:
             temperature_c = float(test_params.get('default_temperature_c', 25.0))
         except (TypeError, ValueError):
@@ -3247,6 +3251,15 @@ class WorkOrderController(QObject):
         except Exception:
             logger.info('Log directory: %s', log_dir)
         self._ui_bridge.show_info_message('Admin', f'Log directory: {log_dir}')
+
+    def _open_bug_reports(self) -> None:
+        report_dir = bug_reports_dir(self._log_dir())
+        report_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(report_dir))  # type: ignore[attr-defined]
+        except Exception:
+            logger.info('Bug report directory: %s', report_dir)
+        self._ui_bridge.show_info_message('Admin', f'Bug report directory: {report_dir}')
 
     def _export_logs(self) -> None:
         log_dir = self._log_dir()
