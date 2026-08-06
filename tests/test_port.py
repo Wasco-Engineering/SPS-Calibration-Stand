@@ -961,7 +961,7 @@ def test_vent_to_atmosphere_exhausts_positive_test_pressure(monkeypatch: Any) ->
 def test_vent_to_atmosphere_prefers_session_gauge_zero_over_alicat_baro(
     monkeypatch: Any,
 ) -> None:
-    """Vent must target boot P0, not Alicat's sea-level 14.7 baro field.
+    """Vent must use boot P0, not Alicat's sea-level 14.7 baro field.
 
     Otherwise gauge mmHg parts idle ~5-8 mmHg above true atmosphere.
     """
@@ -985,7 +985,7 @@ def test_vent_to_atmosphere_prefers_session_gauge_zero_over_alicat_baro(
             timestamp=2.0,
             gauge_pressure=0.0,
             barometric_pressure=14.7,
-            raw_response='A +014.61 +014.61',
+            raw_response='A +014.61 +014.61 EXH',
         )
         readings = [pressurized] * 4 + [atmosphere]
         state = {'index': 0}
@@ -997,10 +997,9 @@ def test_vent_to_atmosphere_prefers_session_gauge_zero_over_alicat_baro(
 
         port.read_all = _next_reading  # type: ignore[method-assign]
 
+        assert port._infer_barometric_psia() == pytest.approx(14.61)
         assert port.vent_to_atmosphere() is True
-        assert alicat.set_pressure_calls
-        assert any(abs(call - 14.61) < 0.01 for call in alicat.set_pressure_calls)
-        assert not any(abs(call - 14.7) < 0.01 for call in alicat.set_pressure_calls)
+        assert alicat.exhaust_calls >= 1
     finally:
         Port.clear_session_gauge_zero_psia()
 
