@@ -326,11 +326,12 @@ def test_ptp_spst_fallback_reads_connected_throw(monkeypatch: Any) -> None:
     assert ok
     daq = port.daq
     assert isinstance(daq, _FakeLabJackController)
-    assert daq.configure_di_calls[-1] == (1, 1, 0, 0)
+    # Drive NO pin 2 (DIO1), read PTP COM pin 1 (DIO0).
+    assert daq.configure_di_calls[-1] == (0, 0, 1, 0)
     assert daq.switch_nc_derived_from_no
     assert not daq.switch_no_derived_from_nc
     assert port.last_switch_resolution is not None
-    assert port.last_switch_resolution.derivation_mode == 'derive_nc_from_no'
+    assert port.last_switch_resolution.derivation_mode == 'drive_no_read_common'
 
 
 def test_ptp_invalid_terminal_fails_without_configured_pin_fallback(monkeypatch: Any) -> None:
@@ -895,6 +896,53 @@ def test_vent_to_atmosphere_reduces_positive_test_pressure(monkeypatch: Any) -> 
     assert port.vent_to_atmosphere() is True
     assert alicat.exhaust_calls == 0
     assert alicat.set_pressure_calls
+
+
+def test_vent_to_atmosphere_prefers_session_gauge_zero_over_alicat_baro(
+    monkeypatch: Any,
+) -> None:
+    """Vent must target boot P0, not Alicat's sea-level 14.7 baro field.
+
+    Otherwise gauge mmHg parts idle ~5-8 mmHg above true atmosphere.
+    """
+    Port.clear_session_gauge_zero_psia()
+    Port.set_session_gauge_zero_psia(14.61)
+    try:
+        port = _make_port(monkeypatch)
+        alicat = port.alicat
+        assert isinstance(alicat, _FakeAlicatController)
+        pressurized = AlicatReading(
+            pressure=15.5,
+            setpoint=15.5,
+            timestamp=1.0,
+            gauge_pressure=0.8,
+            barometric_pressure=14.7,
+            raw_response='A +015.50 +015.50',
+        )
+        atmosphere = AlicatReading(
+            pressure=14.61,
+            setpoint=14.61,
+            timestamp=2.0,
+            gauge_pressure=0.0,
+            barometric_pressure=14.7,
+            raw_response='A +014.61 +014.61',
+        )
+        readings = [pressurized] * 4 + [atmosphere]
+        state = {'index': 0}
+
+        def _next_reading() -> PortReading:
+            reading = readings[min(state['index'], len(readings) - 1)]
+            state['index'] += 1
+            return PortReading(alicat=reading, timestamp=reading.timestamp)
+
+        port.read_all = _next_reading  # type: ignore[method-assign]
+
+        assert port.vent_to_atmosphere() is True
+        assert alicat.set_pressure_calls
+        assert any(abs(call - 14.61) < 0.01 for call in alicat.set_pressure_calls)
+        assert not any(abs(call - 14.7) < 0.01 for call in alicat.set_pressure_calls)
+    finally:
+        Port.clear_session_gauge_zero_psia()
 
 
 def test_disconnect_restores_atmosphere_control(monkeypatch: Any) -> None:

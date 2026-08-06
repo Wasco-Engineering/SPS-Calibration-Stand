@@ -16,6 +16,8 @@ class PortRuntimeState:
     current_measured_values: Dict[str, Dict[str, Optional[float]]] = field(default_factory=dict)
     switch_presence: Dict[str, bool] = field(default_factory=dict)
     manual_switch_latched: Dict[str, bool] = field(default_factory=dict)
+    manual_switch_last_activated: Dict[str, Optional[bool]] = field(default_factory=dict)
+    switch_transition_seen: Dict[str, bool] = field(default_factory=dict)
     debug_solenoid_mode: Dict[str, str] = field(default_factory=dict)
     debug_alicat_mode: Dict[str, str] = field(default_factory=dict)
     debug_solenoid_last_route: Dict[str, Optional[bool]] = field(default_factory=dict)
@@ -38,6 +40,8 @@ class PortRuntimeState:
             },
             switch_presence={pid: False for pid in ports},
             manual_switch_latched={pid: False for pid in ports},
+            manual_switch_last_activated={pid: None for pid in ports},
+            switch_transition_seen={pid: False for pid in ports},
             debug_solenoid_mode={pid: 'atmosphere' for pid in ports},
             debug_alicat_mode={pid: 'pressurize' for pid in ports},
             debug_solenoid_last_route={pid: None for pid in ports},

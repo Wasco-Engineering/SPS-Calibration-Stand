@@ -18,8 +18,13 @@ hardware:
       transducer_reference: absolute
       port_installed: true
       transducer_installed: false
+      # Pin 3 = legacy single-sense; 1/6 carry SPST COM/NC edges (e.g. SPS01999-02).
       switch_sensed_db9_pins:
+      - 1
       - 3
+      - 6
+      # SPST parts whose PTP throw is not pin 3: read stand sense pin, drive PTP throw.
+      switch_spst_read_source: adapter_common
       vacuum_switch_trips_on_no_open: false
       switch_com_state: 0
       switch_active_low: true
@@ -102,8 +107,13 @@ hardware:
       transducer_pressure_min: 0.0
       transducer_pressure_max: 30.0
       transducer_reference: absolute
+      # Pin 3 = legacy single-sense; 1/6 carry SPST COM/NC edges (e.g. SPS01999-02).
       switch_sensed_db9_pins:
+      - 1
       - 3
+      - 6
+      # SPST parts whose PTP throw is not pin 3: read stand sense pin, drive PTP throw.
+      switch_spst_read_source: adapter_common
       vacuum_switch_trips_on_no_open: false
       switch_com_state: 0
       switch_active_low: true

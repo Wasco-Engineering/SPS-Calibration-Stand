@@ -1567,6 +1567,82 @@ def test_pressure_decreasing_derive_nc_from_no_inverts_cycle_targets() -> None:
     assert executor._cycle_target_switch_state('deactivation') is True
 
 
+def test_pressure_decreasing_derive_no_from_nc_inverts_cycle_targets() -> None:
+    """SPS01804-02 adapter_common NC drive: same high-P reset polarity as NC-from-NO."""
+    port = _FakePort([True])
+    port.daq = SimpleNamespace(
+        switch_nc_derived_from_no=False,
+        switch_no_derived_from_nc=True,
+    )
+    executor = _build_executor(port)
+    executor._resolve_sweep_mode = lambda: 'pressure'  # type: ignore[method-assign]
+    executor._resolve_activation_sweep_direction = lambda: -1  # type: ignore[method-assign]
+
+    assert executor._uses_single_sense_switch_derivation() is True
+    assert executor._cycle_target_switch_state('activation') is False
+    assert executor._cycle_target_switch_state('deactivation') is True
+
+
+def test_decreasing_pressure_prep_does_not_confirm_on_hysteresis_lag_alone() -> None:
+    """Prep must not confirm while switch stays on the wrong side of the edge."""
+    port = _FakePort([True])
+    port.daq = SimpleNamespace(
+        switch_nc_derived_from_no=False,
+        switch_no_derived_from_nc=True,
+    )
+    setup = TestSetup(
+        part_id='SPS01804-02',
+        sequence_id='300',
+        units_code='19',
+        units_label='mmHg @ 0 C',
+        activation_direction='Decreasing',
+        activation_target=15.0,
+        pressure_reference='gauge',
+        terminals={},
+        bands={
+            'increasing': {'lower': float('-inf'), 'upper': 30.0},
+            'decreasing': {'lower': 12.5, 'upper': 17.5},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    min_psi = convert_pressure(12.5, 'mmHg @ 0 C', 'PSI')
+    max_psi = convert_pressure(17.5, 'mmHg @ 0 C', 'PSI')
+    # Wrong post-edge state for inverted targets: activation wants False, so
+    # prep wants True. Keep switch False so prep cannot confirm.
+    states = iter(
+        [
+            (0.40, False),
+            (1.04, False),
+            (1.04, False),
+            (1.04, False),
+        ]
+    )
+    executor = _TestExecutor(
+        port_id='port_b',
+        port=cast(Any, port),
+        test_setup=setup,
+        config={'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}}},
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.61,
+    )
+    executor._read_pressure_and_switch_state = lambda: next(states, (1.04, False))  # type: ignore[method-assign]
+    executor._edge_timeout_s = 0.05
+
+    executor._prepare_switch_for_cycle_edge(
+        sweep_mode='pressure',
+        min_psi=min_psi,
+        max_psi=max_psi,
+        direction=-1,
+        edge_type='activation',
+        overshoot=0.15,
+        hw_min_psi=-14.61,
+        hw_max_psi=15.39,
+    )
+
+    assert executor._cycle_prep_confirmed is False
+
+
 def test_vacuum_increasing_pre_approach_starts_on_low_reset_side() -> None:
     setup = TestSetup(
         part_id='SPS02305-02',

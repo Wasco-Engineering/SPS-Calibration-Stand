@@ -539,6 +539,17 @@ class Port:
         return None
 
     def _infer_barometric_psia(self, reading: Optional[PortReading] = None) -> float:
+        from app.services.pressure_domain import (
+            infer_barometric_pressure_from_alicat,
+            is_plausible_barometric_psi,
+        )
+
+        # Prefer boot-locked session P0 so vent/release targets true local atm
+        # (not Alicat's sea-level 14.7 baro field or a leftover 14.7 setpoint).
+        session_p0 = Port.get_session_gauge_zero_psia()
+        if session_p0 is not None and is_plausible_barometric_psi(session_p0):
+            return float(session_p0)
+
         local_default = self._configured_barometric_psia()
         if reading is None:
             try:
@@ -549,10 +560,6 @@ class Port:
             return local_default
         if reading.alicat.barometric_pressure is not None:
             return float(reading.alicat.barometric_pressure)
-        from app.services.pressure_domain import (
-            infer_barometric_pressure_from_alicat,
-            is_plausible_barometric_psi,
-        )
         inferred = infer_barometric_pressure_from_alicat(reading.alicat)
         if inferred is not None:
             return inferred

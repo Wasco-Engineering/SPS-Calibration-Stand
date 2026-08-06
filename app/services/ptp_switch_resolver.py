@@ -196,7 +196,7 @@ def resolve_ptp_switch_config(
             derivation_mode = 'drive_nc_read_common'
             derive_no_from_nc = True
         else:
-            fallback = _resolve_com5_single_sense_fallback(
+            fallback = _resolve_ptp_common_read_fallback(
                 normalized_port,
                 common_terminal=common_terminal,
                 common_dio=common_dio,
@@ -379,12 +379,19 @@ def _resolve_single_throw_adapter_fallback(
     requirement that the PTP product terminal number equal the stand sense pin.
     """
 
-    if len(sensed_pins) != 1:
+    if not sensed_pins:
         return None
     if (no_terminal is None) == (nc_terminal is None):
         return None
 
-    sensed_pin = sensed_pins[0]
+    # Prefer legacy single-sense pin 3 when present in a multi-pin sense set;
+    # otherwise use the sole configured pin.
+    if 3 in sensed_pins:
+        sensed_pin = 3
+    elif len(sensed_pins) == 1:
+        sensed_pin = sensed_pins[0]
+    else:
+        return None
     read_dio = _db9_pin_to_dio(port_id, sensed_pin)
     if read_dio is None:
         return None
@@ -436,7 +443,7 @@ def db9_pin_to_dio(port_id: str, pin: int) -> Optional[int]:
     return _db9_pin_to_dio(str(port_id).strip().lower(), pin)
 
 
-def _resolve_com5_single_sense_fallback(
+def _resolve_ptp_common_read_fallback(
     port_id: str,
     *,
     common_terminal: Optional[int],
@@ -458,17 +465,23 @@ def _resolve_com5_single_sense_fallback(
         bool,
     ]
 ]:
-    """Map COM=5 switches whose PTP throw pins land off the configured sensed pin.
+    """Read any PTP CommonTerminal when throws land off the configured sense set.
 
-    PTP is correct (COM=5, NO/NC on 4/6). On this bench the red wire lands on
-    DB9 pin 3, but deep diagnostic (2026-06-25, SPS02262-02 seq 600) showed
-    switch transitions on PTP CommonTerminal pin 5 (DIO4), not pin 3 (DIO2).
-    Read common on pin 5 and drive the active throw pin directly.
+    Single-sense stands often still wire COM/NO/NC through to LabJack DIOs.
+    Prefer reading PTP common and driving the active throw over assuming an
+    adapter remapped common onto sense pin 3. Applies to every DB9 COM pin
+    (empirically COM=5 SPS02262-02, COM=6 SPS01999-02; same topology for COM=1
+    SPS01804-02 and other SPST rows).
     """
 
-    if common_terminal != 5 or len(sensed_pins) != 1 or common_dio is None:
+    if common_terminal is None or common_dio is None:
+        return None
+    if common_terminal in sensed_pins:
         return None
     if no_terminal is None and nc_terminal is None:
+        return None
+    # Only when neither throw is already observable on the configured sense set.
+    if (no_terminal in sensed_pins) or (nc_terminal in sensed_pins):
         return None
 
     read_dio = common_dio
@@ -480,9 +493,10 @@ def _resolve_com5_single_sense_fallback(
         active_throw = min(no_terminal, nc_terminal)
         observe_no = active_throw == no_terminal
 
+    sensed_txt = ','.join(str(p) for p in sensed_pins) or '--'
     bench_note = (
-        f'COM=5 bench: read PTP CommonTerminal pin {common_terminal} (DIO{read_dio}), '
-        f'not configured sensed pin {sensed_pins[0]}'
+        f'COM={common_terminal} bench: read PTP CommonTerminal pin {common_terminal} '
+        f'(DIO{read_dio}), not configured sensed pin(s) [{sensed_txt}]'
     )
 
     if observe_no:

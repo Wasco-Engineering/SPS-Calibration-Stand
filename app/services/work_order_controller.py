@@ -200,6 +200,8 @@ class WorkOrderController(QObject):
         self._base_viz: Optional[Dict[str, Any]] = None
         self._switch_presence = self._runtime_state.switch_presence
         self._manual_switch_latched = self._runtime_state.manual_switch_latched
+        self._manual_switch_last_activated = self._runtime_state.manual_switch_last_activated
+        self._switch_transition_seen = self._runtime_state.switch_transition_seen
         for pid in ('port_a', 'port_b'):
             sm = PortStateMachine(pid)
             sm.state_changed.connect(self._on_sm_state_changed)
@@ -726,17 +728,72 @@ class WorkOrderController(QObject):
     def _has_switch_presence(self, port_id: str) -> bool:
         return bool(self._switch_presence.get(port_id, False))
 
+    def _port_uses_derived_switch(self, port_id: str) -> bool:
+        """True when PTP/stand wiring derives the complementary NO/NC contact."""
+        port = self._port_manager.get_port(port_id)
+        daq = getattr(port, 'daq', None) if port is not None else None
+        if daq is not None:
+            if bool(getattr(daq, 'switch_nc_derived_from_no', False)):
+                return True
+            if bool(getattr(daq, 'switch_no_derived_from_nc', False)):
+                return True
+        port_cfg = self._config.get('hardware', {}).get('labjack', {}).get(port_id, {})
+        return bool(port_cfg.get('switch_nc_derived_from_no')) or bool(
+            port_cfg.get('switch_no_derived_from_nc')
+        )
+
     def _handle_switch_presence(self, port_id: str, reading: PortReading) -> None:
         switch = getattr(reading, 'switch', None)
-        connected = bool(switch and (switch.no_active or switch.nc_active))
+        # SPST complementary derivation always has no XOR nc, so "either active"
+        # is not evidence of a DUT. Treat any valid reading as electrically present
+        # for pressurize gating, but only latch QAL15 switch_changed on a real
+        # activated-state transition (SPS01804-02 false "switch detected").
+        derived = self._port_uses_derived_switch(port_id)
+        if switch is None:
+            connected = False
+        elif derived:
+            connected = True
+        else:
+            connected = bool(switch.no_active or switch.nc_active)
         self._switch_presence[port_id] = connected
 
         sm = self._state_machines.get(port_id)
         if not sm:
             return
 
-        if sm.current_state != PortState.MANUAL_ADJUST.value:
+        current_activated = bool(switch.switch_activated) if switch is not None else None
+        in_qal15_sense = sm.current_state in (
+            PortState.PRESSURIZING.value,
+            PortState.MANUAL_ADJUST.value,
+        )
+
+        if not in_qal15_sense:
             self._manual_switch_latched[port_id] = False
+            self._manual_switch_last_activated[port_id] = None
+            self._switch_transition_seen[port_id] = False
+            return
+
+        if derived:
+            previous = self._manual_switch_last_activated.get(port_id)
+            if (
+                previous is not None
+                and current_activated is not None
+                and current_activated != previous
+            ):
+                self._switch_transition_seen[port_id] = True
+            if current_activated is not None:
+                self._manual_switch_last_activated[port_id] = current_activated
+            if (
+                sm.current_state == PortState.MANUAL_ADJUST.value
+                and self._switch_transition_seen.get(port_id, False)
+                and not self._manual_switch_latched.get(port_id, False)
+            ):
+                if sm.can_trigger('switch_changed'):
+                    sm.trigger('switch_changed')
+                self._manual_switch_latched[port_id] = True
+            return
+
+        if sm.current_state != PortState.MANUAL_ADJUST.value:
             return
 
         if connected and not self._manual_switch_latched.get(port_id, False):
@@ -1782,9 +1839,9 @@ class WorkOrderController(QObject):
         sm = self._state_machines.get(port_id)
         if not sm:
             return
-        if sm._attempt_count >= sm._max_attempts - 1:
-            logger.warning('%s: Retest blocked after %s attempts', port_id, sm._max_attempts)
-            return
+        # No-switch is a connection/setup failure, not an out-of-spec result.
+        # Always allow Retry / Fail Part here — do not apply the attempt gate first,
+        # or the UI "No Switch - Retry" button becomes a dead click after attempt 3.
         if self._is_no_switch_decision(sm):
             save_args = self._capture_save_args(
                 port_id,
@@ -1798,6 +1855,9 @@ class WorkOrderController(QObject):
                 elif sm.current_state == PortState.PRESSURIZING.value:
                     self._start_pressurize_hw(port_id)
             self._persist_result_async(port_id, save_args, refresh_progress=False)
+            return
+        if sm._attempt_count >= sm._max_attempts - 1:
+            logger.warning('%s: Retest blocked after %s attempts', port_id, sm._max_attempts)
             return
         if sm.trigger('retest'):
             # Retest transitions to CYCLING (QAL16/17) or PRESSURIZING (QAL15)

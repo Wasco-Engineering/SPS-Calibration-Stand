@@ -2525,28 +2525,29 @@ class TestExecutor:
                 )
                 self._cycle_prep_confirmed = True
                 return
-            # Accept if pressure is at the band boundary on the prep side even if
-            # the switch hasn't flipped yet (hysteresis lag).
+            # Pressure on the prep side without the expected switch state is not a
+            # confirmed prep — accepting here left decreasing mmHg parts (e.g.
+            # SPS01804-02) starting the activation ramp already "activated", so
+            # no edge was possible. Keep waiting for the switch, else fall through
+            # to the unconfirmed/full-range path below.
             if pressure_now is not None and math.isfinite(pressure_now):
                 at_prep_side = (
-                    (prep_target >= max_psi and pressure_now >= max_psi - margin_psi)
-                    or (prep_target <= min_psi and pressure_now <= min_psi + margin_psi)
+                    (prep_target >= max_psi and pressure_now >= prep_target - margin_psi)
+                    or (prep_target <= min_psi and pressure_now <= prep_target + margin_psi)
                 )
                 if at_prep_side:
                     now = time.perf_counter()
                     if near_target_since_ is None:
                         near_target_since_ = now
-                    elif now - near_target_since_ >= 1.0:
-                        self._seed_debounce_from_live_reading()
                         logger.info(
-                            '%s: Cycle prep accepted by pressure %.4f PSI at prep side '
-                            '(switch hysteresis lag; %s leg)',
+                            '%s: Cycle prep pressure %.4f PSI on prep side but switch still %s '
+                            '(need %s; %s leg) — continuing to wait',
                             self._port_id,
                             pressure_now,
+                            'activated' if state else 'deactivated',
+                            'activated' if prep_state else 'deactivated',
                             edge_type,
                         )
-                        self._cycle_prep_confirmed = True
-                        return
                 else:
                     near_target_since_ = None
             time.sleep(0.02)
@@ -3625,16 +3626,16 @@ class TestExecutor:
 
     def _cycle_target_switch_state(self, edge_type: str) -> bool:
         """``switch_activated`` value that means this cycle edge (vacuum bench may invert)."""
-        # Single-sense pressure parts (NC derived from NO): at high gauge pressure the
-        # contact reads activated=True on the reset side. Invert cycle targets so prep
-        # accepts that state and the falling activation edge is deactivated=False.
+        # Single-sense pressure parts: at high gauge pressure the contact often reads
+        # activated=True on the reset side (NO-from-NC and NC-from-NO SPST adapters,
+        # including drive_*_read_adapter_common). Invert cycle targets so prep accepts
+        # that state and the falling activation edge is deactivated=False.
         if (
             self._resolve_sweep_mode() == 'pressure'
             and self._resolve_activation_sweep_direction() < 0
+            and self._uses_single_sense_switch_derivation()
         ):
-            daq = getattr(self._port, 'daq', None)
-            if daq is not None and bool(getattr(daq, 'switch_nc_derived_from_no', False)):
-                return edge_type != 'activation'
+            return edge_type != 'activation'
         if edge_type == 'activation':
             if self._resolve_sweep_mode() == 'vacuum' and self._vacuum_switch_trips_on_no_open():
                 return False
