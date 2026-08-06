@@ -69,6 +69,14 @@ def test_alicat_torr_units_ignore_stale_psi_command_preference() -> None:
     assert not controller._prefer_psi_commands
 
 
+def test_alicat_serial_uses_configured_identity_without_hardware(monkeypatch) -> None:
+    monkeypatch.setattr('app.hardware.alicat.SERIAL_AVAILABLE', False)
+    controller = AlicatController({'address': 'A', 'expected_serial_number': '601126'})
+
+    assert controller.refresh_serial_number() == '601126'
+    assert controller.serial_number == '601126'
+
+
 def test_auto_tare_on_connect_does_not_exhaust_at_atmosphere() -> None:
     controller = AlicatController({
         'address': 'A',

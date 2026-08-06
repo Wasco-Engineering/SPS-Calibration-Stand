@@ -8,6 +8,7 @@ Handles serial communication with Alicat pressure controllers for:
 """
 
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -17,6 +18,10 @@ from typing import Any, Dict, List, Optional
 from app.services.pressure_calibration import apply_error_model
 
 logger = logging.getLogger(__name__)
+_MANUFACTURING_SERIAL_RE = re.compile(
+    r'(?:serial(?:\s*number|\s*no\.?)?|s/?n)\s*[:=]?\s*([A-Za-z0-9-]+)',
+    re.IGNORECASE,
+)
 
 try:
     import serial
@@ -123,6 +128,7 @@ class AlicatController:
         self._sim_setpoint = 0.0
         self._logged_raw_status = False
         self._prefer_psi_commands = False
+        self._serial_number: Optional[str] = None
 
         error_model_cfg = config.get('alicat_error_model', {}) or {}
         self._error_model: Optional[Dict[str, Any]] = None
@@ -135,6 +141,11 @@ class AlicatController:
         self._update_display_units_label()
 
         logger.info(f"AlicatController initialized: {self.com_port} address={self.address}")
+
+    @property
+    def serial_number(self) -> Optional[str]:
+        """Return the manufacturing serial number read from the controller."""
+        return self._serial_number
     
     # ------------------------------------------------------------------
     # Display-unit tracking & conversion
@@ -299,6 +310,7 @@ class AlicatController:
         self._configure_setpoint_source()
         if self._pressure_units_value is not None:
             self._ensure_pressure_units_value(int(self._pressure_units_value))
+        self.refresh_serial_number()
         self._maybe_auto_tare()
 
     def _maybe_auto_tare(self) -> None:
@@ -487,6 +499,52 @@ class AlicatController:
     def configure_units_from_ptp_prefer_psi(self, units_code: str) -> bool:
         """Deprecated compatibility alias for the native-unit configuration."""
         return self.configure_units_from_ptp(units_code)
+
+    @_serialized_operation
+    def refresh_serial_number(self) -> Optional[str]:
+        """Query and cache the Alicat manufacturing serial number.
+
+        ``??M*`` emits multiple CR-delimited lines. Read the complete response
+        while holding this controller's serial lock so the other address on a
+        shared COM line cannot consume part of the response.
+        """
+        if not SERIAL_AVAILABLE or not self._serial or not self._serial.is_open:
+            configured = str(self.config.get('expected_serial_number', '')).strip()
+            self._serial_number = configured or None
+            return self._serial_number
+
+        command_lock = None
+        with self._shared_serial_lock:
+            shared = self._shared_serials.get(self.com_port)
+            if shared is self._serial:
+                with self._command_locks_lock:
+                    command_lock = self._command_locks.setdefault(self.com_port, threading.Lock())
+
+        lines: list[str] = []
+        with command_lock or self._lock:
+            try:
+                if self._serial.in_waiting > 0:
+                    self._serial.reset_input_buffer()
+                self._serial.write(f'{self.address}??M*\r'.encode())
+                for _ in range(12):
+                    raw = self._serial.read_until(b'\r')
+                    if not raw:
+                        break
+                    line = raw.decode(errors='ignore').strip()
+                    if line:
+                        lines.append(line)
+            except Exception as exc:
+                logger.warning('Alicat %s: manufacturing serial query failed: %s', self.address, exc)
+                return self._serial_number
+
+        for line in lines:
+            match = _MANUFACTURING_SERIAL_RE.search(line)
+            if match:
+                self._serial_number = match.group(1)
+                logger.info('Alicat %s: manufacturing serial %s', self.address, self._serial_number)
+                return self._serial_number
+        logger.warning('Alicat %s: manufacturing response did not include a serial number', self.address)
+        return self._serial_number
     
     def _verify_connection(self) -> bool:
         """Verify communication with the Alicat."""

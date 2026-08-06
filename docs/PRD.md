@@ -19,6 +19,10 @@ against work orders and Product Test Parameters (PTP).
 - Treat the PCD-115PSIA short response frame as absolute pressure plus
   setpoint; it has no IB gauge or barometric fields.
 - Identify this stand in the database as `CA-SPS-02`.
+- Persist detail results with a port-qualified Alicat identity, for example
+  `CA-SPS-02-L-601126` or `CA-SPS-02-R-601127`. Stinger reads the manufacturing
+  serial at connect; it blocks a production result write when the serial is
+  unavailable or would exceed the 20-character database `EquipmentID` limit.
 
 ## Operator bug reports
 

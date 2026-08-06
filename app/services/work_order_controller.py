@@ -76,14 +76,20 @@ from app.services.pressure_domain import (
 logger = logging.getLogger(__name__)
 
 
-def _detail_equipment_id(base_equipment_id: str, port_id: str) -> str:
-    """Return the database EquipmentID that identifies the physical test side."""
+def _detail_equipment_id(
+    base_equipment_id: str,
+    port_id: str,
+    alicat_serial: Optional[str] = None,
+) -> str:
+    """Return the database EquipmentID for a physical side and Alicat."""
     suffixes = {
         PortId.PORT_A.value: 'L',
         PortId.PORT_B.value: 'R',
     }
     suffix = suffixes.get(str(port_id))
-    return f'{base_equipment_id}-{suffix}' if suffix else base_equipment_id
+    detail_id = f'{base_equipment_id}-{suffix}' if suffix else base_equipment_id
+    serial = str(alicat_serial or '').strip()
+    return f'{detail_id}-{serial}' if serial and suffix else detail_id
 
 
 def _config_bool(value: Any, default: bool = False) -> bool:
@@ -2924,7 +2930,30 @@ class WorkOrderController(QObject):
             test_params.get('equipment_id'),
             DEFAULT_EQUIPMENT_ID,
         )
-        equipment_id = _detail_equipment_id(master_equipment_id, port_id)
+        port_manager = self.__dict__.get('_port_manager')
+        port = port_manager.get_port(port_id) if port_manager is not None else None
+        alicat_serial = port.alicat.serial_number if port is not None else None
+        if port_manager is not None and not alicat_serial:
+            logger.error('%s: Cannot save result without attached Alicat serial number', port_id)
+            return _finish(
+                'failed',
+                activity_status='Alicat serial unavailable',
+                last_write='Blocked',
+                queue=str(get_local_queue_count()),
+            )
+        equipment_id = _detail_equipment_id(master_equipment_id, port_id, alicat_serial)
+        if len(equipment_id) > 20:
+            logger.error(
+                '%s: Alicat-qualified EquipmentID %r exceeds database limit of 20 characters',
+                port_id,
+                equipment_id,
+            )
+            return _finish(
+                'failed',
+                activity_status='Alicat EquipmentID too long',
+                last_write='Blocked',
+                queue=str(get_local_queue_count()),
+            )
         try:
             temperature_c = float(test_params.get('default_temperature_c', 25.0))
         except (TypeError, ValueError):
