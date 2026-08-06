@@ -20,6 +20,7 @@ class AdminActionService:
         on_reconnect_hardware: Callable[[], None],
         on_reconnect_database: Callable[[], None],
         on_open_logs: Callable[[], None],
+        on_open_bug_reports: Callable[[], None],
         on_export_logs: Callable[[], None],
         on_export_history: Callable[[], None],
         on_safety_override: Callable[[Dict[str, Any]], None],
@@ -30,6 +31,7 @@ class AdminActionService:
         self._on_reconnect_hardware = on_reconnect_hardware
         self._on_reconnect_database = on_reconnect_database
         self._on_open_logs = on_open_logs
+        self._on_open_bug_reports = on_open_bug_reports
         self._on_export_logs = on_export_logs
         self._on_export_history = on_export_history
         self._on_safety_override = on_safety_override
@@ -52,6 +54,9 @@ class AdminActionService:
             return
         if action == 'open_logs':
             self._on_open_logs()
+            return
+        if action == 'open_bug_reports':
+            self._on_open_bug_reports()
             return
         if action == 'export_logs':
             self._on_export_logs()

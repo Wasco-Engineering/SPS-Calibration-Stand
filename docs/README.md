@@ -15,6 +15,8 @@
 - **`TESTING.md`**: how to run unit, coverage, and hardware integration tests
 - **`COVERAGE_BASELINE.md`**: current module-level coverage baseline
 - **`OPEN_QUESTIONS.md`**: remaining unknowns + how to verify them
+- **`PRD.md`**: product requirements and operating decisions
+- **`bugs/BUG_LIST.md`**: detailed cross-stand bug tracker
 
 ## Configuration
 

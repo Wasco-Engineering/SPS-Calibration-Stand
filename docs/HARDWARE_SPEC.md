@@ -15,6 +15,10 @@ Each port is independent and includes:
 ### 1) Pressure control: Alicat (control authority)
 
 - Alicat is used for **closed-loop control** (setpoint/ramping), but is **not accurate enough** for the most demanding low-pressure measurements.
+- **Device units:** stands run Alicat in **TorrA** (`pressure_units_value: 13` / DCU 13), not PSIA.
+  TorrA gives finer setpoint/readback resolution on absolute PCD controllers used for
+  vacuum and near-atmosphere work. PTP gauge mmHg may still select mmHg on the device
+  when that unit is required; otherwise stay on TorrA.
 - **Plumbing/control nuance** (important):
   - Alicat pressure port is always connected to a high-pressure source.
   - Alicat exhaust port is routed through a **solenoid** that switches the exhaust path between:

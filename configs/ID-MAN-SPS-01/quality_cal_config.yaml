@@ -55,7 +55,7 @@ hardware:
     auto_tare_delay_s: 0.5
     pressure_units_stat: 2
     pressure_units_group: 0
-    pressure_units_value: 10
+    pressure_units_value: 13  # TorrA - finer resolution than PSIA for vacuum/absolute control
     pressure_units_override: 0
     pressure_index: 0
     gauge_index: 1

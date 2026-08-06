@@ -462,18 +462,14 @@ class AlicatController:
         )
         return False
 
-    # Torr/mmHg PTP codes — keep Alicat in PSI to avoid display round-trip error.
-    _PTP_CODES_KEEP_PSI = frozenset({'12', '13', '14', '19', '21'})
-
     @_serialized_operation
     def configure_units_from_ptp(self, units_code: str) -> bool:
-        """Configure Alicat units based on PTP UnitsOfMeasure numeric code."""
+        """Keep absolute controllers in TorrA; use mmHg for explicit mmHg PTPs."""
         normalized_code = str(units_code).strip()
-        mapped = self._PTP_TO_ALICAT_UNIT_CODE.get(normalized_code)
-        if mapped is None:
+        if normalized_code not in self._PTP_TO_ALICAT_UNIT_CODE:
             logger.warning("Alicat %s: Invalid PTP units code: %s", self.address, units_code)
             return False
-        unit_value = mapped
+        unit_value = 14 if normalized_code in {'14', '19'} else 13
 
         self._pressure_units_value = unit_value
         if not self._is_connected:
@@ -489,10 +485,7 @@ class AlicatController:
         return self._ensure_pressure_units_value(unit_value)
 
     def configure_units_from_ptp_prefer_psi(self, units_code: str) -> bool:
-        """Like configure_units_from_ptp, but keep PSI for Torr/mmHg PTP codes."""
-        normalized = str(units_code).strip()
-        if normalized in self._PTP_CODES_KEEP_PSI:
-            return self.configure_units_from_ptp('1')
+        """Deprecated compatibility alias for the native-unit configuration."""
         return self.configure_units_from_ptp(units_code)
     
     def _verify_connection(self) -> bool:

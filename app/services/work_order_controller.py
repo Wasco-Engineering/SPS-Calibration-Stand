@@ -55,6 +55,7 @@ from app.services.sweep_utils import (
 from app.services.test_executor import TestExecutor
 from app.services.test_protocol import TestEvent
 from app.services.admin_action_service import AdminActionService
+from app.services.bug_report_service import bug_reports_dir
 from app.services.debug_action_service import DebugActionService
 from app.services.port_runtime_state import PortRuntimeState
 from app.services.ui_bridge import UIBridge
@@ -248,6 +249,7 @@ class WorkOrderController(QObject):
             on_reconnect_hardware=self._reconnect_hardware,
             on_reconnect_database=self._reconnect_database,
             on_open_logs=self._open_logs,
+            on_open_bug_reports=self._open_bug_reports,
             on_export_logs=self._export_logs,
             on_export_history=self._export_history,
             on_safety_override=self._safety_override,
@@ -3187,6 +3189,15 @@ class WorkOrderController(QObject):
         except Exception:
             logger.info('Log directory: %s', log_dir)
         self._ui_bridge.show_info_message('Admin', f'Log directory: {log_dir}')
+
+    def _open_bug_reports(self) -> None:
+        report_dir = bug_reports_dir(self._log_dir())
+        report_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(report_dir))  # type: ignore[attr-defined]
+        except Exception:
+            logger.info('Bug report directory: %s', report_dir)
+        self._ui_bridge.show_info_message('Admin', f'Bug report directory: {report_dir}')
 
     def _export_logs(self) -> None:
         log_dir = self._log_dir()
