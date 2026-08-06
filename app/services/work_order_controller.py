@@ -148,8 +148,6 @@ class WorkOrderController(QObject):
         self._debug_solenoid_last_route = self._runtime_state.debug_solenoid_last_route
         self._hw_serial_busy_ports: set[str] = set()
         self._hw_action_cancel: Dict[str, threading.Event] = {}
-        self._last_worker_alicat_refresh_s: Dict[str, float] = {}
-        self._worker_alicat_refresh_interval_s = 0.05
         solenoid_cfg = self._config.get("hardware", {}).get("solenoid", {})
         self._auto_vacuum_threshold_psi = float(
             solenoid_cfg.get("safe_vacuum_switch_threshold_psi", 2.0)
@@ -1087,36 +1085,25 @@ class WorkOrderController(QObject):
     def _get_latest_reading(self, port_id: str) -> Optional[PortReading]:
         """Return a reading for test/edge logic.
 
-        While a test runs, read LabJack sensors on the caller thread instead of
-        the GUI poll cache. Cached snapshots can carry a stale Alicat value when
-        polls are LabJack-only, which makes ramps appear finished instantly.
+        While a test runs, read LabJack sensors on the caller thread and pair
+        them with the Alicat poller's immutable cache snapshot. The executor
+        must not compete with the poller for shared-COM status reads.
         """
         executor = self._test_executors.get(port_id)
         if executor and executor.is_running:
-            return self._read_live_hardware(port_id, refresh_alicat=True)
+            return self._read_live_hardware(port_id)
         with self._latest_readings_lock:
             return self._latest_readings.get(port_id)
 
     def _read_live_hardware(
         self,
         port_id: str,
-        *,
-        refresh_alicat: bool = True,
     ) -> Optional[PortReading]:
-        """Live LabJack (+ optional Alicat) read; publish to UI cache."""
+        """Live LabJack read paired with the Alicat poller cache."""
         port = self._port_manager.get_port(port_id)
         if port is None:
             return None
         try:
-            if refresh_alicat:
-                if port_id in self._hw_serial_busy_ports or (
-                    self._test_executors.get(port_id)
-                    and self._test_executors[port_id].is_running
-                ):
-                    # Worker already owns serial — refresh directly.
-                    self._refresh_alicat_for_worker_if_due(port_id, port)
-                else:
-                    self._refresh_alicat_for_worker_if_due(port_id, port)
             if is_transducer_installed(self._config, port_id):
                 reading = port.read_precision_fast()
             else:
@@ -1128,19 +1115,6 @@ class WorkOrderController(QObject):
             logger.warning('%s: Live hardware read failed: %s', port_id, exc)
             with self._latest_readings_lock:
                 return self._latest_readings.get(port_id)
-
-    def _refresh_alicat_for_worker_if_due(self, port_id: str, port: Any) -> None:
-        """Refresh cached Alicat pressure from the worker during live tests.
-
-        Preferred-source ``auto`` still uses Alicat above the handoff threshold, so
-        always keep the cache fresh while a test owns the port.
-        """
-        now = time.perf_counter()
-        last = self._last_worker_alicat_refresh_s.get(port_id, 0.0)
-        if now - last < self._worker_alicat_refresh_interval_s:
-            return
-        self._last_worker_alicat_refresh_s[port_id] = now
-        port.refresh_alicat()
 
     def _start_find_setpoint(self, port_id: str, payload: Dict[str, Any]) -> None:
         with self._debug_sweep_lock:
@@ -2102,8 +2076,7 @@ class WorkOrderController(QObject):
                     if cancel.is_set():
                         logger.info('%s: Pressurize cancelled during ramp', port_id)
                         return
-                    # Live Alicat read — cache is stale while this worker owns serial.
-                    reading = self._read_live_hardware(port_id, refresh_alicat=True)
+                    reading = self._read_live_hardware(port_id)
                     if reading is not None:
                         current_switch_active = self._switch_is_activated(reading)
                         if initial_switch_state is None:
