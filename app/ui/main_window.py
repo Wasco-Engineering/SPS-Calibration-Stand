@@ -304,13 +304,6 @@ class MainWindow(QMainWindow):
         self._status_button = self._build_status_button()
         layout.addWidget(self._status_button)
 
-        self._btn_report_bug = QPushButton("Report Bug")
-        self._btn_report_bug.setFixedSize(112, 40)
-        self._btn_report_bug.setFont(QFont("Segoe UI, Inter, Arial", 10, QFont.Weight.Bold))
-        self._btn_report_bug.setToolTip("Save a screenshot, logs, and report details")
-        self._btn_report_bug.clicked.connect(self._on_report_bug)
-        layout.addWidget(self._btn_report_bug)
-
         # Close button
         self._btn_close = QPushButton("Close Program")
         self._btn_close.setFixedSize(120, 48)
@@ -343,6 +336,10 @@ class MainWindow(QMainWindow):
         for action in self._status_actions.values():
             if action is not None:
                 action.setEnabled(False)
+        menu.addSeparator()
+        report_bug_action = menu.addAction("Report Bug...")
+        report_bug_action.setToolTip("Save a screenshot, logs, and report details")
+        report_bug_action.triggered.connect(self._on_report_bug)
 
         button.setMenu(menu)
         self._update_status_icon()
