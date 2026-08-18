@@ -674,9 +674,12 @@ class PrecisionPhaseRunner:
         )
         if armed_from_reset_side and not self._ctx._cancel_event.is_set():
             logger.info(
-                '%s: Precision reset-side arming complete; starting slow sweep from reset side',
+                '%s: Precision reset-side arming complete; settling at slow edge rate before sweep',
                 self._ctx._port_id,
             )
+            # Arming uses the fast cycle rate. Without a downshift dwell the
+            # out-sweep inherits that jump and trips while SR is still swapping.
+            self._settle_at_precision_approach(approach_target)
 
         logger.info('%s: Precision final return target=%.4f PSI', self._ctx._port_id, target_back)
         if sweep_mode == 'vacuum' and not self._ctx._port.set_solenoid(to_vacuum=True):
@@ -696,6 +699,7 @@ class PrecisionPhaseRunner:
             target_back,
             self._ctx._slow_edge_rate_psi,
         )
+        self._ctx._precision_activation_start_already_tripped = False
         outcome = self._ctx._run_sweep_pass(
             target_out,
             target_back,
@@ -703,6 +707,34 @@ class PrecisionPhaseRunner:
             self._ctx._slow_edge_rate_psi,
             apply_return_overshoot=target_source != 'cycle-estimate-offset-close-limit',
         )
+        if (
+            outcome.result is None
+            and outcome.missing_edge == 'first'
+            and self._ctx._precision_activation_start_already_tripped
+            and not self._ctx._cancel_event.is_set()
+        ):
+            logger.warning(
+                '%s: Precision out-sweep started already tripped; re-arming from reset side',
+                self._ctx._port_id,
+            )
+            self._ensure_precision_starts_from_reset_side(
+                sweep_mode,
+                activation_direction,
+                approach_target,
+                target_back,
+                min_psi,
+                max_psi,
+            )
+            if not self._ctx._cancel_event.is_set():
+                self._settle_at_precision_approach(approach_target)
+            self._ctx._precision_activation_start_already_tripped = False
+            outcome = self._ctx._run_sweep_pass(
+                target_out,
+                target_back,
+                activation_direction,
+                self._ctx._slow_edge_rate_psi,
+                apply_return_overshoot=target_source != 'cycle-estimate-offset-close-limit',
+            )
         result = outcome.result
         self._ctx._last_precision_missing_edge = outcome.missing_edge
 
@@ -860,31 +892,24 @@ class PrecisionPhaseRunner:
         )
 
     def _settle_at_precision_approach(self, approach_target: float) -> None:
-        """Downshift to the slow edge rate and briefly hold at the approach setpoint.
+        """Downshift to the slow edge rate and hold at the approach setpoint.
 
-        Cycling / fast approach leave the Alicat at a high ramp rate. Starting
-        the precision out-sweep immediately overshoots the trip. A short hold is
-        enough to kill momentum — long dwells just burned cycle time.
+        Cycling / fast approach leave the Alicat at 5 PSI/s. Commanding the
+        precision out-sweep before that rate has actually taken effect jumps
+        through activation (seen on the right port / shared-line address B).
         """
         self._ctx._emit_substate('precision.approach_settle')
         approach_abs = self._ctx._to_absolute(approach_target)
-        if not self._ctx._port.alicat.set_ramp_rate(self._ctx._slow_edge_rate_psi):
-            self._ctx._fail(
-                TestFailureCode.RAMP_RATE_FAILURE,
-                f'Failed to set precision settle ramp rate for {self._ctx._port_id}',
-            )
-        self._ctx._set_pressure_or_raise(approach_abs)
-        self._ctx._port.alicat.cancel_hold()
+        if not self._ctx._engage_ramp_rate(self._ctx._slow_edge_rate_psi):
+            return
+        self._ctx._set_pressure_or_raise(approach_abs, resume_control=False)
         pressure_now, _switch = self._ctx._read_pressure_and_switch_state()
         already_near = (
             pressure_now is not None
             and math.isfinite(pressure_now)
             and abs(pressure_now - approach_target) <= self._ctx._precision_approach_tolerance_psi
         )
-        # Config settle, but never force a long stall when already on target.
-        settle_s = max(0.12, float(self._ctx._precision_approach_settle_s))
-        if already_near:
-            settle_s = min(settle_s, 0.18)
+        settle_s = max(0.45, float(self._ctx._precision_approach_settle_s))
         logger.info(
             '%s: Precision approach settle target=%.4f PSI rate=%.4f psi/s hold=%.2fs near=%s',
             self._ctx._port_id,
@@ -1201,6 +1226,10 @@ class TestExecutor:
             convert_pressure(approach_tolerance_torr, 'Torr', 'PSI'),
         )
         self._precision_approach_settle_s = control_cfg.edge_detection.precision_approach_settle_sec
+        # SR ACKs before the PCD ramp generator actually switches. Address B on
+        # a shared COM is slower to apply, so the precision out-sweep used to
+        # inherit the 5 PSI/s cycle rate and trip during the rate swap.
+        self._precision_ramp_apply_s = max(0.25, float(self._precision_approach_settle_s))
         self._precision_atmosphere_hold_s = control_cfg.edge_detection.precision_start_atmosphere_hold_sec
         close_limit_offset_torr = control_cfg.edge_detection.precision_close_limit_offset_torr
         self._precision_close_limit_offset_psi = max(
@@ -1242,6 +1271,7 @@ class TestExecutor:
         self._alicat_setpoint_ref: Optional[str] = None
         self._last_pressure_source_used: Optional[str] = None
         self._last_precision_missing_edge: Optional[str] = None
+        self._precision_activation_start_already_tripped: bool = False
         self._cycle_phase_runner = CyclePhaseRunner(self)
         self._precision_phase_runner = PrecisionPhaseRunner(self)
 
@@ -2611,12 +2641,11 @@ class TestExecutor:
         rate_psi_per_sec: float,
     ) -> SweepPassOutcome:
         """Measure a two-edge window switch, then assign results by pressure order."""
-        if not self._port.alicat.set_ramp_rate(rate_psi_per_sec):
-            self._fail(TestFailureCode.RAMP_RATE_FAILURE, f'Failed to set sweep ramp rate for {self._port_id}')
+        if not self._engage_ramp_rate(rate_psi_per_sec):
             return SweepPassOutcome(result=None, missing_edge='rate_error')
 
         self._emit_substate('precision.window_low')
-        low_edge = self._sweep_to_edge(low_target, -1, edge_type=None)
+        low_edge = self._sweep_to_edge(low_target, -1, edge_type=None, resume_control=False)
         if self._cancel_event.is_set():
             return SweepPassOutcome(result=None, missing_edge='cancelled')
         if low_edge is None:
@@ -2627,12 +2656,11 @@ class TestExecutor:
         if self._on_edge_detected:
             self._on_edge_detected(low_edge_type, low_edge.pressure_psi)
 
-        if not self._port.alicat.set_ramp_rate(rate_psi_per_sec):
-            self._fail(TestFailureCode.RAMP_RATE_FAILURE, f'Failed to set return sweep ramp rate for {self._port_id}')
+        if not self._engage_ramp_rate(rate_psi_per_sec):
             return SweepPassOutcome(result=None, missing_edge='rate_error')
 
         self._emit_substate('precision.window_high')
-        high_edge = self._sweep_to_edge(high_target, 1, edge_type=None)
+        high_edge = self._sweep_to_edge(high_target, 1, edge_type=None, resume_control=False)
         if self._cancel_event.is_set():
             return SweepPassOutcome(result=None, missing_edge='cancelled')
         if high_edge is None:
@@ -2658,25 +2686,20 @@ class TestExecutor:
         rate_psi_per_sec: float,
     ) -> SweepPassOutcome:
         """NC-derived vacuum precision: slow down to reset, then slow up through both edges."""
-        if not self._port.alicat.set_ramp_rate(rate_psi_per_sec):
-            self._fail(TestFailureCode.RAMP_RATE_FAILURE, f'Failed to set sweep ramp rate for {self._port_id}')
+        if not self._engage_ramp_rate(rate_psi_per_sec):
             return SweepPassOutcome(result=None, missing_edge='rate_error')
 
         self._emit_substate('precision.window_low')
-        self._set_pressure_or_raise(self._to_absolute(reset_target))
-        low_edge = self._sweep_to_edge(reset_target, -1, edge_type=None)
+        self._set_pressure_or_raise(self._to_absolute(reset_target), resume_control=False)
+        low_edge = self._sweep_to_edge(reset_target, -1, edge_type=None, resume_control=False)
         if self._cancel_event.is_set():
             return SweepPassOutcome(result=None, missing_edge='cancelled')
 
-        if not self._port.alicat.set_ramp_rate(rate_psi_per_sec):
-            self._fail(
-                TestFailureCode.RAMP_RATE_FAILURE,
-                f'Failed to set upward precision ramp rate for {self._port_id}',
-            )
+        if not self._engage_ramp_rate(rate_psi_per_sec):
             return SweepPassOutcome(result=None, missing_edge='rate_error')
 
         self._emit_substate('precision.window_high')
-        self._set_pressure_or_raise(self._to_absolute(high_target))
+        self._set_pressure_or_raise(self._to_absolute(high_target), resume_control=False)
         if low_edge is None:
             edges = self._collect_edges_during_sweep(
                 target_psi=high_target,
@@ -2702,7 +2725,7 @@ class TestExecutor:
             low_pressure = min(edge.pressure_psi for edge in edges)
             high_pressure = max(edge.pressure_psi for edge in edges)
         else:
-            high_edge = self._sweep_to_edge(high_target, 1, edge_type=None)
+            high_edge = self._sweep_to_edge(high_target, 1, edge_type=None, resume_control=False)
             if self._cancel_event.is_set():
                 return SweepPassOutcome(result=None, missing_edge='cancelled')
             if high_edge is None:
@@ -2829,13 +2852,16 @@ class TestExecutor:
         fail_on_rate_error: bool,
         apply_return_overshoot: bool = True,
     ) -> SweepPassOutcome:
-        if not self._port.alicat.set_ramp_rate(rate_psi_per_sec):
-            if fail_on_rate_error:
-                self._fail(TestFailureCode.RAMP_RATE_FAILURE, f'Failed to set sweep ramp rate for {self._port_id}')
+        if not self._engage_ramp_rate(rate_psi_per_sec, fail_on_error=fail_on_rate_error):
             return SweepPassOutcome(result=None, missing_edge='rate_error')
 
         # First edge is activation (sweeping in activation direction)
-        edge_out = self._sweep_to_edge(target_out, direction, edge_type='activation')
+        edge_out = self._sweep_to_edge(
+            target_out,
+            direction,
+            edge_type='activation',
+            resume_control=False,
+        )
         if self._cancel_event.is_set():
             return SweepPassOutcome(result=None, missing_edge='cancelled')
         if edge_out is None:
@@ -2869,12 +2895,7 @@ class TestExecutor:
                 return_target,
                 self._precision_return_overshoot_psi,
             )
-        if not self._port.alicat.set_ramp_rate(rate_psi_per_sec):
-            if fail_on_rate_error:
-                self._fail(
-                    TestFailureCode.RAMP_RATE_FAILURE,
-                    f'Failed to set return sweep ramp rate for {self._port_id}',
-                )
+        if not self._engage_ramp_rate(rate_psi_per_sec, fail_on_error=fail_on_rate_error):
             return SweepPassOutcome(result=None, missing_edge='rate_error')
 
         past_margin_psi = self._precision_return_edge_gate_psi(edge_out.pressure_psi)
@@ -2885,6 +2906,7 @@ class TestExecutor:
             require_past_psi=edge_out.pressure_psi,
             past_margin_psi=past_margin_psi,
             seed_edge_time=True,
+            resume_control=False,
         )
         if self._cancel_event.is_set():
             return SweepPassOutcome(result=None, missing_edge='cancelled')
@@ -2945,6 +2967,7 @@ class TestExecutor:
         require_past_psi: Optional[float] = None,
         past_margin_psi: float = 0.0,
         seed_edge_time: bool = False,
+        resume_control: bool = True,
     ) -> Optional[EdgeDetection]:
         """Sweep toward target, returning the first stable edge detected.
         
@@ -2957,16 +2980,20 @@ class TestExecutor:
             past_margin_psi: Travel past ``require_past_psi`` required before accept.
             seed_edge_time: If True, seed debounce ``last_edge_time`` to now so
                 ``min_edge_interval`` applies across an out/back turnaround.
+            resume_control: If False, send the setpoint without C so a just-applied
+                ramp rate is not discarded.
         """
         target_abs = self._to_absolute(target_psi)
-        self._set_pressure_or_raise(target_abs)
+        self._set_pressure_or_raise(target_abs, resume_control=resume_control)
 
         reading_start = self._get_latest_reading(self._port_id)
         dynamic_timeout_s = self._edge_timeout_s
         rate_psi_per_sec = self._current_rate_psi_per_sec()
+        start_test_psi: Optional[float] = None
         if reading_start is not None:
             start_abs = self._reading_pressure_abs_psi(reading_start)
             if start_abs is not None:
+                start_test_psi = self._absolute_to_test_reference(start_abs)
                 travel_psi = abs(target_abs - start_abs)
                 estimated_travel_s = travel_psi / max(1e-4, rate_psi_per_sec)
                 dynamic_timeout_s = max(self._edge_timeout_s, estimated_travel_s * 1.35 + 8.0)
@@ -3027,6 +3054,28 @@ class TestExecutor:
                                 edge_pressure,
                                 require_past_psi if require_past_psi is not None else float('nan'),
                                 past_margin_psi,
+                            )
+                        elif edge_type == 'activation':
+                            # Fast approach can overshoot into the trip, leaving the
+                            # switch already activated at the approach setpoint. That
+                            # start sample is not an activation edge — re-arm instead
+                            # of stamping the approach pressure.
+                            if initial_switch_state == want_activated:
+                                logger.warning(
+                                    '%s: Ignoring already-matching activation start at %.4f PSI '
+                                    '(target=%.4f); requesting reset-side re-arm',
+                                    self._port_id,
+                                    edge_pressure,
+                                    target_psi,
+                                )
+                                self._precision_activation_start_already_tripped = True
+                                return None
+                            logger.debug(
+                                '%s: Precision activation start at %.4f PSI is not a '
+                                'switch transition; waiting (target=%.4f)',
+                                self._port_id,
+                                edge_pressure,
+                                target_psi,
                             )
                         else:
                             if self._on_edge_detected:
@@ -3098,6 +3147,25 @@ class TestExecutor:
                         past_margin_psi,
                     )
                     continue
+                min_room_psi = convert_pressure(5.0, 'Torr', 'PSI')
+                min_activation_travel_psi = convert_pressure(3.0, 'Torr', 'PSI')
+                if (
+                    edge_type == 'activation'
+                    and start_test_psi is not None
+                    and math.isfinite(start_test_psi)
+                    and abs(start_test_psi - target_psi) >= min_room_psi
+                    and abs(edge_pressure - start_test_psi) < min_activation_travel_psi
+                ):
+                    logger.warning(
+                        '%s: Activation edge at %.4f PSI is within %.3f PSI of sweep start '
+                        '%.4f; treating as already tripped so precision can re-arm',
+                        self._port_id,
+                        edge_pressure,
+                        min_activation_travel_psi,
+                        start_test_psi,
+                    )
+                    self._precision_activation_start_already_tripped = True
+                    return None
                 # Report edge immediately if callback is available
                 if self._on_edge_detected and edge_type:
                     self._on_edge_detected(edge_type, edge_pressure)
@@ -4124,7 +4192,12 @@ class TestExecutor:
         self._lock_alicat_setpoint_reference()
         return self._alicat_setpoint_ref or 'absolute'
 
-    def _set_pressure_or_raise(self, target_abs_psi: float) -> None:
+    def _set_pressure_or_raise(
+        self,
+        target_abs_psi: float,
+        *,
+        resume_control: bool = True,
+    ) -> None:
         """Set pressure with one recovery retry before raising."""
         baro = self._get_barometric_psi(self._port_id)
         setpoint_ref = self._resolve_alicat_setpoint_reference()
@@ -4134,14 +4207,15 @@ class TestExecutor:
             setpoint_reference=setpoint_ref,
         )
         logger.info(
-            '%s: Alicat setpoint command %.4f PSI (target_abs=%.4f ref=%s baro=%.4f)',
+            '%s: Alicat setpoint command %.4f PSI (target_abs=%.4f ref=%s baro=%.4f resume=%s)',
             self._port_id,
             command_psi,
             target_abs_psi,
             setpoint_ref,
             baro,
+            resume_control,
         )
-        if self._port.set_pressure(command_psi):
+        if self._command_port_pressure(command_psi, resume_control=resume_control):
             return
 
         logger.warning(
@@ -4157,7 +4231,7 @@ class TestExecutor:
             setpoint_reference=setpoint_ref,
         )
 
-        if self._port.set_pressure(command_psi):
+        if self._command_port_pressure(command_psi, resume_control=resume_control):
             return
 
         self._fail(
@@ -4165,6 +4239,52 @@ class TestExecutor:
             f'Failed to set pressure to {target_abs_psi:.4f} PSI absolute '
             f'(command {command_psi:.4f} PSI {setpoint_ref})',
         )
+
+    def _command_port_pressure(self, command_psi: float, *, resume_control: bool = True) -> bool:
+        """Send a setpoint, keeping C optional so a just-applied ramp is preserved."""
+        try:
+            return bool(self._port.set_pressure(command_psi, resume_control=resume_control))
+        except TypeError:
+            return bool(self._port.set_pressure(command_psi))
+
+    def _engage_ramp_rate(self, rate_psi: float, *, fail_on_error: bool = True) -> bool:
+        """Enter control, apply SR, and wait for the PCD ramp generator to switch.
+
+        Shared-line address B (right port) ACKs SR before the new rate is live.
+        Sending the far precision target in that window jumps at the leftover
+        cycle rate and trips during the swap.
+        """
+        if not self._port.alicat.cancel_hold():
+            logger.warning(
+                '%s: Failed to cancel hold before engaging ramp %.4f PSI/s',
+                self._port_id,
+                rate_psi,
+            )
+        if not self._port.alicat.set_ramp_rate(rate_psi):
+            if fail_on_error:
+                self._fail(
+                    TestFailureCode.RAMP_RATE_FAILURE,
+                    f'Failed to set ramp rate for {self._port_id}',
+                )
+            return False
+        apply_s = max(0.0, float(self._precision_ramp_apply_s))
+        if apply_s <= 0:
+            return True
+        deadline = time.perf_counter() + apply_s
+        logger.info(
+            '%s: Waiting %.2fs for ramp %.4f PSI/s to take effect',
+            self._port_id,
+            apply_s,
+            rate_psi,
+        )
+        while time.perf_counter() < deadline:
+            if self._cancel_event.is_set():
+                return False
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.02, remaining))
+        return True
 
     def _cancel_and_emit(self) -> bool:
         if not self._cancel_event.is_set():

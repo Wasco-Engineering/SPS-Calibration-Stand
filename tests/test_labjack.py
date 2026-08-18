@@ -77,6 +77,23 @@ def test_set_solenoid_safe_in_sim_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     assert controller.set_solenoid_safe()
 
 
+def test_set_solenoid_honors_port_route_polarity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(labjack_module, 'LJM_AVAILABLE', False)
+    cfg = _base_config()
+    cfg.update(
+        {
+            'solenoid_vacuum_state': 0,
+            'solenoid_atmosphere_state': 1,
+        }
+    )
+    controller = LabJackController(cfg)
+
+    assert controller.set_solenoid(True)
+    assert controller._solenoid_dio_state[3] == 0
+    assert controller.set_solenoid_safe()
+    assert controller._solenoid_dio_state[3] == 1
+
+
 def test_transient_error_classifier() -> None:
     assert LabJackController._is_transient_ljm_error(RuntimeError('LJME_RECONNECT_FAILED'))
     assert LabJackController._is_transient_ljm_error(RuntimeError('code 1239 timeout'))

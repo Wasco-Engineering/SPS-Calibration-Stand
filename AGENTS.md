@@ -218,7 +218,7 @@ Legacy labels `STINGER_01` may still appear in env on this PC. The DB equipment 
   PC’s `configs/<hostname>/` folder
 - `test_parameters.equipment_id` — must stay **`CA-SPS-02`** here
 - `hardware.alicat.baudrate` / COM addresses — must match *this* Alicat wiring
-- `open_fitting`, `transducer_installed`, switch COM polarity — bench-specific
+- `transducer_installed`, switch COM polarity — bench-specific
 - Alicat / transducer `*_error_model` blocks — quality-cal for *this* hardware
 - `install_manifest.json` hostname / `stand_id`
 

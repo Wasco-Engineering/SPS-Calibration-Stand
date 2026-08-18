@@ -815,8 +815,8 @@ def test_vent_to_atmosphere_skips_when_already_at_atmospheric_idle(monkeypatch: 
     assert daq.solenoid_calls == []
 
 
-def test_vent_to_atmosphere_skips_idaho_open_fitting_atmosphere(monkeypatch: Any) -> None:
-    """Open fittings already at local atmosphere do not need an EXH command."""
+def test_vent_to_atmosphere_skips_local_atmosphere(monkeypatch: Any) -> None:
+    """A line already at local atmosphere does not need a vent command."""
     port = _make_port(monkeypatch)
     alicat = port.alicat
     assert isinstance(alicat, _FakeAlicatController)
@@ -854,7 +854,7 @@ def test_is_at_atmospheric_idle_accepts_exh_near_baro(monkeypatch: Any) -> None:
     assert port._alicat_in_exhaust_mode() is True
 
 
-def test_ensure_exhaust_idle_enables_exh_from_hold(monkeypatch: Any) -> None:
+def test_ensure_exhaust_idle_preserves_atmospheric_hold(monkeypatch: Any) -> None:
     port = _make_port(monkeypatch)
     alicat = port.alicat
     assert isinstance(alicat, _FakeAlicatController)
@@ -867,10 +867,35 @@ def test_ensure_exhaust_idle_enables_exh_from_hold(monkeypatch: Any) -> None:
         raw_response='A +014.60 +014.70 HLD',
     )
     assert port.ensure_exhaust_idle() is True
-    assert alicat.exhaust_calls >= 1
-    assert port.refresh_alicat() is True
-    assert port._alicat_in_exhaust_mode() is True
+    assert alicat.exhaust_calls == 0
     assert alicat.set_pressure_calls == []
+
+
+def test_ensure_exhaust_idle_recovers_vacuum_with_barometric_setpoint(
+    monkeypatch: Any,
+) -> None:
+    port = _make_port(monkeypatch)
+    alicat = port.alicat
+    assert isinstance(alicat, _FakeAlicatController)
+    low = AlicatReading(
+        pressure=1.5,
+        setpoint=0.5,
+        timestamp=1.0,
+        barometric_pressure=14.7,
+        raw_response='A +001.50 +000.50 EXH',
+    )
+    port.read_all = lambda: PortReading(alicat=low, timestamp=low.timestamp)  # type: ignore[method-assign]
+    calls: list[float] = []
+
+    def _recover(target_psia: float, **_kwargs: Any) -> bool:
+        calls.append(target_psia)
+        return True
+
+    port._release_to_atmosphere_via_setpoint = _recover  # type: ignore[method-assign]
+
+    assert port.ensure_exhaust_idle() is True
+    assert calls == [pytest.approx(14.7)]
+    assert alicat.exhaust_calls == 0
 
 
 def test_is_at_atmospheric_idle_rejects_vacuum_hold(monkeypatch: Any) -> None:
@@ -1004,11 +1029,11 @@ def test_vent_to_atmosphere_prefers_session_gauge_zero_over_alicat_baro(
         Port.clear_session_gauge_zero_psia()
 
 
-def test_disconnect_restores_atmosphere_control(monkeypatch: Any) -> None:
+def test_disconnect_preserves_atmospheric_hold(monkeypatch: Any) -> None:
     port = _make_port(monkeypatch)
     alicat = port.alicat
     assert isinstance(alicat, _FakeAlicatController)
-    # Start in hold (not EXH) so disconnect parks into EXH idle.
+    # Start in atmospheric hold; disconnect must not re-enable EXH.
     alicat.next_reading = AlicatReading(
         pressure=14.68,
         setpoint=14.70,
@@ -1020,10 +1045,10 @@ def test_disconnect_restores_atmosphere_control(monkeypatch: Any) -> None:
     port.disconnect(restore_safe_state=True)
     alicat = port.alicat
     assert isinstance(alicat, _FakeAlicatController)
-    assert alicat.exhaust_calls >= 1
+    assert alicat.exhaust_calls == 0
     assert alicat.cancel_hold_calls == 0
     assert alicat.disconnect_calls == 1
-    assert 'EXH' in (alicat.next_reading.raw_response or '').upper()
+    assert 'HLD' in (alicat.next_reading.raw_response or '').upper()
 
 
 def test_port_manager_disconnect_all_vents_before_shared_disconnect(monkeypatch: Any) -> None:
@@ -1040,12 +1065,11 @@ def test_port_manager_disconnect_all_vents_before_shared_disconnect(monkeypatch:
         assert port.disconnect_calls == 1
 
 
-def test_vent_to_atmosphere_open_fitting_uses_exhaust(monkeypatch: Any) -> None:
-    """Open fittings must pressurize up on the atmosphere route; EXH pulls vacuum."""
+def test_vent_to_atmosphere_releases_vacuum_via_setpoint(monkeypatch: Any) -> None:
+    """A vacuum-held DUT is returned to baro by setpoint, not EXH."""
     port = _make_port(
         monkeypatch,
         labjack_overrides={
-            'open_fitting': True,
             'transducer_installed': False,
             'local_barometric_psi': 13.48,
         },
@@ -1076,11 +1100,11 @@ def test_vent_to_atmosphere_open_fitting_uses_exhaust(monkeypatch: Any) -> None:
     port.read_all = lambda: PortReading(alicat=_next_reading(), timestamp=1.0)  # type: ignore[method-assign]
 
     assert port.vent_to_atmosphere(bleed_installed_dut=True, timeout_s=5.0) is True
-    assert alicat.exhaust_calls == 1
-    assert alicat.set_pressure_calls == []
+    assert alicat.exhaust_calls == 0
+    assert alicat.set_pressure_calls
 
 
-def test_vent_to_atmosphere_uses_exhaust_from_low_pressure(monkeypatch: Any) -> None:
+def test_vent_to_atmosphere_uses_setpoint_from_low_pressure(monkeypatch: Any) -> None:
     port = _make_port(monkeypatch)
     alicat = port.alicat
     assert isinstance(alicat, _FakeAlicatController)
@@ -1114,7 +1138,8 @@ def test_vent_to_atmosphere_uses_exhaust_from_low_pressure(monkeypatch: Any) -> 
     assert isinstance(daq, _FakeLabJackController)
     assert daq.solenoid_calls
     assert daq.solenoid_calls[-1] is False
-    assert alicat.exhaust_calls == 1
+    assert alicat.exhaust_calls == 0
+    assert alicat.set_pressure_calls
 
 
 def test_session_gauge_zero_boot_lock(monkeypatch: Any) -> None:

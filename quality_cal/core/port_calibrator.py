@@ -27,6 +27,10 @@ from quality_cal.core.calibration_export import (
     merge_hardware_into_stinger_config,
     point_passes_after_correction,
 )
+from quality_cal.core.offset_history_store import (
+    extract_port_models_from_stinger,
+    record_offset_history,
+)
 from quality_cal.session import CalibrationPointResult, PortFitSummary
 
 logger = logging.getLogger(__name__)
@@ -478,6 +482,62 @@ def apply_port_models_to_stinger_config(
     return path
 
 
+def _read_previous_port_models(
+    port_id: str,
+    stinger_path: Optional[Path] = None,
+) -> tuple[dict[str, Any], Optional[Path]]:
+    """Load current port error models from stinger config (before overwrite)."""
+    path = stinger_path or get_stinger_config_path()
+    if not path.exists():
+        return (
+            {'transducer_error_model': None, 'alicat_error_model': None},
+            path,
+        )
+    try:
+        stinger = load_config(path)
+    except Exception as exc:
+        logger.warning('Could not load stinger config for offset history: %s', exc)
+        return (
+            {'transducer_error_model': None, 'alicat_error_model': None},
+            path,
+        )
+    return extract_port_models_from_stinger(stinger, port_id), path
+
+
+def _archive_offset_history(
+    *,
+    port_id: str,
+    fit: PortCalibrationFitResult,
+    settings: QualitySettings,
+    previous_models: dict[str, Any],
+    stinger_path: Optional[Path],
+    applied: bool,
+    require_passed: bool = True,
+    apply_skipped_reason: Optional[str] = None,
+) -> None:
+    """Best-effort append to offset history; never raises to callers."""
+    try:
+        record_offset_history(
+            port_id=port_id,
+            fit=fit,
+            previous_models=previous_models,
+            applied=applied,
+            require_passed=require_passed,
+            apply_skipped_reason=apply_skipped_reason,
+            profile_id=settings.profile_id,
+            profile_label=settings.profile_label,
+            stinger_config_path=stinger_path,
+            sweep_csv_path=fit.sweep_csv_path,
+        )
+    except Exception as exc:
+        logger.warning(
+            'Offset history archive failed for %s (applied=%s): %s',
+            port_id,
+            applied,
+            exc,
+        )
+
+
 def reload_port_calibration(port: Port, snippet: Dict[str, Any]) -> None:
     """Apply error models on connected hardware without reconnecting."""
     hw = snippet.get('hardware', {})
@@ -520,7 +580,18 @@ def finalize_port_calibration(
     """Fit correlation models from the sweep, rescore points, optionally apply to config."""
     path = Path(sweep_csv_path)
     fit = fit_port_from_sweep_csv(path, port_id, settings)
+    previous_models, stinger_path = _read_previous_port_models(port_id)
+
     if fit.error_message and fit.transducer is None and fit.alicat is None:
+        _archive_offset_history(
+            port_id=port_id,
+            fit=fit,
+            settings=settings,
+            previous_models=previous_models,
+            stinger_path=stinger_path,
+            applied=False,
+            apply_skipped_reason=f'fit_failed: {fit.error_message}',
+        )
         return FinalizeCalibrationResult(
             points=raw_points,
             fit=fit,
@@ -530,6 +601,7 @@ def finalize_port_calibration(
 
     rescored = rescore_points_with_models(raw_points, fit, settings=settings)
     applied = False
+    apply_skipped_reason: Optional[str] = None
     message_lines = [f'{settings.profile_label} — {port_id}']
 
     if fit.transducer is not None:
@@ -556,7 +628,23 @@ def finalize_port_calibration(
             applied = True
             message_lines.append('Applied passing error models to stinger_config.yaml.')
         else:
+            apply_skipped_reason = 'no_passing_models'
             message_lines.append('No passing models met apply criteria; config unchanged.')
+    elif not apply_to_stinger:
+        apply_skipped_reason = 'apply_to_stinger_disabled'
+    else:
+        apply_skipped_reason = 'no_models_in_fit'
+
+    _archive_offset_history(
+        port_id=port_id,
+        fit=fit,
+        settings=settings,
+        previous_models=previous_models,
+        stinger_path=stinger_path,
+        applied=applied,
+        require_passed=True,
+        apply_skipped_reason=None if applied else apply_skipped_reason,
+    )
 
     passed = sum(1 for p in rescored if p.passed)
     message_lines.append(

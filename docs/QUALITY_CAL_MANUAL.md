@@ -30,3 +30,15 @@ Quality Cal automates the same setpoints on **left then right** port with soleno
 Launch Stinger (`python run.py`) and verify corrected transducer (0–20 PSIA) and corrected Alicat readings on both ports.
 
 Sweep CSV logs: `logs/quality_cal_sweep_port_*_*.csv`
+
+### Offset history (versioned models)
+
+Each finalize (applied or not) appends an immutable archive under `logs/offset_history/`:
+
+| Path | Contents |
+|------|----------|
+| `entries/{YYYYMMDD_HHMMSS}_{port}.json` | Full record: previous + new `*_error_model`, fit p99s, sweep path, profile |
+| `index.jsonl` | One line per event (timestamp, port, applied, p99s, entry path) |
+| `latest_{port}.json` | Most recent entry for that port |
+
+`stinger_config.yaml` remains the live source of truth. Use the history folder to audit how offsets drifted over time (no UI browser yet).
