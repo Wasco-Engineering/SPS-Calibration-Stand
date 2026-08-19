@@ -19,7 +19,6 @@ hardware:
       transducer_reference: absolute
       port_installed: true
       transducer_installed: false
-      open_fitting: true
       switch_sensed_db9_pins:
       - 3
       switch_com_state: 0
@@ -34,7 +33,6 @@ hardware:
     port_b:
       port_installed: true
       transducer_installed: false
-      open_fitting: true
       transducer_ain: 0
       transducer_ain_neg: 1
       transducer_voltage_min: 0
@@ -137,6 +135,7 @@ control:
     overshoot_beyond_limit_percent: 10.0
     timeout_sec: 60.0
     precision_close_limit_offset_torr: 20.0
+    precision_approach_settle_sec: 0.5
     precision_post_target_grace_sec: 0.35
     precision_return_overshoot_torr: 30.0
   debounce:

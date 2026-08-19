@@ -69,7 +69,8 @@ class _FakePort:
         self.set_pressure_calls: list[float] = []
         self.solenoid_calls: list[bool] = []
 
-    def set_pressure(self, setpoint: float) -> bool:
+    def set_pressure(self, setpoint: float, *, resume_control: bool = True) -> bool:
+        del resume_control
         self.set_pressure_calls.append(setpoint)
         if not self._outcomes:
             return True
@@ -106,7 +107,7 @@ def _build_executor(
         },
         raw={},
     )
-    return _TestExecutor(
+    executor = _TestExecutor(
         port_id='port_a',
         port=cast(Any, port),
         test_setup=setup,
@@ -116,6 +117,8 @@ def _build_executor(
         on_cancelled=on_cancelled,
         wait_for_precision_slot=wait_for_precision_slot,
     )
+    executor._precision_ramp_apply_s = 0.0
+    return executor
 
 
 def test_executor_set_pressure_recovers_after_one_failure() -> None:
@@ -270,6 +273,124 @@ def test_executor_sweep_to_edge_returns_none_without_switch_transition() -> None
     assert executor._sweep_to_edge(target_psi=0.0, direction=1) is None
 
 
+def test_sweep_to_edge_does_not_stamp_already_activated_start_as_activation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Precision activation must wait for a transition, not the approach sample.
+
+    Right-port fast approach can overshoot into the trip. The start sample then
+    already matches the activation switch state and sits within 0.5 PSI of
+    target_out — historically stamped as a 406 mmHg "activation".
+    """
+    approach_psi = 7.86
+    target_out_psi = 7.62
+    reading = PortReading(
+        transducer=TransducerReading(
+            voltage=2.5,
+            pressure=approach_psi,
+            pressure_raw=approach_psi,
+            pressure_reference='absolute',
+            timestamp=0.0,
+        ),
+        alicat=AlicatReading(
+            pressure=approach_psi,
+            setpoint=approach_psi,
+            timestamp=0.0,
+            gauge_pressure=0.0,
+            barometric_pressure=14.7,
+        ),
+        switch=SwitchState(no_active=False, nc_active=True, timestamp=0.0),
+        timestamp=0.0,
+    )
+    read_calls = {'n': 0}
+
+    def _reading(_pid: str) -> PortReading:
+        read_calls['n'] += 1
+        return reading
+
+    executor = _build_executor(_FakePort([True]), get_latest_reading=_reading)
+    executor._edge_timeout_s = 0.05
+    executor._stable_count = 2
+    executor._cycle_observed_edge_states['activation'] = False
+
+    now = {'t': 1000.0}
+
+    def _fake_perf_counter() -> float:
+        return now['t']
+
+    def _fake_sleep(_seconds: float) -> None:
+        now['t'] += 0.05
+
+    monkeypatch.setattr('app.services.test_executor.time.perf_counter', _fake_perf_counter)
+    monkeypatch.setattr('app.services.test_executor.time.sleep', _fake_sleep)
+
+    edge = executor._sweep_to_edge(
+        target_psi=target_out_psi,
+        direction=-1,
+        edge_type='activation',
+    )
+
+    assert edge is None
+    assert executor._precision_activation_start_already_tripped is True
+    assert read_calls['n'] >= 1
+
+
+def test_sweep_to_edge_rejects_activation_transition_at_approach_pressure() -> None:
+    """A trip within ~3 Torr of the sweep start is leftover approach overshoot."""
+    reset = PortReading(
+        transducer=TransducerReading(
+            voltage=2.5,
+            pressure=7.86,
+            pressure_raw=7.86,
+            pressure_reference='absolute',
+            timestamp=0.0,
+        ),
+        alicat=AlicatReading(
+            pressure=7.86,
+            setpoint=7.86,
+            timestamp=0.0,
+            gauge_pressure=0.0,
+            barometric_pressure=14.7,
+        ),
+        switch=SwitchState(no_active=True, nc_active=False, timestamp=0.0),
+        timestamp=0.0,
+    )
+    tripped = PortReading(
+        transducer=TransducerReading(
+            voltage=2.5,
+            pressure=7.84,
+            pressure_raw=7.84,
+            pressure_reference='absolute',
+            timestamp=0.1,
+        ),
+        alicat=AlicatReading(
+            pressure=7.84,
+            setpoint=7.62,
+            timestamp=0.1,
+            gauge_pressure=0.0,
+            barometric_pressure=14.7,
+        ),
+        switch=SwitchState(no_active=False, nc_active=True, timestamp=0.1),
+        timestamp=0.1,
+    )
+    samples = [reset, reset, tripped, tripped, tripped]
+    idx = {'value': -1}
+
+    def _reading(_pid: str) -> PortReading:
+        idx['value'] = min(idx['value'] + 1, len(samples) - 1)
+        return samples[idx['value']]
+
+    executor = _build_executor(_FakePort([True]), get_latest_reading=_reading)
+    executor._edge_timeout_s = 0.05
+    executor._stable_count = 2
+    executor._cycle_observed_edge_states['activation'] = False
+
+    edge = executor._sweep_to_edge(target_psi=7.62, direction=-1, edge_type='activation')
+
+    assert edge is None
+    assert executor._precision_activation_start_already_tripped is True
+
+
 def test_executor_sweep_to_edge_honors_post_target_grace_window() -> None:
     port = _FakePort([True])
     samples = [
@@ -379,25 +500,28 @@ def test_precision_activation_accepts_right_port_vacuum_no_open_edge() -> None:
         },
         raw={},
     )
-    samples = [
-        PortReading(
-            transducer=TransducerReading(
-                voltage=2.5,
-                pressure=9.2,
-                pressure_raw=9.2,
-                pressure_reference='absolute',
-                timestamp=0.0,
-            ),
-            alicat=AlicatReading(
-                pressure=9.2,
-                setpoint=9.2,
-                timestamp=0.0,
-                gauge_pressure=-5.5,
-                barometric_pressure=14.7,
-            ),
-            switch=SwitchState(no_active=True, nc_active=False, timestamp=0.0),
+    reset_reading = PortReading(
+        transducer=TransducerReading(
+            voltage=2.5,
+            pressure=9.2,
+            pressure_raw=9.2,
+            pressure_reference='absolute',
             timestamp=0.0,
         ),
+        alicat=AlicatReading(
+            pressure=9.2,
+            setpoint=9.2,
+            timestamp=0.0,
+            gauge_pressure=-5.5,
+            barometric_pressure=14.7,
+        ),
+        switch=SwitchState(no_active=True, nc_active=False, timestamp=0.0),
+        timestamp=0.0,
+    )
+    samples = [
+        # Setpoint-reference lock consumes one reading before the sweep starts.
+        reset_reading,
+        reset_reading,
         PortReading(
             transducer=TransducerReading(
                 voltage=2.5,
@@ -515,6 +639,46 @@ def test_precision_reasserts_ramp_rate_before_return_sweep() -> None:
 
     assert outcome.result is not None
     assert port.alicat.ramp_rates == [pytest.approx(0.0967), pytest.approx(0.0967)]
+    assert port.alicat.cancel_hold_calls >= 2
+
+
+def test_precision_settle_keeps_full_hold_when_already_near() -> None:
+    port = _FakePort([True])
+    executor = _build_executor(port)
+    captured: dict[str, Any] = {}
+    executor._wait_until_near_target = (  # type: ignore[method-assign]
+        lambda **kwargs: captured.update(kwargs) or True
+    )
+    executor._read_pressure_and_switch_state = lambda: (1.0, False)  # type: ignore[method-assign]
+    executor._precision_phase_runner._settle_at_precision_approach(1.0)
+    assert captured['settle_s'] >= 0.45
+    assert port.alicat.ramp_rates[-1] == pytest.approx(executor._slow_edge_rate_psi)
+    assert port.alicat.cancel_hold_calls >= 1
+
+
+def test_precision_settles_after_reset_side_arming() -> None:
+    executor = _build_executor(_FakePort([True]))
+    settle_targets: list[float] = []
+    executor._precision_phase_runner._can_start_precision_from_current_reset_side = (  # type: ignore[method-assign]
+        lambda *_args: False
+    )
+    executor._precision_phase_runner._stage_precision_deactivated = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    executor._precision_phase_runner._run_precision_fast_approach = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    executor._precision_phase_runner._ensure_precision_starts_from_reset_side = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: True
+    )
+    executor._precision_phase_runner._settle_at_precision_approach = (  # type: ignore[method-assign]
+        lambda target: settle_targets.append(target)
+    )
+    executor._run_sweep_pass = lambda *_args, **_kwargs: SweepPassOutcome(  # type: ignore[method-assign]
+        result=SweepResult(activation_psi=1.5, deactivation_psi=1.8),
+        missing_edge=None,
+    )
+
+    result = executor._run_precision_sweep('vacuum', (0.5, 3.0), skip_atmosphere_gate=True)
+
+    assert result is not None
+    assert settle_targets
 
 
 def test_precision_rejects_inverted_deactivation_below_activation() -> None:
@@ -1513,7 +1677,7 @@ def test_precision_arming_uses_reset_target_when_already_activated_decreasing() 
     commanded: list[float] = []
 
     executor._read_pressure_and_switch_state = lambda: next(states, (8.90, False))  # type: ignore[method-assign]
-    executor._set_pressure_or_raise = lambda pressure: commanded.append(pressure)  # type: ignore[method-assign]
+    executor._set_pressure_or_raise = lambda pressure, **_kwargs: commanded.append(pressure)  # type: ignore[method-assign]
 
     executor._precision_phase_runner._ensure_precision_starts_from_reset_side(
         sweep_mode='pressure',
@@ -1538,7 +1702,7 @@ def test_pressure_decreasing_activation_prep_skips_when_already_above_band() -> 
     executor._get_latest_reading = lambda _pid: None  # type: ignore[method-assign]
 
     commanded: list[float] = []
-    executor._set_pressure_or_raise = lambda pressure: commanded.append(pressure)  # type: ignore[method-assign]
+    executor._set_pressure_or_raise = lambda pressure, **_kwargs: commanded.append(pressure)  # type: ignore[method-assign]
 
     executor._prepare_switch_for_cycle_edge(
         sweep_mode='pressure',
@@ -1671,7 +1835,7 @@ def test_vacuum_increasing_pre_approach_starts_on_low_reset_side() -> None:
     commanded: list[float] = []
     waits: list[float] = []
     wait_timeouts: list[float] = []
-    executor._set_pressure_or_raise = lambda pressure: commanded.append(pressure)  # type: ignore[method-assign]
+    executor._set_pressure_or_raise = lambda pressure, **_kwargs: commanded.append(pressure)  # type: ignore[method-assign]
 
     def _wait_until_near_target(target_psi: float, **kwargs: Any) -> bool:
         waits.append(target_psi)
@@ -1731,7 +1895,7 @@ def test_vacuum_decreasing_pre_approach_approaches_baro_on_atmosphere_then_vacuu
     commanded: list[float] = []
     waits: list[float] = []
     executor._stage_atmosphere_setpoint_before_route = lambda: staged.append(True)  # type: ignore[method-assign]
-    executor._set_pressure_or_raise = lambda pressure: commanded.append(pressure)  # type: ignore[method-assign]
+    executor._set_pressure_or_raise = lambda pressure, **_kwargs: commanded.append(pressure)  # type: ignore[method-assign]
     executor._wait_until_near_target = (  # type: ignore[method-assign]
         lambda **kwargs: waits.append(float(kwargs['target_psi'])) or True
     )
@@ -1790,7 +1954,7 @@ def test_pressure_decreasing_pre_approach_resets_above_deactivation_side() -> No
     waits: list[float] = []
     tolerances: list[float] = []
     executor._read_pressure_and_switch_state = lambda: (0.0, True)  # type: ignore[method-assign]
-    executor._set_pressure_or_raise = lambda pressure: commanded.append(pressure)  # type: ignore[method-assign]
+    executor._set_pressure_or_raise = lambda pressure, **_kwargs: commanded.append(pressure)  # type: ignore[method-assign]
 
     def _wait_until_near_target(target_psi: float, **kwargs: Any) -> bool:
         waits.append(target_psi)
@@ -2121,7 +2285,7 @@ def test_pressure_increasing_pre_approach_resets_below_deactivation_side() -> No
     commanded: list[float] = []
     waits: list[float] = []
     executor._read_pressure_and_switch_state = lambda: (14.0, False)  # type: ignore[method-assign]
-    executor._set_pressure_or_raise = lambda pressure: commanded.append(pressure)  # type: ignore[method-assign]
+    executor._set_pressure_or_raise = lambda pressure, **_kwargs: commanded.append(pressure)  # type: ignore[method-assign]
     executor._wait_until_near_target = (  # type: ignore[method-assign]
         lambda target_psi, **_kwargs: waits.append(target_psi) or True
     )
@@ -2334,17 +2498,35 @@ class _FlowAlicat:
     def configure_units_from_ptp(self, _units_code: str) -> bool:
         return True
 
+    def configure_units_from_ptp_prefer_psi(self, _units_code: str) -> bool:
+        return True
+
     def cancel_hold(self) -> bool:
         return True
 
     def set_ramp_rate(self, _rate: float) -> bool:
         return True
 
+    def hold_valve(self, closed: bool = False) -> bool:
+        return True
+
+    def set_pressure(self, _setpoint: float) -> bool:
+        return True
+
+
+class _FlowDaq:
+    def set_solenoid_safe(self) -> bool:
+        return True
+
+    def reset_filter(self) -> None:
+        return None
+
 
 class _FlowPort:
     def __init__(self, sim: _FlowSimulator) -> None:
         self._sim = sim
         self.alicat = _FlowAlicat()
+        self.daq = _FlowDaq()
         self.set_pressure_calls: list[float] = []
 
     def set_pressure(self, command_psi: float) -> bool:
@@ -2389,6 +2571,7 @@ def _build_flow_executor(setup: TestSetup, sim: _FlowSimulator) -> tuple[_TestEx
     )
     ptp_ref = str(setup.pressure_reference or 'absolute').strip().lower()
     executor._alicat_setpoint_ref = ptp_ref
+    executor._precision_ramp_apply_s = 0.0
     return executor, port, captured
 
 

@@ -147,12 +147,13 @@ class LabJackController:
         except Exception as exc:
             logger.warning('Could not persist solenoid state file %s: %s', path, exc)
 
+    def _solenoid_output(self, to_vacuum: bool) -> int:
+        """Return the configured DIO output for the requested physical route."""
+        return self.solenoid_vacuum_state if to_vacuum else self.solenoid_atmosphere_state
+
     def _initial_solenoid_output(self) -> int:
-        """Output level when configuring solenoid DIO (0=atmosphere, 1=vacuum)."""
-        self.__class__._load_solenoid_state_file()
-        if self.solenoid_dio is None:
-            return 0
-        return int(self._solenoid_dio_state.get(self.solenoid_dio, 0))
+        """Always configure a newly opened solenoid DIO to its safe route."""
+        return self._solenoid_output(to_vacuum=False)
 
     def _remember_solenoid_output(self, output: int) -> None:
         if self.solenoid_dio is None:
@@ -207,6 +208,12 @@ class LabJackController:
         self.switch_nc_derived_from_no = bool(config.get('switch_nc_derived_from_no', False))
         self.switch_no_derived_from_nc = bool(config.get('switch_no_derived_from_nc', False))
         self.solenoid_dio = config.get('solenoid_dio')
+        self.solenoid_vacuum_state = int(config.get('solenoid_vacuum_state', 1))
+        self.solenoid_atmosphere_state = int(config.get('solenoid_atmosphere_state', 0))
+        if self.solenoid_vacuum_state not in {0, 1} or self.solenoid_atmosphere_state not in {0, 1}:
+            raise ValueError('Solenoid route states must be 0 or 1')
+        if self.solenoid_vacuum_state == self.solenoid_atmosphere_state:
+            raise ValueError('Solenoid vacuum and atmosphere states must differ')
 
         self._lock = threading.RLock()
         self._is_configured = False
@@ -372,10 +379,9 @@ class LabJackController:
                     initial = self._initial_solenoid_output()
                     self.set_dio_direction(self.solenoid_dio, True, initial)
                     logger.info(
-                        'LabJack: solenoid DIO%s initial output=%d (%s)',
+                        'LabJack: solenoid DIO%s initial output=%d (atmosphere)',
                         self.solenoid_dio,
                         initial,
-                        'vacuum' if initial else 'atmosphere',
                     )
 
                 self._apply_switch_directions()
@@ -668,7 +674,7 @@ class LabJackController:
         if not LJM_AVAILABLE:
             if not self._allow_simulated_hardware:
                 return False
-            self._remember_solenoid_output(1 if to_vacuum else 0)
+            self._remember_solenoid_output(self._solenoid_output(to_vacuum))
             logger.debug('LabJack solenoid -> %s', 'Vacuum' if to_vacuum else 'Atmosphere')
             return True
 
@@ -680,7 +686,7 @@ class LabJackController:
             return False
 
         try:
-            output = 1 if to_vacuum else 0
+            output = self._solenoid_output(to_vacuum)
             if not self._write_name_with_retry(f'DIO{self.solenoid_dio}', output):
                 return False
             self._remember_solenoid_output(output)
